@@ -27,6 +27,10 @@ struct io_router_loop_arg {
     QIOChannel *channel;
 };
 
+struct connect_thread_arg {
+    int target_index;
+};
+
 void start_io_router(void);
 
 void mmio_forwarding(hwaddr addr, MemTxAttrs attrs, uint8_t *buf, int len, bool is_write);

@@ -23,8 +23,8 @@
 
 #define ROUTER_BUFFER_SIZE 1024
 // #define ROUTER_CONNECTION_UNIX_SOCKET
-// #define ROUTER_CONNECTION_TCP
-#define ROUTER_CONNECTION_RDMA
+#define ROUTER_CONNECTION_TCP
+// #define ROUTER_CONNECTION_RDMA
 
 /* Unix socket */
 #define ROUTER_SOCKET_PREFIX "/home/binss/work/qemu-io-router-socket"
@@ -371,6 +371,8 @@ static void *io_router_loop(void *arg)
                 }
                 kvm_ioapic_router_handle(routing);
                 qemu_put_be32(rsp_file, 99);
+                printf("Handle INI_ROUTER Done\n");
+                fflush(stdout);
                 qemu_fflush(rsp_file);
                 free(routing);
                 break;
@@ -600,6 +602,60 @@ static gboolean io_router_accept_connection(QIOChannel *ioc,
     return true;
 }
 
+
+static void *connect_io_router_thread(void *arg)
+{
+    struct connect_thread_arg *carg = (struct connect_thread_arg *)arg;
+    int index = carg->target_index;
+    g_free(carg);
+    
+    QIOChannel *channel;
+    SocketAddress *connect_addr;
+    Error *err = NULL;
+    int ret;
+    struct router_address addr;
+    
+    memset(&addr, 0, sizeof(addr));
+    ret = get_router_address(index, &addr);
+    if (ret) {
+        printf("get_router_address failed, ret: %d\n", ret);
+        return NULL;
+    }
+    
+    connect_addr = g_new0(SocketAddress, 1);
+    connect_addr->type = SOCKET_ADDRESS_TYPE_INET;
+    connect_addr->u.inet = (InetSocketAddress) {
+        .host = g_strdup(addr.host),
+        .port = g_strdup(addr.port),
+        .has_ipv4 = true,
+        .ipv4 = true,
+    };
+    
+    printf("Thread: connecting to %s:%s\n", addr.host, addr.port);
+    
+    channel = QIO_CHANNEL(qio_channel_socket_new());
+    qio_channel_set_name(QIO_CHANNEL(channel), "io-send");
+    
+    // 重试连接
+    while (true) {
+        if (qio_channel_socket_connect_sync(QIO_CHANNEL_SOCKET(channel),
+                                            connect_addr, &err) == 0) {
+            break;
+        }
+        err = NULL;
+        usleep(100000);
+    }
+    
+    qio_channel_set_delay(channel, false);
+    req_files[index] = qemu_file_new_output(channel);
+    rsp_files[index] = qemu_file_get_return_path(req_files[index]);
+    
+    printf("Thread: connecting to %d done\n", index);
+    qapi_free_SocketAddress(connect_addr);
+    
+    return NULL;
+}
+
 static void connect_io_router_single(int index)
 {
     QIOChannel *channel;
@@ -714,13 +770,40 @@ static void *qemu_io_router_thread_run(void *arg)
         exit(1);
     }
 
-    qio_channel_add_watch(QIO_CHANNEL(lioc),
-                          G_IO_IN,
-                          io_router_accept_connection,
-                          lioc,
-                          (GDestroyNotify)object_unref);
-
     qapi_free_SocketAddress(listen_addr);
+    printf("QEMU %d waiting for connections...\n", index);
+    
+    while (true) {
+        QIOChannelSocket *sioc;
+        Error *err = NULL;
+        
+        // 阻塞等待连接
+        sioc = qio_channel_socket_accept(lioc, &err);
+        if (!sioc) {
+            if (err) {
+                error_report("could not accept io router connection (%s)",
+                           error_get_pretty(err));
+                error_free(err);
+            }
+            continue;
+        }
+        
+        QIOChannel *channel = QIO_CHANNEL(sioc);
+        qio_channel_set_name(channel, "io-router-connection-channel");
+        
+        printf("QEMU %d accepted a connection\n", index);
+        
+        // 为每个连接创建处理线程
+        QemuThread *thread = g_malloc0(sizeof(QemuThread));
+        struct io_router_loop_arg *arg = g_malloc0(sizeof(struct io_router_loop_arg));
+        memset(arg, 0, sizeof(struct io_router_loop_arg));
+        arg->req_file = qemu_file_new_input(channel);
+        arg->rsp_file = qemu_file_get_return_path(arg->req_file);
+        arg->channel = channel;
+        
+        qemu_thread_create(thread, "io-router-connection", io_router_loop,
+                         arg, QEMU_THREAD_JOINABLE);
+    }
 #endif
     return NULL;
 }
@@ -733,14 +816,30 @@ static void connect_io_router(void)
     connect_io_router_rdma();
 #else
     MachineState *ms = MACHINE(qdev_get_machine());
-    int index = ms->local_cpu_start_index / ms->local_cpus;
-
-    int i;
-    for (i = 0; i < ms->qemu_nums; i++) {
-        if (i != index) {
-            connect_io_router_single(i);
+    int local_index = ms->local_cpu_start_index / ms->local_cpus;
+    
+    QemuThread *threads = g_malloc0(sizeof(QemuThread) * ms->qemu_nums);
+    int thread_count = 0;
+    
+    // 为每个目标实例创建连接线程
+    for (int i = 0; i < ms->qemu_nums; i++) {
+        if (i != local_index) {
+            struct connect_thread_arg *arg = g_malloc0(sizeof(struct connect_thread_arg));
+            arg->target_index = i;
+            
+            qemu_thread_create(&threads[thread_count], "io-router-connect",
+                             connect_io_router_thread,
+                             arg, QEMU_THREAD_JOINABLE);
+            thread_count++;
         }
     }
+    
+    // 等待所有连接线程完成
+    for (int i = 0; i < thread_count; i++) {
+        qemu_thread_join(&threads[i]);
+    }
+    
+    g_free(threads);
 #endif
     printf("connect_io_router done\n");
 
@@ -801,6 +900,9 @@ void start_io_router(void)
 
     qemu_thread_create(&(router.thread), "io-router-listener", qemu_io_router_thread_run,
                    &router, QEMU_THREAD_JOINABLE);
+    
+
+    sleep(10); // wait for listener to be ready
 
     connect_io_router();
 }
@@ -1070,10 +1172,9 @@ void irq_forwarding(int cpu_index, int vector_num, int trigger_mode)
 void ioapic_irq_forwarding(int irq, int level)
 {
     qemu_mutex_lock(&io_forwarding_mutex);
-    QEMUFile *io_connect_file = req_files[0];
     MachineState *ms = MACHINE(qdev_get_machine());
     for (int i = 1; i < ms->qemu_nums; i++) {
-        io_connect_file = req_files[i];
+        QEMUFile * io_connect_file = req_files[i];
         if (io_connect_file) {
            qemu_put_be16(io_connect_file, IOAPIC_INI);
            qemu_put_sbe32(io_connect_file, CPU_INDEX_ANY);
@@ -1087,45 +1188,51 @@ void ioapic_irq_forwarding(int irq, int level)
 
 void ioapic_router_forwarding(struct kvm_irq_routing *routing) {
     qemu_mutex_lock(&io_forwarding_mutex);
-    QEMUFile *io_connect_file = req_files[1];
-    
-    qemu_put_be16(io_connect_file, INI_ROUTER);
-    qemu_put_sbe32(io_connect_file, CPU_INDEX_ANY);
-    qemu_put_be32(io_connect_file, routing->nr);     
-    qemu_put_be32(io_connect_file, routing->flags);  
+    MachineState *ms = MACHINE(qdev_get_machine());
+    for (int i = 1; i < ms->qemu_nums; i++) {
+        QEMUFile * io_connect_file = req_files[i];
+        printf("ioapic_router_forwarding to QEMU before qemu file check %d\n", i);
+        if (io_connect_file) {
+            printf("ioapic_router_forwarding to QEMU %d\n", i);
+            fflush(stdout);
+            qemu_put_be16(io_connect_file, INI_ROUTER);
+            qemu_put_sbe32(io_connect_file, CPU_INDEX_ANY);
+            qemu_put_be32(io_connect_file, routing->nr);
+            qemu_put_be32(io_connect_file, routing->flags);
+            for (int j = 0; j < routing->nr; j++) {
+                struct kvm_irq_routing_entry *entry = &(routing->entries[j]);
 
-    for (int i = 0; i < routing->nr; i++) {
-        struct kvm_irq_routing_entry *entry = &(routing->entries[i]);
+                qemu_put_be32(io_connect_file, entry->gsi);
+                qemu_put_be32(io_connect_file, entry->type);
+                qemu_put_be32(io_connect_file, entry->flags);
+                qemu_put_be32(io_connect_file, entry->pad);
 
-        qemu_put_be32(io_connect_file, entry->gsi);
-        qemu_put_be32(io_connect_file, entry->type);
-        qemu_put_be32(io_connect_file, entry->flags);
-        qemu_put_be32(io_connect_file, entry->pad); 
-
-        switch (entry->type) {
-            case KVM_IRQ_ROUTING_IRQCHIP: {
-                struct kvm_irq_routing_irqchip *irq = &(entry->u.irqchip);
-                qemu_put_be32(io_connect_file, irq->irqchip); 
-                qemu_put_be32(io_connect_file, irq->pin);
-                break;
+                switch (entry->type) {
+                    case KVM_IRQ_ROUTING_IRQCHIP: {
+                        struct kvm_irq_routing_irqchip *irq = &(entry->u.irqchip);
+                        qemu_put_be32(io_connect_file, irq->irqchip);
+                        qemu_put_be32(io_connect_file, irq->pin);
+                        break;
+                    }
+                    case KVM_IRQ_ROUTING_MSI: {
+                        struct kvm_irq_routing_msi *msi = &(entry->u.msi);
+                        qemu_put_be32(io_connect_file, msi->address_lo);
+                        qemu_put_be32(io_connect_file, msi->address_hi);
+                        qemu_put_be32(io_connect_file, msi->data);
+                        qemu_put_be32(io_connect_file, msi->pad);
+                        break;
+                    }
+                    default:
+                        fprintf(stderr, "Unsupported routing type: %d\n", entry->type);
+                        break;
+                }
             }
-            case KVM_IRQ_ROUTING_MSI: {
-                struct kvm_irq_routing_msi *msi = &(entry->u.msi);
-                qemu_put_be32(io_connect_file, msi->address_lo);
-                qemu_put_be32(io_connect_file, msi->address_hi);
-                qemu_put_be32(io_connect_file, msi->data);
-                qemu_put_be32(io_connect_file, msi->pad);
-                break;
+
+            qemu_fflush(io_connect_file);
+            io_connect_file = rsp_files[i];
+            while(qemu_get_be32(io_connect_file) != 99) {
             }
-            default:
-                fprintf(stderr, "Unsupported routing type: %d\n", entry->type);
-                break;
         }
-    }
-
-    qemu_fflush(io_connect_file); 
-    io_connect_file = rsp_files[1];
-    while(qemu_get_be32(io_connect_file) != 99) {
     }
     qemu_mutex_unlock(&io_forwarding_mutex);
 }
