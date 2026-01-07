@@ -150,9 +150,8 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
             int port1 = base_port + local_id * total_nodes * 2 + i * 2;
             rdma_conn_t *conn1;
             debugf("[RDMA] Connecting to %s:%d (request channel)\n", hosts[i], port1);
-            if (create_connection(hosts[i], port1, NULL, &conn1) < 0) {
-                fprintf(stderr, "[RDMA Router] Failed to connect request channel to %d\n", i);
-                return -1;
+            while (create_connection(hosts[i], port1, NULL, &conn1) < 0) {
+                sleep(1);
             }
             g_ctx.request_conns[i] = conn1;
             debugf("[RDMA Router] Connected request channel to peer %d\n", i);
@@ -161,9 +160,8 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
             int port2 = base_port + local_id * total_nodes * 2 + i * 2 + 1;
             rdma_conn_t *conn2;
             debugf("[RDMA] Connecting to %s:%d (reply channel)\n", hosts[i], port2);
-            if (create_connection(hosts[i], port2, NULL, &conn2) < 0) {
-                fprintf(stderr, "[RDMA Router] Failed to connect reply channel to %d\n", i);
-                return -1;
+            while (create_connection(hosts[i], port2, NULL, &conn2) < 0) {
+                sleep(1);
             }
             g_ctx.reply_for_recv_conns[i] = conn2;
             debugf("[RDMA Router] Connected reply channel to peer %d\n", i);
@@ -367,9 +365,8 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
             int port1 = base_port + local_id * total_nodes * 2 + i * 2;
             rdma_conn_t *conn1;
             debugf("[RDMA] Connecting to %s:%d (request channel)\n", hosts[i], port1);
-            if (create_connection(hosts[i], port1, NULL, &conn1) < 0) {
-                fprintf(stderr, "[RDMA Router] Failed to connect request channel to %d\n", i);
-                return -1;
+            while (create_connection(hosts[i], port1, NULL, &conn1) < 0) {
+                sleep(1);
             }
             g_ctx.request_conns[i] = conn1;
             debugf("[RDMA Router] Connected request channel to peer %d\n", i);
