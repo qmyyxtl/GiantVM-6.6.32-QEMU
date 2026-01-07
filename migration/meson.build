@@ -38,6 +38,7 @@ else
 endif
 
 system_ss.add(when: rdma, if_true: files('rdma.c'))
+system_ss.add(when: rdma, if_true: files('rdma-gvm.c'))
 system_ss.add(when: zstd, if_true: files('multifd-zstd.c'))
 system_ss.add(when: qpl, if_true: files('multifd-qpl.c'))
 system_ss.add(when: uadk, if_true: files('multifd-uadk.c'))
