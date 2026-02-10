@@ -91,13 +91,16 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
     g_ctx.reply_for_recv_conns = calloc(total_nodes, sizeof(rdma_conn_t*));
     g_ctx.recv_threads = calloc(total_nodes, sizeof(pthread_t));
     
-    // ========== 阶段1：创建所有 listener ==========
-    struct rdma_cm_id **listeners = calloc(total_nodes * 2, sizeof(struct rdma_cm_id*));
+    // ========== 创建所有 listener ==========
+    struct rdma_cm_id ***listeners = calloc(total_nodes, sizeof(struct rdma_cm_id**));
+    for (int i = 0; i < total_nodes; i++) {
+        listeners[i] = calloc(2, sizeof(struct rdma_cm_id*));
+    }
     
     for (int i = 0; i < total_nodes; i++) {
         if (i == local_id) continue;
         
-        // Listener 1: 接收来自 i 的请求
+        // Listener 1: 接收请求
         int port1 = base_port + i * total_nodes * 2 + local_id * 2;
         struct rdma_cm_id *listen_id1;
         struct rdma_event_channel *cm_channel1 = rdma_create_event_channel();
@@ -110,13 +113,13 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
         addr1.sin_port = htons(port1);
         
         rdma_bind_addr(listen_id1, (struct sockaddr*)&addr1);
-        rdma_listen(listen_id1, 1);
-        listeners[i*2] = listen_id1;
+        rdma_listen(listen_id1, 10);
+        listeners[i][0] = listen_id1;
         
         debugf("[RDMA Router] Listening on %s:%d for requests from peer %d\n", 
                hosts[local_id], port1, i);
         
-        // Listener 2: 接收来自 i 对我请求的响应
+        // Listener 2: 接收响应
         int port2 = base_port + i * total_nodes * 2 + local_id * 2 + 1;
         struct rdma_cm_id *listen_id2;
         struct rdma_event_channel *cm_channel2 = rdma_create_event_channel();
@@ -129,244 +132,40 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
         addr2.sin_port = htons(port2);
         
         rdma_bind_addr(listen_id2, (struct sockaddr*)&addr2);
-        rdma_listen(listen_id2, 1);
-        listeners[i*2+1] = listen_id2;
+        rdma_listen(listen_id2, 10);
+        listeners[i][1] = listen_id2;
         
         debugf("[RDMA Router] Listening on %s:%d for responses from peer %d\n",
                hosts[local_id], port2, i);
     }
     
     debugf("[RDMA Router] Waiting for all listeners to be ready...\n");
-    sleep(3);
+    sleep(5);
     
-    // ========== 阶段2：建立连接（避免死锁：ID小的先连） ==========
+    // ========== 🔑 关键改动：逐对建立连接 ==========
     for (int i = 0; i < total_nodes; i++) {
         if (i == local_id) continue;
         
         if (local_id < i) {
-            // 我的 ID 小，我主动连接
+            // ===== 我的 ID 小，我先主动连接，再被动接受 =====
             
-            // 连接1：发送请求到 i
+            debugf("[RDMA Router] Establishing connections with peer %d (I connect first)...\n", i);
+            
+            // 步骤1：主动连接 2 条
             int port1 = base_port + local_id * total_nodes * 2 + i * 2;
             rdma_conn_t *conn1;
             debugf("[RDMA] Connecting to %s:%d (request channel)\n", hosts[i], port1);
-            while (create_connection(hosts[i], port1, NULL, &conn1) < 0) {
+            int retry = 0;
+            while (retry < 10) {
+                if (create_connection(hosts[i], port1, NULL, &conn1) == 0) {
+                    break;
+                }
+                retry++;
                 sleep(1);
             }
-            g_ctx.request_conns[i] = conn1;
-            debugf("[RDMA Router] Connected request channel to peer %d\n", i);
-            
-            // 连接2：发送对 i 请求的回复
-            int port2 = base_port + local_id * total_nodes * 2 + i * 2 + 1;
-            rdma_conn_t *conn2;
-            debugf("[RDMA] Connecting to %s:%d (reply channel)\n", hosts[i], port2);
-            while (create_connection(hosts[i], port2, NULL, &conn2) < 0) {
-                sleep(1);
-            }
-            g_ctx.reply_for_recv_conns[i] = conn2;
-            debugf("[RDMA Router] Connected reply channel to peer %d\n", i);
-        }
-    }
-    
-    // ========== 阶段3：接受连接 ==========
-    for (int i = 0; i < total_nodes; i++) {
-        if (i == local_id) continue;
-        
-        if (local_id > i) {
-            // 我的 ID 大，我接受连接
-            
-            // 接受1：接收来自 i 的请求
-            debugf("[RDMA Router] Waiting for request connection from peer %d...\n", i);
-            struct rdma_cm_event *event1;
-            rdma_get_cm_event(listeners[i*2]->channel, &event1);
-            if (event1->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
-                fprintf(stderr, "[RDMA Router] Unexpected event\n");
+            if (retry >= 10) {
+                fprintf(stderr, "[RDMA Router] Failed to connect request channel to %d\n", i);
                 return -1;
-            }
-            
-            rdma_conn_t *conn1;
-            if (create_connection(NULL, 0, event1->id, &conn1) < 0) {
-                return -1;
-            }
-            
-            struct ibv_qp_init_attr qp_attr1;
-            memset(&qp_attr1, 0, sizeof(qp_attr1));
-            qp_attr1.send_cq = conn1->cq;
-            qp_attr1.recv_cq = conn1->cq;
-            qp_attr1.qp_type = IBV_QPT_RC;
-            qp_attr1.cap.max_send_wr = RDMA_CQ_SIZE;
-            qp_attr1.cap.max_recv_wr = RDMA_CQ_SIZE;
-            qp_attr1.cap.max_send_sge = 1;
-            qp_attr1.cap.max_recv_sge = 1;
-            
-            rdma_create_qp(conn1->cm_id, conn1->pd, &qp_attr1);
-            conn1->qp = conn1->cm_id->qp;
-            post_all_recvs(conn1);
-            
-            struct rdma_conn_param cm_params1;
-            memset(&cm_params1, 0, sizeof(cm_params1));
-            rdma_accept(conn1->cm_id, &cm_params1);
-            rdma_ack_cm_event(event1);
-            
-            rdma_get_cm_event(conn1->cm_id->channel, &event1);
-            if (event1->event != RDMA_CM_EVENT_ESTABLISHED) {
-                fprintf(stderr, "[RDMA Router] Connection not established\n");
-                return -1;
-            }
-            rdma_ack_cm_event(event1);
-            
-            g_ctx.recv_conns[i] = conn1;
-            rdma_destroy_id(listeners[i*2]);
-            debugf("[RDMA Router] Accepted request connection from peer %d\n", i);
-            
-            // 接受2：接收来自 i 对我请求的响应
-            debugf("[RDMA Router] Waiting for response connection from peer %d...\n", i);
-            struct rdma_cm_event *event2;
-            rdma_get_cm_event(listeners[i*2+1]->channel, &event2);
-            if (event2->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
-                fprintf(stderr, "[RDMA Router] Unexpected event\n");
-                return -1;
-            }
-            
-            rdma_conn_t *conn2;
-            if (create_connection(NULL, 0, event2->id, &conn2) < 0) {
-                return -1;
-            }
-            
-            struct ibv_qp_init_attr qp_attr2;
-            memset(&qp_attr2, 0, sizeof(qp_attr2));
-            qp_attr2.send_cq = conn2->cq;
-            qp_attr2.recv_cq = conn2->cq;
-            qp_attr2.qp_type = IBV_QPT_RC;
-            qp_attr2.cap.max_send_wr = RDMA_CQ_SIZE;
-            qp_attr2.cap.max_recv_wr = RDMA_CQ_SIZE;
-            qp_attr2.cap.max_send_sge = 1;
-            qp_attr2.cap.max_recv_sge = 1;
-            
-            rdma_create_qp(conn2->cm_id, conn2->pd, &qp_attr2);
-            conn2->qp = conn2->cm_id->qp;
-            post_all_recvs(conn2);
-            
-            struct rdma_conn_param cm_params2;
-            memset(&cm_params2, 0, sizeof(cm_params2));
-            rdma_accept(conn2->cm_id, &cm_params2);
-            rdma_ack_cm_event(event2);
-            
-            rdma_get_cm_event(conn2->cm_id->channel, &event2);
-            if (event2->event != RDMA_CM_EVENT_ESTABLISHED) {
-                fprintf(stderr, "[RDMA Router] Connection not established\n");
-                return -1;
-            }
-            rdma_ack_cm_event(event2);
-            
-            g_ctx.response_for_req_conns[i] = conn2;
-            rdma_destroy_id(listeners[i*2+1]);
-            debugf("[RDMA Router] Accepted response connection from peer %d\n", i);
-        }
-    }
-    
-    // ========== 阶段4：补充剩余连接 ==========
-    for (int i = 0; i < total_nodes; i++) {
-        if (i == local_id) continue;
-        
-        if (local_id < i) {
-            // 我之前是主动方，现在被动接受
-            
-            debugf("[RDMA Router] Waiting for request connection from peer %d...\n", i);
-            struct rdma_cm_event *event1;
-            rdma_get_cm_event(listeners[i*2]->channel, &event1);
-            if (event1->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
-                fprintf(stderr, "[RDMA Router] Unexpected event\n");
-                return -1;
-            }
-            
-            rdma_conn_t *conn1;
-            if (create_connection(NULL, 0, event1->id, &conn1) < 0) {
-                return -1;
-            }
-            
-            struct ibv_qp_init_attr qp_attr1;
-            memset(&qp_attr1, 0, sizeof(qp_attr1));
-            qp_attr1.send_cq = conn1->cq;
-            qp_attr1.recv_cq = conn1->cq;
-            qp_attr1.qp_type = IBV_QPT_RC;
-            qp_attr1.cap.max_send_wr = RDMA_CQ_SIZE;
-            qp_attr1.cap.max_recv_wr = RDMA_CQ_SIZE;
-            qp_attr1.cap.max_send_sge = 1;
-            qp_attr1.cap.max_recv_sge = 1;
-            
-            rdma_create_qp(conn1->cm_id, conn1->pd, &qp_attr1);
-            conn1->qp = conn1->cm_id->qp;
-            post_all_recvs(conn1);
-            
-            struct rdma_conn_param cm_params1;
-            memset(&cm_params1, 0, sizeof(cm_params1));
-            rdma_accept(conn1->cm_id, &cm_params1);
-            rdma_ack_cm_event(event1);
-            
-            rdma_get_cm_event(conn1->cm_id->channel, &event1);
-            if (event1->event != RDMA_CM_EVENT_ESTABLISHED) {
-                fprintf(stderr, "[RDMA Router] Connection not established\n");
-                return -1;
-            }
-            rdma_ack_cm_event(event1);
-            
-            g_ctx.recv_conns[i] = conn1;
-            rdma_destroy_id(listeners[i*2]);
-            debugf("[RDMA Router] Accepted request connection from peer %d\n", i);
-            
-            // 接受响应连接
-            debugf("[RDMA Router] Waiting for response connection from peer %d...\n", i);
-            struct rdma_cm_event *event2;
-            rdma_get_cm_event(listeners[i*2+1]->channel, &event2);
-            if (event2->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
-                fprintf(stderr, "[RDMA Router] Unexpected event\n");
-                return -1;
-            }
-            
-            rdma_conn_t *conn2;
-            if (create_connection(NULL, 0, event2->id, &conn2) < 0) {
-                return -1;
-            }
-            
-            struct ibv_qp_init_attr qp_attr2;
-            memset(&qp_attr2, 0, sizeof(qp_attr2));
-            qp_attr2.send_cq = conn2->cq;
-            qp_attr2.recv_cq = conn2->cq;
-            qp_attr2.qp_type = IBV_QPT_RC;
-            qp_attr2.cap.max_send_wr = RDMA_CQ_SIZE;
-            qp_attr2.cap.max_recv_wr = RDMA_CQ_SIZE;
-            qp_attr2.cap.max_send_sge = 1;
-            qp_attr2.cap.max_recv_sge = 1;
-            
-            rdma_create_qp(conn2->cm_id, conn2->pd, &qp_attr2);
-            conn2->qp = conn2->cm_id->qp;
-            post_all_recvs(conn2);
-            
-            struct rdma_conn_param cm_params2;
-            memset(&cm_params2, 0, sizeof(cm_params2));
-            rdma_accept(conn2->cm_id, &cm_params2);
-            rdma_ack_cm_event(event2);
-            
-            rdma_get_cm_event(conn2->cm_id->channel, &event2);
-            if (event2->event != RDMA_CM_EVENT_ESTABLISHED) {
-                fprintf(stderr, "[RDMA Router] Connection not established\n");
-                return -1;
-            }
-            rdma_ack_cm_event(event2);
-            
-            g_ctx.response_for_req_conns[i] = conn2;
-            rdma_destroy_id(listeners[i*2+1]);
-            debugf("[RDMA Router] Accepted response connection from peer %d\n", i);
-            
-        } else {
-            // 我之前是被动方，现在主动连接
-            
-            int port1 = base_port + local_id * total_nodes * 2 + i * 2;
-            rdma_conn_t *conn1;
-            debugf("[RDMA] Connecting to %s:%d (request channel)\n", hosts[i], port1);
-            while (create_connection(hosts[i], port1, NULL, &conn1) < 0) {
-                sleep(1);
             }
             g_ctx.request_conns[i] = conn1;
             debugf("[RDMA Router] Connected request channel to peer %d\n", i);
@@ -374,15 +173,257 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
             int port2 = base_port + local_id * total_nodes * 2 + i * 2 + 1;
             rdma_conn_t *conn2;
             debugf("[RDMA] Connecting to %s:%d (reply channel)\n", hosts[i], port2);
-            if (create_connection(hosts[i], port2, NULL, &conn2) < 0) {
+            retry = 0;
+            while (retry < 10) {
+                if (create_connection(hosts[i], port2, NULL, &conn2) == 0) {
+                    break;
+                }
+                retry++;
+                sleep(1);
+            }
+            if (retry >= 10) {
                 fprintf(stderr, "[RDMA Router] Failed to connect reply channel to %d\n", i);
                 return -1;
             }
             g_ctx.reply_for_recv_conns[i] = conn2;
             debugf("[RDMA Router] Connected reply channel to peer %d\n", i);
+            
+            // 步骤2：被动接受 2 条（对方会连接我）
+            debugf("[RDMA Router] Waiting for request connection from peer %d...\n", i);
+            struct rdma_cm_event *event1;
+            rdma_get_cm_event(listeners[i][0]->channel, &event1);
+            if (event1->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
+                fprintf(stderr, "[RDMA Router] Unexpected event\n");
+                return -1;
+            }
+            
+            rdma_conn_t *recv_conn;
+            if (create_connection(NULL, 0, event1->id, &recv_conn) < 0) {
+                return -1;
+            }
+            
+            struct ibv_qp_init_attr qp_attr1;
+            memset(&qp_attr1, 0, sizeof(qp_attr1));
+            qp_attr1.send_cq = recv_conn->cq;
+            qp_attr1.recv_cq = recv_conn->cq;
+            qp_attr1.qp_type = IBV_QPT_RC;
+            qp_attr1.cap.max_send_wr = RDMA_BUFFER_COUNT;
+            qp_attr1.cap.max_recv_wr = RDMA_BUFFER_COUNT;
+            qp_attr1.cap.max_send_sge = 1;
+            qp_attr1.cap.max_recv_sge = 1;
+            
+            rdma_create_qp(recv_conn->cm_id, recv_conn->pd, &qp_attr1);
+            recv_conn->qp = recv_conn->cm_id->qp;
+            post_all_recvs(recv_conn);
+            
+            struct rdma_conn_param cm_params1;
+            memset(&cm_params1, 0, sizeof(cm_params1));
+            cm_params1.retry_count = 7;
+            cm_params1.rnr_retry_count = 7;
+            rdma_accept(recv_conn->cm_id, &cm_params1);
+            rdma_ack_cm_event(event1);
+            
+            rdma_get_cm_event(recv_conn->cm_id->channel, &event1);
+            if (event1->event != RDMA_CM_EVENT_ESTABLISHED) {
+                fprintf(stderr, "[RDMA Router] Connection not established\n");
+                return -1;
+            }
+            rdma_ack_cm_event(event1);
+            
+            g_ctx.recv_conns[i] = recv_conn;
+            rdma_destroy_id(listeners[i][0]);
+            debugf("[RDMA Router] Accepted request connection from peer %d\n", i);
+            
+            // 接受响应连接
+            debugf("[RDMA Router] Waiting for response connection from peer %d...\n", i);
+            struct rdma_cm_event *event2;
+            rdma_get_cm_event(listeners[i][1]->channel, &event2);
+            if (event2->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
+                fprintf(stderr, "[RDMA Router] Unexpected event\n");
+                return -1;
+            }
+            
+            rdma_conn_t *resp_conn;
+            if (create_connection(NULL, 0, event2->id, &resp_conn) < 0) {
+                return -1;
+            }
+            
+            struct ibv_qp_init_attr qp_attr2;
+            memset(&qp_attr2, 0, sizeof(qp_attr2));
+            qp_attr2.send_cq = resp_conn->cq;
+            qp_attr2.recv_cq = resp_conn->cq;
+            qp_attr2.qp_type = IBV_QPT_RC;
+            qp_attr2.cap.max_send_wr = RDMA_BUFFER_COUNT;
+            qp_attr2.cap.max_recv_wr = RDMA_BUFFER_COUNT;
+            qp_attr2.cap.max_send_sge = 1;
+            qp_attr2.cap.max_recv_sge = 1;
+            
+            rdma_create_qp(resp_conn->cm_id, resp_conn->pd, &qp_attr2);
+            resp_conn->qp = resp_conn->cm_id->qp;
+            post_all_recvs(resp_conn);
+            
+            struct rdma_conn_param cm_params2;
+            memset(&cm_params2, 0, sizeof(cm_params2));
+            cm_params2.retry_count = 7;
+            cm_params2.rnr_retry_count = 7;
+            rdma_accept(resp_conn->cm_id, &cm_params2);
+            rdma_ack_cm_event(event2);
+            
+            rdma_get_cm_event(resp_conn->cm_id->channel, &event2);
+            if (event2->event != RDMA_CM_EVENT_ESTABLISHED) {
+                fprintf(stderr, "[RDMA Router] Connection not established\n");
+                return -1;
+            }
+            rdma_ack_cm_event(event2);
+            
+            g_ctx.response_for_req_conns[i] = resp_conn;
+            rdma_destroy_id(listeners[i][1]);
+            debugf("[RDMA Router] Accepted response connection from peer %d\n", i);
+            
+            debugf("[RDMA Router] All 4 connections established with peer %d\n", i);
+            
+        } else {
+            // ===== 我的 ID 大，我先被动接受，再主动连接 =====
+            
+            debugf("[RDMA Router] Establishing connections with peer %d (I accept first)...\n", i);
+            
+            // 步骤1：被动接受 2 条（对方会先连接我）
+            debugf("[RDMA Router] Waiting for request connection from peer %d...\n", i);
+            struct rdma_cm_event *event1;
+            rdma_get_cm_event(listeners[i][0]->channel, &event1);
+            if (event1->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
+                fprintf(stderr, "[RDMA Router] Unexpected event\n");
+                return -1;
+            }
+            
+            rdma_conn_t *recv_conn;
+            if (create_connection(NULL, 0, event1->id, &recv_conn) < 0) {
+                return -1;
+            }
+            
+            struct ibv_qp_init_attr qp_attr1;
+            memset(&qp_attr1, 0, sizeof(qp_attr1));
+            qp_attr1.send_cq = recv_conn->cq;
+            qp_attr1.recv_cq = recv_conn->cq;
+            qp_attr1.qp_type = IBV_QPT_RC;
+            qp_attr1.cap.max_send_wr = RDMA_BUFFER_COUNT;
+            qp_attr1.cap.max_recv_wr = RDMA_BUFFER_COUNT;
+            qp_attr1.cap.max_send_sge = 1;
+            qp_attr1.cap.max_recv_sge = 1;
+            
+            rdma_create_qp(recv_conn->cm_id, recv_conn->pd, &qp_attr1);
+            recv_conn->qp = recv_conn->cm_id->qp;
+            post_all_recvs(recv_conn);
+            
+            struct rdma_conn_param cm_params1;
+            memset(&cm_params1, 0, sizeof(cm_params1));
+            cm_params1.retry_count = 7;
+            cm_params1.rnr_retry_count = 7;
+            rdma_accept(recv_conn->cm_id, &cm_params1);
+            rdma_ack_cm_event(event1);
+            
+            rdma_get_cm_event(recv_conn->cm_id->channel, &event1);
+            if (event1->event != RDMA_CM_EVENT_ESTABLISHED) {
+                fprintf(stderr, "[RDMA Router] Connection not established\n");
+                return -1;
+            }
+            rdma_ack_cm_event(event1);
+            
+            g_ctx.recv_conns[i] = recv_conn;
+            rdma_destroy_id(listeners[i][0]);
+            debugf("[RDMA Router] Accepted request connection from peer %d\n", i);
+            
+            // 接受响应连接
+            debugf("[RDMA Router] Waiting for response connection from peer %d...\n", i);
+            struct rdma_cm_event *event2;
+            rdma_get_cm_event(listeners[i][1]->channel, &event2);
+            if (event2->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
+                fprintf(stderr, "[RDMA Router] Unexpected event\n");
+                return -1;
+            }
+            
+            rdma_conn_t *resp_conn;
+            if (create_connection(NULL, 0, event2->id, &resp_conn) < 0) {
+                return -1;
+            }
+            
+            struct ibv_qp_init_attr qp_attr2;
+            memset(&qp_attr2, 0, sizeof(qp_attr2));
+            qp_attr2.send_cq = resp_conn->cq;
+            qp_attr2.recv_cq = resp_conn->cq;
+            qp_attr2.qp_type = IBV_QPT_RC;
+            qp_attr2.cap.max_send_wr = RDMA_BUFFER_COUNT;
+            qp_attr2.cap.max_recv_wr = RDMA_BUFFER_COUNT;
+            qp_attr2.cap.max_send_sge = 1;
+            qp_attr2.cap.max_recv_sge = 1;
+            
+            rdma_create_qp(resp_conn->cm_id, resp_conn->pd, &qp_attr2);
+            resp_conn->qp = resp_conn->cm_id->qp;
+            post_all_recvs(resp_conn);
+            
+            struct rdma_conn_param cm_params2;
+            memset(&cm_params2, 0, sizeof(cm_params2));
+            cm_params2.retry_count = 7;
+            cm_params2.rnr_retry_count = 7;
+            rdma_accept(resp_conn->cm_id, &cm_params2);
+            rdma_ack_cm_event(event2);
+            
+            rdma_get_cm_event(resp_conn->cm_id->channel, &event2);
+            if (event2->event != RDMA_CM_EVENT_ESTABLISHED) {
+                fprintf(stderr, "[RDMA Router] Connection not established\n");
+                return -1;
+            }
+            rdma_ack_cm_event(event2);
+            
+            g_ctx.response_for_req_conns[i] = resp_conn;
+            rdma_destroy_id(listeners[i][1]);
+            debugf("[RDMA Router] Accepted response connection from peer %d\n", i);
+            
+            // 步骤2：主动连接 2 条
+            int port1 = base_port + local_id * total_nodes * 2 + i * 2;
+            rdma_conn_t *conn1;
+            debugf("[RDMA] Connecting to %s:%d (request channel)\n", hosts[i], port1);
+            int retry = 0;
+            while (retry < 10) {
+                if (create_connection(hosts[i], port1, NULL, &conn1) == 0) {
+                    break;
+                }
+                retry++;
+                sleep(1);
+            }
+            if (retry >= 10) {
+                fprintf(stderr, "[RDMA Router] Failed to connect request channel to %d\n", i);
+                return -1;
+            }
+            g_ctx.request_conns[i] = conn1;
+            debugf("[RDMA Router] Connected request channel to peer %d\n", i);
+            
+            int port2 = base_port + local_id * total_nodes * 2 + i * 2 + 1;
+            rdma_conn_t *conn2;
+            debugf("[RDMA] Connecting to %s:%d (reply channel)\n", hosts[i], port2);
+            retry = 0;
+            while (retry < 10) {
+                if (create_connection(hosts[i], port2, NULL, &conn2) == 0) {
+                    break;
+                }
+                retry++;
+                sleep(1);
+            }
+            if (retry >= 10) {
+                fprintf(stderr, "[RDMA Router] Failed to connect reply channel to %d\n", i);
+                return -1;
+            }
+            g_ctx.reply_for_recv_conns[i] = conn2;
+            debugf("[RDMA Router] Connected reply channel to peer %d\n", i);
+            
+            debugf("[RDMA Router] All 4 connections established with peer %d\n", i);
         }
     }
     
+    // 清理 listeners
+    for (int i = 0; i < total_nodes; i++) {
+        free(listeners[i]);
+    }
     free(listeners);
     
     // 启动接收线程

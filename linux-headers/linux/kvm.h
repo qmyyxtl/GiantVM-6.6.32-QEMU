@@ -223,6 +223,7 @@ struct kvm_run {
 			__u32 id;
 			__u32 val;
 			__u32 val2;
+			__u32 dest_id;
 		} lapic_irq;
 		/* KVM_EXIT_DSM_X2APIC */
 		struct{
@@ -1291,6 +1292,7 @@ struct kvm_dipi_params {
 	int vcpu_id;
 	__u32 val;
 	__u32 val2;
+	__u32 dest_id;
 };
 #define KVM_DSM_IPI               _IOW(KVMIO, 0xf3, struct kvm_dipi_params)
 

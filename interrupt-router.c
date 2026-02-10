@@ -17,6 +17,8 @@
 
 // #define RDMA_DEBUG
 
+#define		APIC_ICR_BUSY		0x01000
+
 #ifdef RDMA_DEBUG
 #define debugf(...) printf(__VA_ARGS__)
 #else
@@ -130,7 +132,8 @@ static int handle_incoming_message(int peer_id, rdma_msg_header_t *hdr, void *da
     if (cpu_index != CPU_INDEX_ANY) {
         current_cpu = qemu_get_cpu(cpu_index);
     }
-    
+    debugf("[RDMA Router] Handling message from peer %d: type=%d, len=%d, seq=%lu, cpu_index=%d\n",
+           peer_id, hdr->msg_type, hdr->data_len, hdr->sequence, cpu_index);
     /* 处理消息 */
     switch (hdr->msg_type) {
     case PIO: {
@@ -200,11 +203,34 @@ static int handle_incoming_message(int peer_id, rdma_msg_header_t *hdr, void *da
         uint32_t val = *(uint32_t*)ptr;
         ptr += sizeof(uint32_t);
         uint32_t val2 = *(uint32_t*)ptr;
+        ptr += sizeof(uint32_t);
+        uint32_t dest_id = *(uint32_t*)ptr;
         
-        int ret = kvm_dipi_forwarding(cpu_index, val, val2);
+        int ret = kvm_dipi_forwarding(cpu_index, val, val2,dest_id);
         if (ret < 0) {
             error_report("KVM DSM IPI fail");
         }
+        printf("SIPI received: cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d\n",
+               cpu_index, val, val2,dest_id);
+        
+         /* 回复 SIPI 响应 */
+        // if (val == 0x300) {
+        //     uint32_t delivery_mode = (val2 & ~APIC_ICR_BUSY) & 0x700;
+        //     if (delivery_mode == 0x500 || delivery_mode == 0x600)
+        //     {
+        //          /* 回复 SIPI 响应 */
+        //         uint32_t response = 99;
+        //         rdma_router_send_response(peer_id, SIPI, hdr->sequence, 
+        //                                 &response, sizeof(response));
+        //     }
+        // }
+        // else if (val == 0x310)
+        // {
+        //     uint32_t response = 99;
+        //     rdma_router_send_response(peer_id, SIPI, hdr->sequence, 
+        //                             &response, sizeof(response));
+        // }
+        
         break;
     }
     
@@ -316,11 +342,6 @@ static int handle_incoming_message(int peer_id, rdma_msg_header_t *hdr, void *da
         }
         
         kvm_ioapic_router_handle(routing);
-        
-        /* 回复确认 */
-        uint32_t response = 99;
-        rdma_router_send_response(peer_id, INI_ROUTER, hdr->sequence, 
-                                  &response, sizeof(response));
         
         free(routing);
         break;
@@ -467,7 +488,7 @@ void pio_forwarding(uint16_t port, MemTxAttrs attrs, void *data, int direction,
 void mmio_forwarding(hwaddr addr, MemTxAttrs attrs, uint8_t *data, int len, bool is_write)
 {
     qemu_mutex_lock(&io_forwarding_mutex);
-    debugf("[RDMA Router] MMIO forwarding: addr=0x%llx, len=%d, is_write=%d\n",
+    printf("[RDMA Router] MMIO forwarding: addr=0x%llx, len=%d, is_write=%d\n",
            (unsigned long long)addr, len, is_write);
     /* 准备消息数据 */
     size_t data_size = sizeof(int32_t) + sizeof(hwaddr) + sizeof(MemTxAttrs) + 
@@ -557,15 +578,15 @@ void special_interrupt_forwarding(int cpu_index, int mask)
     qemu_mutex_unlock(&io_forwarding_mutex);
 }
 
-void startup_forwarding(int cpu_index, uint32_t val, uint32_t val2)
+void startup_forwarding(int cpu_index, uint32_t val, uint32_t val2,uint32_t dest_id)
 {
     qemu_mutex_lock(&io_forwarding_mutex);
-    debugf("[RDMA Router] Startup forwarding: cpu_index=%d, val=0x%08x, val2=0x%08x\n",
+    printf("[RDMA Router] Startup forwarding: cpu_index=%d, val=0x%08x, val2=0x%08x\n",
            cpu_index, val, val2);
     MachineState *ms = MACHINE(qdev_get_machine());
     
     /* 准备消息数据 */
-    size_t data_size = sizeof(int32_t) + sizeof(uint32_t) * 2;
+    size_t data_size = sizeof(int32_t) + sizeof(uint32_t) * 3;
     uint8_t *msg_data = g_malloc(data_size);
     
     uint8_t *ptr = msg_data;
@@ -574,15 +595,122 @@ void startup_forwarding(int cpu_index, uint32_t val, uint32_t val2)
     *(uint32_t*)ptr = val;
     ptr += sizeof(uint32_t);
     *(uint32_t*)ptr = val2;
-    
+    ptr += sizeof(uint32_t);
+    *(uint32_t*)ptr = dest_id;
+    uint32_t delivery_mode = (val2 & ~APIC_ICR_BUSY) & 0x700;
     /* 发送到所有其他 QEMU 实例（除了目标 CPU 所在的） */
     for (int i = 0; i < ms->qemu_nums; i++) {
+        // if (cpu_index  < 0 )
+        // {
+        //     printf("startup_forwarding cpu_index get cpu index %d< 0\n",cpu_index);
+        //     goto end;
+        // }
         if (i == cpu_index / ms->local_cpus) {
-            continue;
+            kvm_dipi_forwarding(cpu_index, val, val2,dest_id);
         }
-        rdma_router_send_request(i, SIPI, msg_data, data_size, NULL, NULL);
-    }
+        // if (val == 0x300)
+        // {   
+        //     int source_qemu = cpu_index / ms->local_cpus;
+        //     int dest_qemu = dest_id / ms->local_cpus;
+        //     if (delivery_mode == 0x600 || delivery_mode == 0x500) {
+        //         if (source_qemu == dest_qemu)
+        //         {
+        //             if (!(dest_id ==0 && cpu_index == 0))
+        //             {
+        //                 printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d, same qemu\n", delivery_mode,cpu_index, val, val2, dest_id);
+        //                 goto end;
+        //             }
+        //             else {
+        //                 uint32_t response;
+        //                 size_t resp_len;
+        //                 printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d , init 0 for all\n", delivery_mode,cpu_index, val, val2, dest_id);
+        //                 rdma_router_send_request(i, SIPI, msg_data, data_size, &response, &resp_len);
+        //             }
+        //         }
+        //         if (i == dest_qemu)
+        //         {
+        //             uint32_t response;
+        //             size_t resp_len;
+        //             printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d\n", delivery_mode,cpu_index, val, val2, dest_id);
+        //             rdma_router_send_request(i, SIPI, msg_data, data_size, &response, &resp_len);
+        //             goto end;
+        //         }
+        //     } 
+        //     else if (delivery_mode == 0x000)
+        //     {
+        //         if (val2 == 0xfb || val2 == 0xfd)
+        //         {
+        //             printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d\n", delivery_mode,cpu_index, val, val2, dest_id);
+        //             rdma_router_send_request(i, SIPI, msg_data, data_size, NULL, NULL);
+        //             continue;
+        //         }
+                
+        //         // if (source_qemu != 0 && dest_qemu != 0 && i == 0)
+        //         // {
+        //         //     printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d, sync to qemu 0 first\n", delivery_mode,cpu_index, val, val2, dest_id);
+        //         //     rdma_router_send_request(i, SIPI, msg_data, data_size, NULL,NULL);
+        //         // }
+                
+        //         if (i == dest_id / ms->local_cpus) {
+        //             printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d\n", delivery_mode,cpu_index, val, val2, dest_id);
+        //             rdma_router_send_request(i, SIPI, msg_data, data_size, NULL,NULL);
+        //             goto end;
+        //         } 
+        //         // else if (cpu_index == 0 || dest_id == 0)
+        //         // {
+        //         //     printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d, broadcast\n", delivery_mode,cpu_index, val, val2, dest_id);
+        //         //     rdma_router_send_request(i, SIPI, msg_data, data_size, NULL,NULL);
+        //         // }
+        //         // else
+        //         // {
+        //         //     printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d, not target qemu\n", delivery_mode,cpu_index, val, val2, dest_id);
+        //         // }
+        //         // else if (dest_id == 0 && i != 0)
+        //         // {
+        //         //     printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d, broadcast\n", delivery_mode,cpu_index, val, val2, dest_id);
+        //         //     rdma_router_send_request(i, SIPI, msg_data, data_size, NULL, NULL);
+        //         // }
+        //         // else if (source_qemu != 0 && dest_qemu !=0 && i == 0)
+        //         // {
+        //         //     printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d, sync to qemu 0\n", delivery_mode,cpu_index, val, val2, dest_id);
+        //         //     rdma_router_send_request(i, SIPI, msg_data, data_size, NULL, NULL);
+        //         // }
+                
+        //         // else
+        //         // {
+        //         //     printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d, same qemu\n", delivery_mode,cpu_index, val, val2, dest_id);
+        //         // }
+        //     }
+            
+        //     else
+        //     {
+        //         printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d\n", delivery_mode,cpu_index, val, val2, dest_id);
+        //         rdma_router_send_request(i, SIPI, msg_data, data_size, NULL, NULL);
+        //     }
+        // } 
+        // else if (val == 0x310)
+        // {
+        //     /* code */
+        //     if (i == dest_id / ms->local_cpus) {
+        //         uint32_t response;
+        //         size_t resp_len;
+        //         printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d\n", delivery_mode,cpu_index, val, val2, dest_id);
+        //         rdma_router_send_request(i, SIPI, msg_data, data_size, &response, &resp_len);
+        //         goto end;
+        //     }
+            
+        // }
+        else
+        {   
+            // printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d, break\n", delivery_mode,cpu_index, val, val2, dest_id);
+            // goto end;
+            // printf("SIPI delivery_mode=0x%03x,cpu_index=%d, val=0x%08x, val2=0x%08x, dest_id=%d\n", delivery_mode,cpu_index, val, val2, dest_id);
+            rdma_router_send_request(i, SIPI, msg_data, data_size, NULL, NULL);
+        }
+        
     
+    }
+end:   
     g_free(msg_data);
     qemu_mutex_unlock(&io_forwarding_mutex);
 }
@@ -787,14 +915,8 @@ void ioapic_router_forwarding(struct kvm_irq_routing *routing)
     
     /* 发送到所有其他 QEMU 实例（除了 QEMU 0） */
     for (int i = 1; i < ms->qemu_nums; i++) {
-        uint32_t response;
-        size_t resp_len;
         rdma_router_send_request(i, INI_ROUTER, msg_data, data_size, 
-                                &response, &resp_len);
-        
-        if (response != 99) {
-            error_report("IOAPIC router forwarding to %d failed", i);
-        }
+                                NULL, NULL);
     }
     
     g_free(msg_data);
