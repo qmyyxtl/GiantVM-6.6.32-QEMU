@@ -581,8 +581,8 @@ void special_interrupt_forwarding(int cpu_index, int mask)
 void startup_forwarding(int cpu_index, uint32_t val, uint32_t val2,uint32_t dest_id)
 {
     qemu_mutex_lock(&io_forwarding_mutex);
-    printf("[RDMA Router] Startup forwarding: cpu_index=%d, val=0x%08x, val2=0x%08x\n",
-           cpu_index, val, val2);
+    // printf("[RDMA Router] Startup forwarding: cpu_index=%d, val=0x%08x, val2=0x%08x\n",
+    //        cpu_index, val, val2);
     MachineState *ms = MACHINE(qdev_get_machine());
     
     /* 准备消息数据 */

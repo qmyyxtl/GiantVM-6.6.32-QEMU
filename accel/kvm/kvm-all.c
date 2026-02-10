@@ -98,6 +98,8 @@ static uint64_t kvm_supported_memory_attributes;
 static bool kvm_guest_memfd_supported;
 static hwaddr kvm_max_slot_size = ~0;
 
+static int qemu_forward_count = 0;
+
 static const KVMCapabilityInfo kvm_required_capabilites[] = {
     KVM_CAP_INFO(USER_MEMORY),
     KVM_CAP_INFO(DESTROY_MEMORY_REGION_WORKS),
@@ -3145,9 +3147,18 @@ int kvm_cpu_exec(CPUState *cpu)
             ret = 0;
             break;
         case KVM_EXIT_DSM_SEND_IRQ:
+            qemu_forward_count++;
             // printf("KVM_EXIT_DSM_SEND_IRQ\n");
+            printf("[QEMU-FWD-%d] Received: vcpu=%d, reg=0x%x, val=0x%x, dest=%u, exit_reason=%d\n",
+                qemu_forward_count,
+                run->lapic_irq.id,
+                run->lapic_irq.val,
+                run->lapic_irq.val2,
+                run->lapic_irq.dest_id,
+                run->exit_reason);
             startup_forwarding(run->lapic_irq.id, run->lapic_irq.val, run->lapic_irq.val2, run->lapic_irq.dest_id);
             memset(&run->lapic_irq, 0, sizeof(run->lapic_irq));
+            printf("[QEMU-FWD-%d] Clearing exit_reason\n", qemu_forward_count);
             run->exit_reason = 0;
             ret = 0;
             break;
