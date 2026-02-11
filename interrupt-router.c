@@ -606,7 +606,8 @@ void startup_forwarding(int cpu_index, uint32_t val, uint32_t val2,uint32_t dest
         //     goto end;
         // }
         if (i == cpu_index / ms->local_cpus) {
-            kvm_dipi_forwarding(cpu_index, val, val2,dest_id);
+            // kvm_dipi_forwarding(cpu_index, val, val2,dest_id);
+            continue;
         }
         // if (val == 0x300)
         // {   
