@@ -2,7 +2,125 @@
 
 本分支在 GVM 的 RDMA 巨虚上移植 Loom PCI owner/remote 结构。一个 OS 分别看到各节点持有的 PCI 设备，设备不合并为逻辑卷或网络接口。
 
-## 当前运行配置：共享已连通物理端口的 VF（2026-10-08）
+## 当前验收：真实 VF + guest 原生驱动 + DSM DMA 同步（2026-10-08）
+
+Garen master 172.0.1.4（CPU0/1），Ezreal slave 172.0.1.2（CPU2/3）。
+两端 host 保持 6.6.32-krdma+，QEMU 9.0.90；一个 4 CPU / 4 GiB
+guest 使用新内核 6.12.0-vanilla-vfio，构建 #20，systemd 为 PID 1。
+clocksource=hpet，串口在 Garen 127.0.0.1:5555，QMP 各在本机 4444。
+
+两端 X710 第一物理口 0000:0c:00.0 / ens101f0np0 保留 i40e，
+host 原 IP 与 10 Gb/s 链路保留。只把 VF 0000:0c:02.0
+（独立 IOMMU group 405）绑定 vfio-pci，交给 guest。
+
+| owner | guest PCI | guest 接口 | MAC | guest 运行时 IP |
+| --- | --- | --- | --- | --- |
+| Garen | 00:07.0 | enp0s7 | 52:54:00:da:01:10 | 192.168.100.241/21 |
+| Ezreal | 00:08.0 | enp0s8 | 52:54:00:da:01:11 | 192.168.100.242/21 |
+
+两个独立设备均为真实 Intel VF [8086:154c]，guest 使用内置 iavf，
+carrier=1、speed=10000。没有使用 QEMU 网卡模型替代它们，没有
+将接口合并。两端 PF 双向 ping 仍通过。
+
+### 硬件 DMA 如何与 DSM 配合
+
+旧 VFIO 把 IOMMU 映射直接指向 DSM guest RAM；硬件写入不经过
+KVM_DSM_MEMCPY，远端 CPU 可能读取过期页面。现在启用
+LOOM_VFIO_DSM_DMA=1 后，VFIO 的硬件 DMA 映射指向设备 owner
+私有的匿名缓冲区，不直接指向 DSM 管理的 guest RAM。
+
+guest kernel/dma/loom.c 为目标 VF 安装 DMA API 操作，包装原
+dma_direct 路径。00:03.0、00:04.0 的 loom-dma-bridge 分别属于
+owner0、owner1，通过 MMIO 登记 DMA 地址、长度、方向及同步命令。
+原生 iavf 驱动源码没有修改。初始化时每个 bridge 登记 66 个缓冲区，
+状态为 0；目标设备依然由 iavf 驱动。
+
+QEMU 在 VF BAR 写入前先合并硬件完成的数据，再同步 CPU 提交的
+修改；BAR 读取及 MSI/MSI-X 通知前同步设备写入。只合并相对上次
+基线发生变化的字节，避免整块复制覆盖 CPU 在其他字段的更新。
+较新的 payload 映射先于较旧的 coherent descriptor 映射处理。
+这些复制通过已有 address_space_read/write 和 KVM_DSM_MEMCPY
+路径完成。强制关闭 BAR mmap、KVM irqfd 和 ioeventfd 快路径，
+保证当前同步入口不会被绕过。
+
+这是功能原型：当前验收仅覆盖固定的双节点、root-bus X710 VF、
+guest direct DMA。没有验收 guest IOMMU、P2P DMA、热插拔、迁移、
+任意直通硬件、故障恢复或性能。部分范围同步当前同步整个已登记
+映射；DMA 缓冲区双方同时修改同一字节的行为不能视为通用并发协议。
+
+### 实测结果
+
+- CPU0、CPU2 × 两张 VF，四组各 10 个 1400-byte 常规 ping：
+  40/40 回复，零丢包。
+- CPU0/1/2/3 × 两张 VF，八组各 10 包：80/80；
+  每个回复的 1400-byte 载荷逐字节匹配，ICMP 校验和正确。
+- 远端 CPU2 提交 Garen VF、远端 CPU0 提交 Ezreal VF：
+  每端连续 640 包，8 包一批，1280/1280，载荷校验均通过。
+  连续请求检查了描述符复用；这不是吞吐基准。
+- 两端 host ens101f0np0 抓到来自对端 VF MAC 的真实 ICMP 请求：
+  Garen 收到 .242/MAC ...:11，Ezreal 收到 .241/MAC ...:10。
+- 在载荷矩阵结束时，两接口 rx_errors、tx_errors、rx_dropped、
+  tx_dropped 均为 0。iavf 统计异步刷新，不能用刚完成时的零计数
+  判断无流量。
+
+### 编译与运行
+
+QEMU 实现 commit c34b824bb6，guest kernel commit f10f12144，
+均在 device-aggregation 分支。guest 源码：
+https://github.com/qmyyxtl/GVM-guest-kernel。
+原 fair.c 未提交修改保留，未纳入上述提交。
+
+```bash
+# Garen，编译 guest，沿用 2 MiB BSS 边界与内置 i40e/iavf。
+cd /home/xtl/GVM-guest-kernel
+cp config-device-aggregation .config
+make LOCALVERSION= olddefconfig
+make -j16 LOCALVERSION= bzImage
+cp arch/x86/boot/bzImage /home/xtl/start/bzImage-6.12-vfio-bss2m
+
+# 两端分别编译 QEMU，Ezreal 的根目录满，临时文件放既有 build。
+cd /home/xtl/GVM-qemu
+TMPDIR=/home/xtl/GVM-qemu/build ninja -C build -j8 qemu-system-x86_64
+```
+
+已部署新 bzImage 两端 SHA256：
+8efa92af5453f26c93817f197903a55eee097bfd590456ceadc315863271e722。
+Garen 同名 .config 为配置归档。host 内核没有切换。
+
+启动前确认 IPoIB 的 .4/.2 互通、PF 已连线、VF 独立 IOMMU group、
+VF0 MAC 与表格一致。已有 VF 时不要重置 sriov_numvfs：
+首次且 numvfs=0 时才以 root 向 PF sriov_numvfs 写入 1，再分别用
+ip link set dev ens101f0np0 vf 0 mac <MAC> 配置。启动器仅接受
+具有 physfn 的 VF，拒绝改绑 PF；退出恢复 VF 的原 iavf 绑定。
+
+```bash
+# Garen
+sudo /home/xtl/GVM-qemu/scripts/gvm-device-vfio-node.py 0 --host 0000:0c:02.0
+# Ezreal，紧接着启动
+sudo /home/xtl/GVM-qemu/scripts/gvm-device-vfio-node.py 1 --host 0000:0c:02.0
+```
+
+启动器设置 LOOM_VFIO_DSM_DMA=1；slave 无须指定 -kernel。
+每端追加真实 vfio-pci owner endpoint 和对应 loom-dma-bridge，
+不是两台独立 OS。bridge 的 target-devfn 分别为 56、64。
+
+root 登录 Garen guest 串口后，在 Garen 执行：
+
+```bash
+# 常规四组 ping；仅 guest 运行时网络设置。
+/home/xtl/GVM-qemu/scripts/gvm-device-serial-exec.py \
+  /home/xtl/GVM-qemu/scripts/gvm-device-guest-network-test.py
+
+# 原生 iavf / DMA bridge 检查、80 包载荷矩阵、1280 包连续复用检查。
+/home/xtl/GVM-qemu/scripts/gvm-device-serial-exec.py \
+  /home/xtl/GVM-qemu/scripts/gvm-device-guest-vfio-dma-test.py
+```
+
+串口执行器将生产测试代码交给 guest Python 在内存中执行，
+不创建 guest 脚本、实验日志、overlay 或 PID 文件。
+已授权创建的两块 1 GiB raw 数据镜像仍未附加；磁盘聚合读写未验收。
+
+## 历史对照：未同步 DMA 的双 VF 配置（2026-10-08）
 
 Garen master 172.0.1.4，Ezreal slave 172.0.1.2。两端 host 仍为
 6.6.32-krdma+，QEMU 9.0.90；同一个 4 CPU / 4 GiB guest 运行新内核
