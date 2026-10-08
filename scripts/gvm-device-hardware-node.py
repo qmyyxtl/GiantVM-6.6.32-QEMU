@@ -75,7 +75,7 @@ try:
         disk = Path(args.data_disk)
         if not disk.is_block_device():
             parser.error("--data-disk must be a physical block device")
-        diskfd = os.open(disk, os.O_RDONLY | os.O_CLOEXEC)
+        diskfd = os.open(disk, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECT)
         fds.append(diskfd)
         extra += [
             "-add-fd", f"fd={diskfd},set=1,opaque=physical-data-readonly",
