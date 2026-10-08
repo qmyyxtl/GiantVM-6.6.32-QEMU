@@ -53,3 +53,35 @@ Ezreal 与 Jinx 均保持 6.6.32-krdma+，各运行 QEMU 9.0.90；同一 guest �
 - 未创建实验日志、镜像、overlay 或 guest 测试文件；测试代码由串口直接送入 Python 内存执行。
 
 上述结果只验收模拟 EDU 与 fixed physical MSI 路由，不代表真实 VFIO DMA、网卡收发、磁盘读写或 Linux PCI 驱动 IRQ 亲和性已经验收。
+
+
+## 真实硬件后端检查（2026-10-08）
+
+这项检查将 QEMU e1000/virtio-blk 连接到物理以太网与物理块设备，不是 VFIO PCI 直通。RDMA 巨虚仍使用 ibs4f0；SSH 管理网卡不改绑。
+
+- Ezreal 的 X710 ens101f0np0 已连接，Jinx 的 X710 ens101f0 属于现有 br0。其他空闲以太网口及第二个 IB 口未检测到链路。
+- Jinx /dev/sdb 为 116.4 TiB 物理 RAID 逻辑盘，sdb1 挂载 /data 并提供 NFS；它与系统盘共用 smartpqi 控制器 32:00.0，因此不能整控制器 VFIO 直通。
+- 数据盘以 O_RDONLY | O_DIRECT 打开，通过 fdset 和 readonly=on 提供给 guest。没有卸载 /data，没有对物理盘执行写入，没有创建测试镜像、overlay 或日志文件。
+
+双节点启动尝试中，00:07.0、00:08.0 网络设备及 owner1 的 00:09.0 块设备进入两端聚合目录，但启动未完成：Jinx 设备模型线程停在 KVM_DSM_MEMCPY → kvm_dsm_page_fault → kvm_dsm_fetch → krdma_receive。master 的 PCI owner 请求随后超时。退出/kill 后还留有 DSM 内核等待，需要先清理宿主机状态才能继续。当前不能宣称跨节点网卡收发或物理盘读取通过。
+
+另行在 Jinx 执行单节点对照（同一 QEMU，2 CPU、2 GiB，无 DSM，已有 bzImage-6.12-bss2m；根盘也只读，init=/bin/bash）：
+
+- guest 枚举 e1000 网络设备及 116.4 TiB 的只读 /dev/vdb 数据盘。
+- CPU0/CPU1 各从偏移 0、16 MiB、1 GiB、1 TiB 读取 1 MiB，8 次 SHA-256 均与 host /dev/sdb 一致。
+- guest 192.168.100.242 经 Jinx br0 → ens101f0 → 物理网络访问 Ezreal 192.168.100.17；CPU0/CPU1 各发 10 个 ICMP 包，均收到 10 个回复，丢包为 0。
+- 修复接入脚本中的 TAP MAC 问题：桥端 TAP MAC 必须与 guest 网卡 MAC 不同，否则 local FDB 会截留外部单播回包。macvtap 的 MAC 则需匹配 guest。
+
+可复用的只读单节点检查启动方式：
+
+```bash
+# Jinx；复用已有 br0、guest kernel 和原始根盘
+sudo ./scripts/gvm-device-hardware-node.py 1 --parent br0 \
+    --data-disk /dev/sdb --single-node \
+    --guest-kernel /home/xtl/start/bzImage-6.12-bss2m
+# 串口 loopback 5556、QMP 4445；shell 中挂载 proc/sysfs 即可检查。
+```
+
+启动器退出后删除自己创建的网络接口，不生成文件。多节点硬件后端模式尚有上述启动阻塞，不能作为已验证配置重复运行；真实 VFIO DMA 仍未实现。
+
+代码阅读还发现 MemoryRegionCache/virtio ring 的直接 RAM 访问未经过 DSM；krdma_receive 的 EAGAIN 等待循环缺少 signal/stop 检查。它们是后续需要修补和验证的路径，本次没有改 host 内核，也没有把源码判断当作已确认的完整根因。

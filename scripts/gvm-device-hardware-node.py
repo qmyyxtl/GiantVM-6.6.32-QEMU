@@ -19,12 +19,19 @@ parser.add_argument("node", type=int, choices=(0, 1))
 parser.add_argument("--parent", required=True,
                     help="physical Ethernet interface (node0) or bridge (node1)")
 parser.add_argument("--data-disk", help="physical block device, read-only")
+parser.add_argument("--single-node", action="store_true",
+                    help="control run: 2 local CPUs, read-only root, no DSM")
+parser.add_argument("--guest-kernel",
+                    help="existing guest bzImage for --single-node")
 args = parser.parse_args()
+if args.single_node and not args.guest_kernel:
+    parser.error("--single-node requires --guest-kernel")
+
 if os.geteuid() != 0 or not os.environ.get("SUDO_USER"):
     parser.error("run with sudo as the ordinary QEMU user")
 user = pwd.getpwnam(os.environ["SUDO_USER"])
 root = Path(__file__).resolve().parent.parent
-iface = f"gvm-net{args.node}"
+iface = f"gvm-local{args.node}" if args.single_node else f"gvm-net{args.node}"
 fds = []
 created = False
 child = None
@@ -52,7 +59,10 @@ try:
             "user", user.pw_name)
     created = True
     mac = f"52:54:00:da:00:{16 + args.node:02x}"
-    run("ip", "link", "set", "dev", iface, "address", mac)
+    # A bridge TAP needs a different host MAC; a local bridge FDB entry
+    # must not consume unicast replies destined for the guest.
+    host_mac = mac if args.node == 0 else f"52:54:00:da:10:{16 + args.node:02x}"
+    run("ip", "link", "set", "dev", iface, "address", host_mac)
     if args.node == 1:
         run("ip", "link", "set", "dev", iface, "master", args.parent)
     run("ip", "link", "set", "dev", iface, "up")
@@ -89,9 +99,27 @@ try:
     env = dict(os.environ, GVM_QUIET="1")
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, stop_child)
+    command = [str(root / "scripts/gvm-device-node.sh"), str(args.node)]
+    if args.single_node:
+        # The control guest uses existing images read-only and an init shell.
+        # Ports differ from the distributed guest; no router is started.
+        env.pop("LOOM_DEVICE_AGGREGATION", None)
+        image = env.get("GVM_ROOT_IMAGE", "/home/xtl/start/debian-12-40G.raw")
+        command = [
+            str(root / "build/qemu-system-x86_64"),
+            "-enable-kvm", "-machine", "kernel-irqchip=split",
+            "-smp", "2", "-m", "2G", "-display", "none", "-monitor", "none",
+            "-qmp", "tcp:127.0.0.1:4445,server=on,wait=off",
+            "-serial", "tcp:127.0.0.1:5556,server=on,wait=off",
+            "-kernel", args.guest_kernel,
+            "-append", "notsc nokaslr console=ttyS0 root=/dev/vda1 ro init=/bin/bash",
+            "-drive", f"file={image},format=raw,id=rootfs,if=none,"
+                      "readonly=on,file.locking=off",
+            "-device", "virtio-blk-pci,drive=rootfs,id=rootfs,addr=04.0",
+        ]
     child = subprocess.Popen(
-        [str(root / "scripts/gvm-device-node.sh"), str(args.node), *extra],
-        env=env, pass_fds=fds, preexec_fn=drop_privileges,
+        [*command, *extra], env=env, stdout=subprocess.DEVNULL,
+        pass_fds=fds, preexec_fn=drop_privileges,
     )
     raise SystemExit(child.wait())
 finally:
