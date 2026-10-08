@@ -41,8 +41,16 @@ guest 没有为 X710 绑定驱动，modprobe i40e 返回缺少
 
 磁盘后端可以是每个 owner 各自的 raw 或 qcow2 文件，guest 保持两块
 独立磁盘；也可使用独立物理块设备。镜像格式不解决跨机 DMA/virtqueue
-缓存一致性问题。当前 Garen/Ezreal 没有独立空闲物理数据盘，尚未创建
-新数据镜像，也未验收跨机磁盘读写。
+缓存一致性问题。当前 Garen/Ezreal 没有独立空闲物理数据盘。经用户授权，已各创建一个
+1 GiB raw 稀疏数据盘：Garen /home/xtl/start/gvm-device-data-node0.raw，
+Ezreal /home/xtl/start/gvm-device-data-node1.raw，初始各实际分配 4 KiB。
+它们尚未挂入 guest，未验收跨机磁盘读写。
+
+两端已连通的 X710 0000:0c:00.0 均为 10 Gb/s，sriov_totalvfs=64、
+sriov_numvfs=0。可以保留 host PF，并从这个物理端口创建 VF 供 guest
+直通；这不需要启用未连通的第二物理端口。PF 直通需要 i40e；VF
+直通需要 iavf。当前 guest 源码配置的 CONFIG_I40E、CONFIG_I40EVF
+均关闭，已有镜像的驱动模块版本也不匹配运行中的 guest 内核。
 
 每次 host 重启后恢复 IB 地址（仅运行时配置）：
 
