@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/pci/loom.h"
 #include "qemu/help-texts.h"
 #include "qemu/datadir.h"
 #include "qemu/units.h"
@@ -2751,6 +2752,11 @@ void qmp_x_exit_preconfig(Error **errp)
 
     qemu_init_board();
     qemu_create_cli_devices();
+    loom_pci_prepare();
+    if (loom_pci_enabled()) {
+        start_io_router();
+        loom_pci_bootstrap();
+    }
     if (!qemu_machine_creation_done(errp)) {
         return;
     }
@@ -2763,7 +2769,9 @@ void qmp_x_exit_preconfig(Error **errp)
         replay_vmstate_init();
     }
 
-    start_io_router();
+    if (!loom_pci_enabled()) {
+        start_io_router();
+    }
 
     if (incoming) {
         Error *local_err = NULL;

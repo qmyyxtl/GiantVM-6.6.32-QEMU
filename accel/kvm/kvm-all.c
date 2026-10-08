@@ -14,6 +14,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/pci/loom.h"
 #include <sys/ioctl.h>
 #include <poll.h>
 
@@ -2076,6 +2077,10 @@ int kvm_irqchip_get_virq(KVMState *s)
 
 int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg)
 {
+    int status;
+    if (loom_pci_forward_msi(msg, &status)) {
+        return status;
+    }
     struct kvm_msi msi;
 
     msi.address_lo = (uint32_t)msg.address;
@@ -2265,6 +2270,12 @@ int kvm_irqchip_update_msi_route(KVMState *s, int virq, MSIMessage msg)
 int kvm_irqchip_add_irqfd_notifier_gsi(KVMState *s, EventNotifier *n,
                                        EventNotifier *rn, int virq)
 {
+    /* First RDMA backend routes MSI in QEMU; a local irqfd would inject
+     * into remote vCPU replicas. Device backends must use their fallback.
+     */
+    if (loom_pci_enabled()) {
+        return -ENOSYS;
+    }
     return kvm_irqchip_assign_irqfd(s, n, rn, virq, true);
 }
 
@@ -2738,6 +2749,10 @@ static void kvm_handle_io(uint16_t port, MemTxAttrs attrs, void *data, int direc
     int i;
     uint8_t *ptr = data;
 
+    if (loom_pci_handle_pio(port, attrs, data, direction, size, count)) {
+        return;
+    }
+
     MachineState *ms = MACHINE(qdev_get_machine());
     if (ms->local_cpus != ms->smp.cpus) {
         // AP PIO redirect
@@ -3178,6 +3193,12 @@ int kvm_cpu_exec(CPUState *cpu)
             ret = 0;
             break;
         case KVM_EXIT_MMIO:
+            if (loom_pci_handle_mmio(run->mmio.phys_addr, attrs,
+                                     run->mmio.data, run->mmio.len,
+                                     run->mmio.is_write)) {
+                ret = 0;
+                break;
+            }
             // printf("KVM_EXIT_MMIO\n");
         //TODO: IO_APIC
             if (ms->local_cpus != ms->smp.cpus && ms->local_cpu_start_index != 0) {
@@ -4519,3 +4540,8 @@ int kvm_ioapic_router_handle(struct kvm_irq_routing *routing)
     return fd;
 }
 
+
+int loom_pci_inject_msi(MSIMessage msg)
+{
+    return kvm_irqchip_send_msi(kvm_state, msg);
+}

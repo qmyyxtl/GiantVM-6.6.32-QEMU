@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/pci/loom.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_bridge.h"
 #include "hw/pci/pci_host.h"
@@ -93,7 +94,16 @@ void pci_host_config_write_common(PCIDevice *pci_dev, uint32_t addr,
     trace_pci_cfg_write(pci_dev->name, pci_dev_bus_num(pci_dev),
                         PCI_SLOT(pci_dev->devfn),
                         PCI_FUNC(pci_dev->devfn), addr, val);
+    bool reset = loom_pci_config_will_reset(pci_dev, addr, val, len);
+    if (reset) {
+        loom_pci_reset_begin(pci_dev);
+    }
     pci_dev->config_write(pci_dev, addr, val, MIN(len, limit - addr));
+    if (reset) {
+        loom_pci_reset_end(pci_dev);
+    } else {
+        loom_pci_publish(pci_dev);
+    }
 }
 
 uint32_t pci_host_config_read_common(PCIDevice *pci_dev, uint32_t addr,
@@ -166,6 +176,7 @@ static void pci_host_config_write(void *opaque, hwaddr addr,
         return;
     }
     s->config_reg = val;
+    loom_pci_config_address(val);
 }
 
 static uint64_t pci_host_config_read(void *opaque, hwaddr addr,

@@ -14,6 +14,9 @@
 #include "qom/object_interfaces.h"
 #include "hw/boards.h"
 #include "migration/rdma-gvm.h"
+#include "hw/pci/loom.h"
+#include "sysemu/kvm.h"
+#include "qemu/main-loop.h"
 
 // #define RDMA_DEBUG
 
@@ -46,7 +49,21 @@ enum forward_type {
     SHUTDOWN,
     RESET,
     EXIT,
+    LOOM_PCI,
+    LOOM_DIRECTORY,
+    LOOM_INTX,
+    LOOM_MSI,
 };
+
+
+typedef struct LoomDirectoryRequest {
+    uint32_t offset, size;
+} LoomDirectoryRequest;
+typedef struct LoomDirectoryResponse {
+    int32_t status;
+    uint32_t size;
+    uint8_t data[LOOM_DIRECTORY_CHUNK];
+} LoomDirectoryResponse;
 
 QemuMutex ipi_mutex;
 QemuMutex io_forwarding_mutex;
@@ -136,6 +153,63 @@ static int handle_incoming_message(int peer_id, rdma_msg_header_t *hdr, void *da
            peer_id, hdr->msg_type, hdr->data_len, hdr->sequence, cpu_index);
     /* 处理消息 */
     switch (hdr->msg_type) {
+    case LOOM_PCI: {
+        LoomPCIRequest request;
+        LoomPCIResponse response = { .status = -EINVAL };
+        if (hdr->data_len == sizeof(int32_t) + sizeof(request)) {
+            memcpy(&request, ptr, sizeof(request));
+            loom_pci_dispatch(&request, &response);
+        }
+        rdma_router_send_response(peer_id, LOOM_PCI, hdr->sequence,
+                                  &response, sizeof(response));
+        break;
+    }
+    case LOOM_DIRECTORY: {
+        LoomDirectoryRequest request;
+        LoomDirectoryResponse response = { .status = -EINVAL };
+        if (hdr->data_len == sizeof(int32_t) + sizeof(request)) {
+            memcpy(&request, ptr, sizeof(request));
+            loom_pci_directory_dispatch(request.offset, response.data,
+                                         request.size, &response.status);
+            if (!response.status) {
+                response.size = request.size;
+            }
+        }
+        rdma_router_send_response(peer_id, LOOM_DIRECTORY, hdr->sequence,
+                                  &response, offsetof(LoomDirectoryResponse, data) +
+                                  response.size);
+        break;
+    }
+    case LOOM_INTX: {
+        LoomPCIRequest request;
+        if (hdr->data_len == sizeof(int32_t) + sizeof(request) &&
+            MACHINE(qdev_get_machine())->local_cpu_start_index == 0) {
+            memcpy(&request, ptr, sizeof(request));
+            if (request.device_id / 64 == peer_id) {
+                loom_pci_intx_dispatch(&request);
+            }
+        }
+        break;
+    }
+    case LOOM_MSI: {
+        MSIMessage message;
+        int32_t status = -EINVAL;
+        MachineState *ms = MACHINE(qdev_get_machine());
+        if (hdr->data_len == sizeof(int32_t) + sizeof(message)) {
+            memcpy(&message, ptr, sizeof(message));
+            unsigned target = (message.address >> 12) & 0xff;
+            if (!(message.address & 4) && !(message.data & 0x700) &&
+                target >= ms->local_cpu_start_index &&
+                target < ms->local_cpu_start_index + ms->local_cpus) {
+                status = loom_pci_inject_msi(message);
+            }
+        }
+        if (!hdr->flags) {
+            rdma_router_send_response(peer_id, LOOM_MSI, hdr->sequence,
+                                      &status, sizeof(status));
+        }
+        break;
+    }
     case PIO: {
         /* 解析 PIO 数据 */
         uint16_t port = *(uint16_t*)ptr;
@@ -215,8 +289,7 @@ static int handle_incoming_message(int peer_id, rdma_msg_header_t *hdr, void *da
         
          /* 回复 SIPI 响应 */
         // if (val == 0x300) {
-        //     uint32_t delivery_mode = (val2 & ~APIC_ICR_BUSY) & 0x700;
-        //     if (delivery_mode == 0x500 || delivery_mode == 0x600)
+        //         //     if (delivery_mode == 0x500 || delivery_mode == 0x600)
         //     {
         //          /* 回复 SIPI 响应 */
         //         uint32_t response = 99;
@@ -597,7 +670,6 @@ void startup_forwarding(int cpu_index, uint32_t val, uint32_t val2,uint32_t dest
     *(uint32_t*)ptr = val2;
     ptr += sizeof(uint32_t);
     *(uint32_t*)ptr = dest_id;
-    uint32_t delivery_mode = (val2 & ~APIC_ICR_BUSY) & 0x700;
     /* 发送到所有其他 QEMU 实例（除了目标 CPU 所在的） */
     for (int i = 0; i < ms->qemu_nums; i++) {
         if (i == cpu_index / ms->local_cpus) {
@@ -611,7 +683,6 @@ void startup_forwarding(int cpu_index, uint32_t val, uint32_t val2,uint32_t dest
         
     
     }
-end:   
     g_free(msg_data);
     qemu_mutex_unlock(&io_forwarding_mutex);
 }
@@ -932,4 +1003,122 @@ void exit_forwarding(void)
     
     g_free(msg_data);
     qemu_mutex_unlock(&io_forwarding_mutex);
+}
+/* Separate request and response QPs allow the peer handler to progress.
+ * Drop the BQL before waiting for any owner to acquire its BQL.
+ */
+static int loom_rpc(int owner, uint16_t type, const void *payload, size_t size,
+                    void *response, size_t capacity, size_t *length)
+{
+    uint8_t data[MAX_MSG_DATA_SIZE];
+    int32_t cpu = CPU_INDEX_ANY;
+    bool locked = bql_locked();
+    int result;
+
+    if (size > sizeof(data) - sizeof(cpu)) {
+        return -EMSGSIZE;
+    }
+    memcpy(data, &cpu, sizeof(cpu));
+    memcpy(data + sizeof(cpu), payload, size);
+    if (locked) {
+        bql_unlock();
+    }
+    result = rdma_router_call(owner, type, data, size + sizeof(cpu),
+                              response, capacity, length, 5000);
+    if (locked) {
+        bql_lock();
+    }
+    return result;
+}
+
+int loom_pci_rpc(int owner, const LoomPCIRequest *req, LoomPCIResponse *resp)
+{
+    size_t length = 0;
+    int result = loom_rpc(owner, LOOM_PCI, req, sizeof(*req), resp,
+                          sizeof(*resp), &length);
+    return result < 0 ? result : length == sizeof(*resp) ? 0 : -EPROTO;
+}
+
+int loom_pci_directory_rpc(int owner, uint32_t offset, void *buffer, uint32_t size)
+{
+    uint8_t *out = buffer;
+    while (size) {
+        LoomDirectoryRequest req = { offset, MIN(size, LOOM_DIRECTORY_CHUNK) };
+        LoomDirectoryResponse resp;
+        size_t length = 0;
+        int result = loom_rpc(owner, LOOM_DIRECTORY, &req, sizeof(req),
+                              &resp, sizeof(resp), &length);
+        if (result < 0) {
+            return result;
+        }
+        if (length < offsetof(LoomDirectoryResponse, data) || resp.status ||
+            resp.size != req.size ||
+            length != offsetof(LoomDirectoryResponse, data) + resp.size) {
+            return -EPROTO;
+        }
+        memcpy(out, resp.data, resp.size);
+        out += resp.size;
+        offset += resp.size;
+        size -= resp.size;
+    }
+    return 0;
+}
+
+static void loom_send_intx(void *opaque)
+{
+    LoomPCIRequest *req = opaque;
+    loom_rpc(0, LOOM_INTX, req, sizeof(*req), NULL, 0, NULL);
+    g_free(req);
+}
+
+void loom_pci_intx_notify(const LoomPCIRequest *req)
+{
+    /* Do not send while the owner's PCI/BQL callback is active. */
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), loom_send_intx,
+                            g_memdup2(req, sizeof(*req)));
+}
+
+static void loom_send_msi(void *opaque)
+{
+    MSIMessage *msg = opaque;
+    MachineState *ms = MACHINE(qdev_get_machine());
+    int owner = ((msg->address >> 12) & 0xff) / ms->local_cpus;
+    int32_t status;
+    size_t length = 0;
+    int result = loom_rpc(owner, LOOM_MSI, msg, sizeof(*msg), &status,
+                          sizeof(status), &length);
+    g_free(msg);
+    if (result < 0 || length != sizeof(status) || status < 0) {
+        error_report("Loom RDMA: remote MSI delivery failed");
+        exit(EXIT_FAILURE);
+    }
+}
+
+bool loom_pci_forward_msi(MSIMessage msg, int *status)
+{
+    MachineState *ms = MACHINE(qdev_get_machine());
+    unsigned cpu, owner;
+    if (!loom_pci_enabled()) {
+        return false;
+    }
+    /* Initial routing contract: physical, fixed, xAPIC destinations. */
+    if ((msg.address & 4) || (msg.address >> 32) || (msg.data & 0x700)) {
+        *status = -EOPNOTSUPP;
+        return true;
+    }
+    cpu = (msg.address >> 12) & 0xff;
+    if (cpu >= ms->smp.cpus) {
+        *status = -EINVAL;
+        return true;
+    }
+    owner = cpu / ms->local_cpus;
+    if (owner == ms->local_cpu_start_index / ms->local_cpus) {
+        return false;
+    }
+    /* Queue after the model callback; simultaneous cross-owner MMIO must
+     * not recurse into a response QP already owned by another vCPU. */
+    aio_bh_schedule_oneshot(qemu_get_aio_context(), loom_send_msi,
+                            g_memdup2(&msg, sizeof(msg)));
+    *status = 0;
+    return true;
 }

@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <arpa/inet.h>
+#include <time.h>
 #include <stdbool.h> 
 
 // #define RDMA_DEBUG
@@ -448,7 +449,7 @@ static int create_connection(const char *host, int port, struct rdma_cm_id *serv
     pthread_mutex_init(&conn->send_lock, NULL);
     pthread_mutex_init(&conn->recv_lock, NULL);
     pthread_mutex_init(&conn->response_lock, NULL);
-    conn->send_free_mask = (1 << RDMA_BUFFER_COUNT) - 1;
+    conn->send_free_mask = 1;
     conn->next_seq = 1;
     conn->response_queue = NULL;
     
@@ -587,22 +588,14 @@ static int rdma_send_msg(rdma_conn_t *conn, rdma_msg_header_t *hdr, const void *
 {
     pthread_mutex_lock(&conn->send_lock);
     
-    // Find free buffer
-    int buf_idx = -1;
-    for (int i = 0; i < RDMA_BUFFER_COUNT; i++) {
-        if (conn->send_free_mask & (1 << i)) {
-            buf_idx = i;
-            conn->send_free_mask &= ~(1 << i);
-            break;
-        }
-    }
-    
-    if (buf_idx < 0) {
+    /* send_lock and synchronous completion make one send buffer enough.
+     * A 32-bit bitmask cannot describe RDMA_BUFFER_COUNT (1024) entries. */
+    int buf_idx = 0;
+    if (hdr->data_len > MAX_MSG_DATA_SIZE || (hdr->data_len && !data)) {
         pthread_mutex_unlock(&conn->send_lock);
-        fprintf(stderr, "[RDMA] No free send buffer\n");
-        return -1;
+        return -EMSGSIZE;
     }
-    
+
     // Copy message
     void *buf = conn->send_bufs[buf_idx];
     memcpy(buf, hdr, sizeof(*hdr));
@@ -697,6 +690,12 @@ static void* recv_thread_func(void *arg)
             void *buf = conn->recv_bufs[buf_idx];
             
             rdma_msg_header_t *hdr = (rdma_msg_header_t*)buf;
+            if (wc.byte_len < sizeof(*hdr) || hdr->data_len > MAX_MSG_DATA_SIZE ||
+                hdr->data_len > wc.byte_len - sizeof(*hdr)) {
+                fprintf(stderr, "[RDMA] Malformed request\n");
+                g_ctx.running = false;
+                break;
+            }
             void *data = buf + sizeof(*hdr);
             
             debugf("[RDMA Router] Received request from peer %d: type=%d, len=%d, seq=%lu\n",
@@ -745,97 +744,112 @@ static void* recv_thread_func(void *arg)
 
 // ============ API 实现 ============
 
+
+static uint64_t rdma_monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int rdma_repost_response(rdma_conn_t *conn, unsigned index)
+{
+    struct ibv_sge sge = {
+        .addr = (uint64_t)conn->recv_bufs[index],
+        .length = RDMA_BUFFER_SIZE,
+        .lkey = conn->recv_mrs[index]->lkey,
+    };
+    struct ibv_recv_wr wr = {
+        .wr_id = index, .sg_list = &sge, .num_sge = 1,
+    }, *bad;
+    return ibv_post_recv(conn->qp, &wr, &bad) ? -EIO : 0;
+}
+
+int rdma_router_call(int target_id, uint16_t msg_type,
+                      const void *req_data, size_t req_len,
+                      void *resp_data, size_t resp_capacity, size_t *resp_len,
+                      unsigned timeout_ms)
+{
+    rdma_conn_t *req, *resp;
+    rdma_msg_header_t hdr;
+    uint64_t deadline;
+    int result = -EIO;
+
+    if (target_id < 0 || target_id >= g_ctx.total_nodes ||
+        req_len > MAX_MSG_DATA_SIZE || (req_len && !req_data)) {
+        return -EINVAL;
+    }
+    req = g_ctx.request_conns[target_id];
+    resp = g_ctx.response_for_req_conns[target_id];
+    if (!req || (resp_data && !resp)) {
+        return -ENOTCONN;
+    }
+    /* Every response CQ has one consumer, including legacy callers. */
+    pthread_mutex_lock(&req->response_lock);
+    hdr = (rdma_msg_header_t) {
+        .msg_type = msg_type, .flags = resp_data ? 0 : 1,
+        .data_len = req_len,
+        .sequence = __sync_fetch_and_add(&req->next_seq, 1),
+    };
+    deadline = rdma_monotonic_ms() + timeout_ms;
+    if (rdma_send_msg(req, &hdr, req_data) < 0) {
+        goto out;
+    }
+    if (!resp_data) {
+        result = 0;
+        goto out;
+    }
+    while (rdma_monotonic_ms() < deadline) {
+        struct ibv_wc wc;
+        int n = ibv_poll_cq(resp->cq, 1, &wc);
+        if (n < 0) {
+            goto out;
+        }
+        if (!n) {
+            usleep(1);
+            continue;
+        }
+        if (wc.status != IBV_WC_SUCCESS || wc.opcode != IBV_WC_RECV ||
+            wc.wr_id >= RDMA_BUFFER_COUNT || wc.byte_len < sizeof(hdr)) {
+            result = -EPROTO;
+            goto out;
+        }
+        rdma_msg_header_t *reply = resp->recv_bufs[wc.wr_id];
+        if (reply->data_len > MAX_MSG_DATA_SIZE ||
+            reply->data_len > wc.byte_len - sizeof(*reply)) {
+            rdma_repost_response(resp, wc.wr_id);
+            result = -EPROTO;
+            goto out;
+        }
+        if (reply->sequence != hdr.sequence) {
+            /* A response to a timed-out operation has no live waiter. */
+            rdma_repost_response(resp, wc.wr_id);
+            continue;
+        }
+        if (reply->msg_type != msg_type || reply->data_len > resp_capacity) {
+            rdma_repost_response(resp, wc.wr_id);
+            result = -EMSGSIZE;
+            goto out;
+        }
+        memcpy(resp_data, (uint8_t *)reply + sizeof(*reply), reply->data_len);
+        if (resp_len) {
+            *resp_len = reply->data_len;
+        }
+        result = rdma_repost_response(resp, wc.wr_id);
+        goto out;
+    }
+    result = -ETIMEDOUT;
+out:
+    pthread_mutex_unlock(&req->response_lock);
+    return result;
+}
+
 int rdma_router_send_request(int target_id, uint16_t msg_type,
                               const void *req_data, size_t req_len,
                               void *resp_data, size_t *resp_len)
 {
-    rdma_conn_t *req_conn = g_ctx.request_conns[target_id];
-    rdma_conn_t *resp_conn = g_ctx.response_for_req_conns[target_id];
-    
-    if (!req_conn) return -1;
-    
-    rdma_msg_header_t hdr;
-    hdr.msg_type = msg_type;
-    hdr.flags = 0;
-    hdr.data_len = req_len;
-    hdr.sequence = __sync_fetch_and_add(&req_conn->next_seq, 1);
-    
-    debugf("[RDMA Router] Sending request to %d: type=%d, len=%zu, seq=%lu\n",
-           target_id, msg_type, req_len, hdr.sequence);
-    
-    // 发送请求
-    if (rdma_send_msg(req_conn, &hdr, req_data) < 0) {
-        return -1;
-    }
-    
-    debugf("[RDMA Router] Sent request to %d: type=%d, len=%zu, seq=%lu\n",
-           target_id, msg_type, req_len, hdr.sequence);
-    
-    // 🔑 关键修复：如果不需要响应（resp_data == NULL），直接返回
-    if (resp_data == NULL) {
-        debugf("[RDMA Router] No response needed for seq=%lu\n", hdr.sequence);
-        return 0;
-    }
-    
-    // 需要响应的情况，等待响应
-    if (!resp_conn) {
-        fprintf(stderr, "[RDMA Router] No response connection to %d\n", target_id);
-        return -1;
-    }
-    
-    debugf("[RDMA Router] Waiting for response from %d: seq=%lu\n", target_id, hdr.sequence);
-    
-    while (1) {
-        struct ibv_wc wc;
-        int n = ibv_poll_cq(resp_conn->cq, 1, &wc);
-        
-        if (n == 1 && wc.opcode == IBV_WC_RECV) {
-            int buf_idx = wc.wr_id;
-            void *buf = resp_conn->recv_bufs[buf_idx];
-            
-            rdma_msg_header_t *resp_hdr = (rdma_msg_header_t*)buf;
-            
-            if (resp_hdr->sequence == hdr.sequence) {
-                // 匹配！
-                if (resp_hdr->data_len > 0) {
-                    memcpy(resp_data, buf + sizeof(*resp_hdr), resp_hdr->data_len);
-                }
-                if (resp_len) *resp_len = resp_hdr->data_len;
-                
-                debugf("[RDMA Router] Found response from %d: seq=%lu\n", target_id, hdr.sequence);
-                
-                // Re-post
-                struct ibv_sge sge;
-                sge.addr = (uint64_t)buf;
-                sge.length = RDMA_BUFFER_SIZE;
-                sge.lkey = resp_conn->recv_mrs[buf_idx]->lkey;
-                
-                struct ibv_recv_wr wr, *bad_wr;
-                memset(&wr, 0, sizeof(wr));
-                wr.wr_id = buf_idx;
-                wr.sg_list = &sge;
-                wr.num_sge = 1;
-                ibv_post_recv(resp_conn->qp, &wr, &bad_wr);
-                
-                return 0;
-            }
-            
-            // 不匹配，re-post
-            struct ibv_sge sge;
-            sge.addr = (uint64_t)buf;
-            sge.length = RDMA_BUFFER_SIZE;
-            sge.lkey = resp_conn->recv_mrs[buf_idx]->lkey;
-            
-            struct ibv_recv_wr wr, *bad_wr;
-            memset(&wr, 0, sizeof(wr));
-            wr.wr_id = buf_idx;
-            wr.sg_list = &sge;
-            wr.num_sge = 1;
-            ibv_post_recv(resp_conn->qp, &wr, &bad_wr);
-        }
-        
-        usleep(1);
-    }
+    return rdma_router_call(target_id, msg_type, req_data, req_len,
+                            resp_data, MAX_MSG_DATA_SIZE, resp_len, 30000);
 }
 
 int rdma_router_send_response(int peer_id, uint16_t msg_type, uint64_t sequence,

@@ -28,6 +28,12 @@ int rdma_router_send_request(int target_id, uint16_t msg_type,
                               const void *req_data, size_t req_len,
                               void *resp_data, size_t *resp_len);
 
+/* Bounded, serialized RPC. Timeout means outcome unknown; never retry I/O. */
+int rdma_router_call(int target_id, uint16_t msg_type,
+                      const void *req_data, size_t req_len,
+                      void *resp_data, size_t resp_capacity, size_t *resp_len,
+                      unsigned timeout_ms);
+
 // 发送响应
 int rdma_router_send_response(int peer_id, uint16_t msg_type, uint64_t sequence,
                                const void *data, size_t len);

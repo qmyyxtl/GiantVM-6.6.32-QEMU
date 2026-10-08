@@ -1,5 +1,6 @@
 pci_ss = ss.source_set()
 pci_ss.add(files(
+  'loom.c',
   'msi.c',
   'msix.c',
   'pci.c',

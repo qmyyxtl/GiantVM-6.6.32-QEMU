@@ -78,6 +78,8 @@ struct PCIDevice {
     uint8_t *used;
 
     /* the following fields are read only */
+    bool loom_aggregate;
+    int32_t loom_numa_node;
     int32_t devfn;
     /*
      * Cached device to fetch requester ID from, to avoid the PCI tree

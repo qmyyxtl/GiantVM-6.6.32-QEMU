@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/pci/loom.h"
 #include "qemu/datadir.h"
 #include "qemu/units.h"
 #include "hw/irq.h"
@@ -68,6 +69,8 @@ static void pcibus_reset_hold(Object *obj, ResetType type);
 static bool pcie_has_upstream_port(PCIDevice *dev);
 
 static Property pci_props[] = {
+    DEFINE_PROP_BOOL("loom-aggregate", PCIDevice, loom_aggregate, false),
+    DEFINE_PROP_INT32("loom-numa-node", PCIDevice, loom_numa_node, -1),
     DEFINE_PROP_PCI_DEVFN("addr", PCIDevice, devfn, -1),
     DEFINE_PROP_STRING("romfile", PCIDevice, romfile),
     DEFINE_PROP_UINT32("romsize", PCIDevice, romsize, UINT32_MAX),
@@ -258,7 +261,6 @@ static const TypeInfo cxl_bus_info = {
     .class_init = pcie_bus_class_init,
 };
 
-static void pci_update_mappings(PCIDevice *d);
 static void pci_irq_handler(void *opaque, int irq_num, int level);
 static void pci_add_option_rom(PCIDevice *pdev, bool is_default_rom, Error **);
 static void pci_del_option_rom(PCIDevice *pdev);
@@ -304,6 +306,9 @@ static void pci_bus_change_irq_level(PCIBus *bus, int irq_num, int change)
 static void pci_change_irq_level(PCIDevice *pci_dev, int irq_num, int change)
 {
     PCIBus *bus;
+    if (loom_pci_route_intx(pci_dev, irq_num, change)) {
+        return;
+    }
     for (;;) {
         int dev_irq = irq_num;
         bus = pci_get_bus(pci_dev);
@@ -418,8 +423,10 @@ static void pci_do_device_reset(PCIDevice *dev)
  */
 void pci_device_reset(PCIDevice *dev)
 {
+    loom_pci_reset_begin(dev);
     device_cold_reset(&dev->qdev);
     pci_do_device_reset(dev);
+    loom_pci_reset_end(dev);
 }
 
 /*
@@ -1511,7 +1518,7 @@ pcibus_t pci_bar_address(PCIDevice *d,
     return new_addr;
 }
 
-static void pci_update_mappings(PCIDevice *d)
+void pci_update_mappings(PCIDevice *d)
 {
     PCIIORegion *r;
     int i;
@@ -1655,6 +1662,19 @@ void pci_set_irq(PCIDevice *pci_dev, int level)
 {
     int intx = pci_intx(pci_dev);
     pci_irq_handler(pci_dev, intx, level);
+}
+
+void loom_pci_set_effective_irq(PCIDevice *dev, unsigned pin, bool level)
+{
+    int change;
+    assert(pin < PCI_NUM_PINS);
+    change = level - pci_irq_state(dev, pin);
+    if (!change) {
+        return;
+    }
+    pci_set_irq_state(dev, pin, level);
+    pci_update_irq_status(dev);
+    pci_change_irq_level(dev, pin, change);
 }
 
 /* Special hooks used by device assignment */

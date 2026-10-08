@@ -1504,7 +1504,7 @@ static int qemu_rdma_poll(RDMAContext *rdma, struct ibv_cq *cq,
 /* Wait for activity on the completion channel.
 * Returns 0 on success, none-0 on error.
 */
-static int qemu_rdma_wait_comp_channel(RDMAContext *rdma,
+static int G_GNUC_UNUSED qemu_rdma_wait_comp_channel(RDMAContext *rdma,
                                     struct ibv_comp_channel *comp_channel)
 {
     struct rdma_cm_event *cm_event;
