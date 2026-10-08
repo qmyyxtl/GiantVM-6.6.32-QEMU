@@ -393,8 +393,15 @@ static void execute(unsigned owner, LoomPCIRequest *req, LoomPCIResponse *resp)
 {
     if (owner == local_node) {
         loom_pci_dispatch(req, resp);
-    } else if (loom_pci_rpc(owner, req, resp) < 0) {
-        fatal_error("owner request failed; outcome unknown, no automatic retry");
+    } else {
+        int status = loom_pci_rpc(owner, req, resp);
+        if (status < 0) {
+            error_report("Loom PCI owner=%u device=%u op=%u bar=%u "
+                         "offset=0x%" PRIx64 " size=%u status=%d",
+                         owner, req->device_id, req->operation, req->bar,
+                         req->offset, req->size, status);
+            fatal_error("owner request failed; outcome unknown, no automatic retry");
+        }
     }
     if (resp->status || (resp->generation != req->generation &&
                          req->operation != LOOM_PCI_CONFIG_WRITE)) {
