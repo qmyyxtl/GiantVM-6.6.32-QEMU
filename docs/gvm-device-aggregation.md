@@ -2,7 +2,34 @@
 
 本分支在 GVM 的 RDMA 巨虚上移植 Loom PCI owner/remote 结构。一个 OS 分别看到各节点持有的 PCI 设备，设备不合并为逻辑卷或网络接口。
 
-## 启动
+## 当前运行配置（Garen / Ezreal）
+
+Garen 为 master（CPU0/1，172.0.1.4），Ezreal 为 slave（CPU2/3，
+172.0.1.2）。两端 host 均为 6.6.32-krdma+，一个 guest 使用 4 CPU、
+4 GiB，guest 版本 6.12.0-vanilla，可登录 root。当前使用
+clocksource=hpet，两块独立网络设备为 00:07.0、00:08.0，各以本机
+ens101f0np0 的 macvtap 为物理以太网后端。它们不是 VFIO 直通。
+
+EDU BAR/DMA/MSI/双向并发通过，物理网络四组各 10 个 1400-byte
+ICMP 包通过。已修复并验证远端 CPU 的 BQL 错配和退出忙等：
+两端并发 QMP quit 均正常退出（状态码 0），接口和端口均清理，
+随后重新启动成功。最终两端 QMP 均为 running；guest CPU0–3 在线，
+时钟源 hpet，两块网卡地址分别为 192.168.100.241/21、.242/21。
+
+每次 host 重启后先恢复 IB 地址（仅运行时配置，不生成配置文件）：
+
+```bash
+# Garen
+sudo /home/xtl/GVM-qemu/scripts/gvm-rdma-link.py 172.0.1.4/24
+# Ezreal
+sudo /home/xtl/GVM-qemu/scripts/gvm-rdma-link.py 172.0.1.2/24
+```
+
+实际启动命令见下方“当前时钟配置与启动命令”。尚未验收物理数据盘
+聚合、真实 VFIO DMA 或长期稳定性。Garen 旧标准 QEMU 的 worker-g4
+另有自定义 KVM exit 42 的 ABI 兼容问题，目前 paused，见末节。
+
+## 早期启动配置（Ezreal / Jinx）
 
 Host 使用现有 6.6.32-krdma+，QEMU 基于 9.0.90。默认 4 CPU、4 GiB，Ezreal 执行 CPU0/1，Jinx 执行 CPU2/3。两端必须紧接着启动，沿用已有 IB 地址 172.0.1.2、172.0.1.3。
 
@@ -41,7 +68,7 @@ MSI 目标测试使用 Linux 现有 IRQ-work 向量 0xf6，观察 /proc/interrup
 只支持单根总线上的静态 PCI endpoint；动态热插拔、逻辑/广播 MSI、内核 irqfd 加速、真实 VFIO DMA、跨节点故障 supervisor 尚未实现。现有根盘仍使用 master 的旧设备路径。设备聚合逻辑位于 QEMU；Garen 的 host 内核使用同步后的 RDMA 基线编译。
 
 
-## 已完成的真实双机验证
+## 早期 EDU 真实双机验证（Ezreal / Jinx）
 
 Ezreal 与 Jinx 均保持 6.6.32-krdma+，各运行 QEMU 9.0.90；同一 guest 为 6.12.0-rc5-g8f585d63b94a-dirty，4 CPU 在线。root/root 可通过串口登录。
 
