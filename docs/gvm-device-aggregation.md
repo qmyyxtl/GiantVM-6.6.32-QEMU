@@ -85,3 +85,16 @@ sudo ./scripts/gvm-device-hardware-node.py 1 --parent br0 \
 启动器退出后删除自己创建的网络接口，不生成文件。多节点硬件后端模式尚有上述启动阻塞，不能作为已验证配置重复运行；真实 VFIO DMA 仍未实现。
 
 代码阅读还发现 MemoryRegionCache/virtio ring 的直接 RAM 访问未经过 DSM；krdma_receive 的 EAGAIN 等待循环缺少 signal/stop 检查。它们是后续需要修补和验证的路径，本次没有改 host 内核，也没有把源码判断当作已确认的完整根因。
+
+
+## Garen master / Jinx slave
+
+两端先运行 `sudo ./scripts/gvm-rdma-link.py ADDRESS/24`：Garen 为
+172.0.1.4，Jinx 为 172.0.1.3。运行内核须支持 KVM DSM RDMA。两端设置
+`GVM_IPLIST='172.0.1.4 172.0.1.3'`，Garen 执行 node 0，Jinx 执行 node 1。
+Garen master 可复用 `/home/xtl/start/bzImage-6.12-bss2m`。
+
+聚合网络设备关闭 option ROM (`romfile=`)：当前远端设备描述只发布普通
+BAR，并未发布 expansion ROM；网络设备不承担 guest 启动。此设置关闭
+一个不受支持的路径，并不证明它是先前 DSM 阻塞的根因。物理数据盘
+使用各 owner 唯一的 BDF：node0 为 00:09.0，node1 为 00:0a.0。

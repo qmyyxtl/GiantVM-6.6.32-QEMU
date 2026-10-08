@@ -80,7 +80,7 @@ try:
         "-netdev", f"tap,id=physical-net,fd={netfd},vhost=off",
         "-device", f"e1000,id=physical-net-owner-{args.node},"
                    f"netdev=physical-net,mac={mac},addr=0{7 + args.node}.0,"
-                   f"loom-aggregate=on,loom-numa-node={args.node}",
+                   f"loom-aggregate=on,loom-numa-node={args.node},romfile=",
     ]
     if args.data_disk:
         disk = Path(args.data_disk)
@@ -94,7 +94,7 @@ try:
                       "readonly=on,file.driver=host_device,file.locking=off,"
                       "cache=none",
             "-device", f"virtio-blk-pci,drive=physical-data,id=physical-data,"
-                       f"addr=09.0,ioeventfd=off,vectors=0,"
+                       f"addr=0{9 + args.node:x}.0,ioeventfd=off,vectors=0,"
                        f"loom-aggregate=on,loom-numa-node={args.node}",
         ]
     env = dict(os.environ, GVM_QUIET="1")
