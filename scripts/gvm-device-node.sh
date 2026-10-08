@@ -13,10 +13,15 @@ args=(
     -local-cpu "cpus=2,start=$((node * 2)),iplist=${GVM_IPLIST:-172.0.1.2 172.0.1.3}"
     -drive "file=${GVM_ROOT_IMAGE:-/home/xtl/start/debian-12-40G.raw},format=raw,id=rootfs,if=none,file.locking=off"
     -device ide-hd,drive=rootfs,id=rootfs
-    -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22
-    -device virtio-net-pci,netdev=net0,addr=03.0
     -device "edu,id=edu-owner-$node,addr=0$((5 + node)).0,loom-aggregate=on,loom-numa-node=$node"
 )
+# Some host builds omit libslirp; the serial console needs no user network.
+case ${GVM_USER_NET:-1} in
+    1) args+=(-netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22
+              -device virtio-net-pci,netdev=net0,addr=03.0) ;;
+    0) ;;
+    *) echo 'GVM_USER_NET must be 0 or 1' >&2; exit 2 ;;
+esac
 if [[ $node == 0 ]]; then
     args+=(
         -serial tcp:127.0.0.1:5555,server=on,wait=off

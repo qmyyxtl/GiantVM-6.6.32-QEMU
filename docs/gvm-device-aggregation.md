@@ -98,3 +98,13 @@ Garen master 可复用 `/home/xtl/start/bzImage-6.12-bss2m`。
 BAR，并未发布 expansion ROM；网络设备不承担 guest 启动。此设置关闭
 一个不受支持的路径，并不证明它是先前 DSM 阻塞的根因。物理数据盘
 使用各 owner 唯一的 BDF：node0 为 00:09.0，node1 为 00:0a.0。
+
+
+## Garen master / Ezreal slave
+
+Garen 使用 172.0.1.4，Ezreal 使用 172.0.1.2，两端设置
+`GVM_IPLIST='172.0.1.4 172.0.1.2'`。Garen 的 QEMU 构建未包含
+libslirp，两端显式设置 `GVM_USER_NET=0`，串口登录和聚合设备测试
+不依赖默认 user 网络。Garen 执行 node 0，Ezreal 执行 node 1；
+master 设置 `GVM_GUEST_KERNEL=/home/xtl/start/bzImage-6.12-bss2m`。
+物理网络后端可在两端选择现有 `ens101f0np0`，无需改绑 IB 或管理网卡。
