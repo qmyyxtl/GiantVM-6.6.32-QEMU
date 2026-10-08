@@ -10,7 +10,12 @@ import subprocess
 parser = argparse.ArgumentParser()
 parser.add_argument("node", type=int, choices=(0, 1))
 parser.add_argument("--host", required=True, help="VF PCI address, e.g. 0000:0c:02.0")
+parser.add_argument("--data-disk", type=Path, help="existing dedicated raw data image")
 args = parser.parse_args()
+if args.data_disk is not None:
+    args.data_disk = args.data_disk.resolve()
+    if not args.data_disk.is_file() or args.data_disk.stat().st_size != 1024 ** 3:
+        parser.error("--data-disk must be an existing dedicated 1 GiB raw image")
 if os.geteuid() != 0:
     parser.error("run with sudo; VFIO group access is required")
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -59,10 +64,18 @@ try:
     bridge = (f"loom-dma-bridge,id=dma-owner-{args.node},"
               f"addr=0{3 + args.node}.0,target-devfn={8 * (7 + args.node)},"
               f"loom-aggregate=on,loom-numa-node={args.node}")
+    extra = []
+    if args.data_disk is not None:
+        extra = ["-drive", f"file={args.data_disk},format=raw,if=none,"
+                 f"id=data-owner-{args.node},cache=none,aio=threads",
+                 "-device", f"virtio-blk-pci,drive=data-owner-{args.node},"
+                 f"id=data-owner-{args.node},addr=0{9 + args.node:x}.0,"
+                 f"serial=GVM-DATA-OWNER{args.node},ioeventfd=off,vectors=0,"
+                 f"loom-aggregate=on,loom-numa-node={args.node}"]
     print(f"VF {args.host}; host PF {parent.name} remains on i40e", flush=True)
     child = subprocess.Popen([str(root / "scripts/gvm-device-node.sh"),
                               str(args.node), "-device", endpoint,
-                              "-device", bridge], env=env)
+                              "-device", bridge, *extra], env=env)
     print(f"QEMU PID {child.pid}", flush=True)
     raise SystemExit(child.wait())
 finally:
