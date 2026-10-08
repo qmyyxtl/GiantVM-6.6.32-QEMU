@@ -38,7 +38,7 @@ MSI 目标测试使用 Linux 现有 IRQ-work 向量 0xf6，观察 /proc/interrup
 
 ## 当前边界
 
-只支持单根总线上的静态 PCI endpoint；动态热插拔、逻辑/广播 MSI、内核 irqfd 加速、真实 VFIO DMA、跨节点故障 supervisor 尚未实现。现有根盘仍使用 master 的旧设备路径。本分支不修改 host 内核。
+只支持单根总线上的静态 PCI endpoint；动态热插拔、逻辑/广播 MSI、内核 irqfd 加速、真实 VFIO DMA、跨节点故障 supervisor 尚未实现。现有根盘仍使用 master 的旧设备路径。设备聚合逻辑位于 QEMU；Garen 的 host 内核使用同步后的 RDMA 基线编译。
 
 
 ## 已完成的真实双机验证
@@ -82,7 +82,7 @@ sudo ./scripts/gvm-device-hardware-node.py 1 --parent br0 \
 # 串口 loopback 5556、QMP 4445；shell 中挂载 proc/sysfs 即可检查。
 ```
 
-启动器退出后删除自己创建的网络接口，不生成文件。多节点硬件后端模式尚有上述启动阻塞，不能作为已验证配置重复运行；真实 VFIO DMA 仍未实现。
+启动器退出后删除自己创建的网络接口，不生成文件。这次早期多节点硬件后端尝试有上述启动阻塞；后文记录 Garen / Ezreal 配置的验证结果。真实 VFIO DMA 仍未实现。
 
 代码阅读还发现 MemoryRegionCache/virtio ring 的直接 RAM 访问未经过 DSM；krdma_receive 的 EAGAIN 等待循环缺少 signal/stop 检查。它们是后续需要修补和验证的路径，本次没有改 host 内核，也没有把源码判断当作已确认的完整根因。
 
@@ -153,3 +153,37 @@ Garen 与 Ezreal 各只有系统用的 /dev/sda，未发现独立数据盘；
 现使用远端互斥锁、条件变量、通知代次及存活线程计数：先设待确认
 数量再通知，每线程每代确认一次；shutdown 状态保留，重复通知
 不会等待已退出的线程。公共清理还覆盖 SIGTERM 发起的退出。
+
+
+### 当前时钟配置与启动命令
+
+复测时曾出现一次远端网卡 ping 5/10。进一步测得 guest 使用
+kvm-clock 时，CPU2 切回 CPU0 的 CLOCK_MONOTONIC 倒退约 65–75 ms；
+使用 host 计时限定等待的 raw ICMP 四组各 10 包均收到，1400-byte
+载荷逐字节校验通过。切换 guest 到 hpet 后，八次跨 CPU 采样均递增，
+常规 ping 四组各 10 包再次全部收到。该配置是本轮时钟问题的规避
+措施，并未修复跨 host 的 KVM pvclock 协议，也没有验收性能或长期
+稳定性；首组 ping 仍可出现较大延迟。
+
+两端紧接着启动，不生成日志、镜像、overlay 或 PID 文件：
+
+```bash
+# Garen master，CPU0/1
+sudo GVM_USER_NET=0 GVM_IPLIST='172.0.1.4 172.0.1.2' \
+  GVM_GUEST_KERNEL=/home/xtl/start/bzImage-6.12-bss2m \
+  GVM_GUEST_EXTRA_ARGS='clocksource=hpet' \
+  /home/xtl/GVM-qemu/scripts/gvm-device-hardware-node.py 0 \
+  --parent ens101f0np0
+
+# Ezreal slave，CPU2/3
+sudo GVM_USER_NET=0 GVM_IPLIST='172.0.1.4 172.0.1.2' \
+  /home/xtl/GVM-qemu/scripts/gvm-device-hardware-node.py 1 \
+  --parent ens101f0np0
+```
+
+Master 串口监听 Garen loopback 5555，两端 QMP 都在 loopback 4444。
+Guest 网络测试脚本配置运行时地址，见前节；本配置没有附加物理数据盘。
+
+Garen 的旧 libvirt worker-g4 使用系统标准 QEMU，重启后报告
+`KVM: unknown exit reason 42`（自定义 KVM_EXIT_DSM_APIC_BASE），
+目前 paused；常规 QEMU 与该 RDMA 内核的 ABI 兼容需要另行处理。

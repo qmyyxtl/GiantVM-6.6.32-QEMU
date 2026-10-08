@@ -25,10 +25,11 @@ case ${GVM_USER_NET:-1} in
     *) echo 'GVM_USER_NET must be 0 or 1' >&2; exit 2 ;;
 esac
 if [[ $node == 0 ]]; then
+    guest_cmdline='notsc nokaslr console=ttyS0 root=/dev/sda1 memmap=64K$0x08000000'
     args+=(
         -serial tcp:127.0.0.1:5555,server=on,wait=off
         -kernel "${GVM_GUEST_KERNEL:-/home/xtl/start/bzImage}"
-        -append 'notsc nokaslr console=ttyS0 root=/dev/sda1 memmap=64K$0x08000000'
+        -append "$guest_cmdline ${GVM_GUEST_EXTRA_ARGS:-}"
     )
 else
     args+=(-serial null)
