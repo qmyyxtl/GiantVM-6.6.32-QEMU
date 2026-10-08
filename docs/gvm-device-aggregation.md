@@ -108,3 +108,15 @@ libslirp，两端显式设置 `GVM_USER_NET=0`，串口登录和聚合设备测�
 不依赖默认 user 网络。Garen 执行 node 0，Ezreal 执行 node 1；
 master 设置 `GVM_GUEST_KERNEL=/home/xtl/start/bzImage-6.12-bss2m`。
 物理网络后端可在两端选择现有 `ens101f0np0`，无需改绑 IB 或管理网卡。
+
+
+### Garen / Ezreal EDU 验收（2026-10-08）
+
+Garen master 与 Ezreal slave 均运行 6.6.32-krdma+，guest 使用已有
+bzImage-6.12-bss2m，运行版本为 6.12.0-vanilla，4 CPU 在线，可进入
+root shell。CPU0/CPU2 × owner0/owner1 的 BAR、有序访问、4096-byte
+DMA 往返与跨 CPU 数据检查全部通过；八组 MSI 各 8 次投递通过，
+两个 CPU 同时访问各自远端 owner 各 128 轮通过。两端 IPoIB ping
+均 5/5，双向 rping 校验各 1000 × 4096 byte 通过。
+
+GVM_USER_NET=0 同时指定 -nic none，禁止 QEMU 自动添加默认网卡。

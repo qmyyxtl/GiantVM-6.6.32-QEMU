@@ -19,7 +19,7 @@ args=(
 case ${GVM_USER_NET:-1} in
     1) args+=(-netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22
               -device virtio-net-pci,netdev=net0,addr=03.0) ;;
-    0) ;;
+    0) args+=(-nic none) ;;
     *) echo 'GVM_USER_NET must be 0 or 1' >&2; exit 2 ;;
 esac
 if [[ $node == 0 ]]; then
