@@ -2,7 +2,79 @@
 
 本分支在 GVM 的 RDMA 巨虚上移植 Loom PCI owner/remote 结构。一个 OS 分别看到各节点持有的 PCI 设备，设备不合并为逻辑卷或网络接口。
 
-## 当前运行配置（Garen / Ezreal，2026-10-08 VFIO 枚举验证）
+## 当前运行配置：共享已连通物理端口的 VF（2026-10-08）
+
+Garen master 172.0.1.4，Ezreal slave 172.0.1.2。两端 host 仍为
+6.6.32-krdma+，QEMU 9.0.90；同一个 4 CPU / 4 GiB guest 运行新内核
+6.12.0-vanilla-vfio（构建 #19），systemd 为 PID 1，已登录 root。
+两端 QMP query-status 为 running。串口在 Garen 127.0.0.1:5555。
+
+每端已连通的 X710 第一口 0000:0c:00.0 / ens101f0np0 保留给 host，
+i40e 驱动、原 IP、10 Gb/s 链路保留。其上创建一个 SR-IOV VF：
+0000:0c:02.0，独占 IOMMU group 405，绑定 vfio-pci 交给 guest。
+第二个物理端口不再参与实验。两个 guest 设备如下：
+
+| owner | guest PCI | guest 接口 | MAC | runtime IP |
+| --- | --- | --- | --- | --- |
+| Garen | 00:07.0 | enp0s7 | 52:54:00:da:01:10 | 192.168.100.241/21 |
+| Ezreal | 00:08.0 | enp0s8 | 52:54:00:da:01:11 | 192.168.100.242/21 |
+
+两块均为真实 VF [8086:154c]，Kernel driver in use: iavf。
+当前 driver 绑定与网络接口创建通过，**跨机数据收发未通过**：两块接口
+administrative UP，但 carrier=0；CPU0/CPU2 × owner0/owner1 四组各
+3 个 1400-byte ICMP 包均为 0/3，最初 owner0 的 10 包检查也是 0/10。
+邮箱 MSI-X 计数 owner1 为 3、owner0 为 2，TxRx 队列中断均为 0。
+初始化曾出现 Failed to communicate with PF，重试后创建接口。
+
+单机对照使用同一个新内核、同一 VF、只读已有根盘、2 CPU / 2 GiB，
+不启用 DSM。两台 guest 各出现 eth0，iavf、carrier=1、10 Gb/s；
+CPU0/CPU1 分别向另一台 host 数据地址发 5 个 1400-byte ping，
+四组共 20/20 通过。创建 VF 后及对照测试期间开始的 host 双向 ping
+各为 5/5，原 PF 网络仍可用。不得把单机收发结果算作跨机聚合通过。
+
+定位到的边界：VFIO 在 hw/vfio/common.c 通过 RAM host pointer 做
+IOMMU 映射，硬件 DMA 没有经过 system/physmem.c 的
+KVM_DSM_MEMCPY/MEMPIN。当前代码没有在硬件 DMA 完成时更新 DSM
+页面状态并同步远端 CPU 的访问。读取 AdminQ 寄存器可见硬件已推进：
+owner0 ARQ head/tail=3/2，owner1=4/3；直接读取各 host pc.ram 的
+同一 GPA，完成描述符标志在两端副本不同。DSM 本身允许未持有页面的
+副本过期，所以快照差异不能单独证明根因；结合单机对照与代码路径，
+目前证据指向 DMA/DSM 配合，尚未通过修复后的收发验证确认。
+检查期间 CPU0 一度位于 kvm_dsm_fetch -> krdma_receive；随后恢复响应，
+无 host 重启。跨机硬件 DMA 协议仍需实现，不能宣称聚合数据通路成功。
+
+启动器 scripts/gvm-device-vfio-node.py 只接受 VF（必须有 physfn），
+拒绝改绑 PF；退出恢复 VF 原 iavf 驱动，保留 PF 和已创建 VF。
+运行时改绑和实验输出不创建日志、PID 文件或 guest 脚本。
+
+```bash
+# 两端首先恢复 IPoIB，分别使用 172.0.1.4/24、172.0.1.2/24。
+# 首次且 sriov_numvfs=0 时才创建 VF；已有 VF 时不要重置 sriov_numvfs。
+# 每端已配置 VF0 MAC：Garen 52:54:00:da:01:10，Ezreal ...:11。
+# Garen
+sudo /home/xtl/GVM-qemu/scripts/gvm-device-vfio-node.py 0 --host 0000:0c:02.0
+# Ezreal，紧接着启动
+sudo /home/xtl/GVM-qemu/scripts/gvm-device-vfio-node.py 1 --host 0000:0c:02.0
+```
+
+Guest 源码 https://github.com/qmyyxtl/GVM-guest-kernel 的
+ device-aggregation 分支，commit 46840bf1c：config-device-aggregation
+启用内置 i40e/iavf，BSS 起止 2 MiB 对齐，并修复原 PID 批量缓存将
+init 分配为 PID 8 的启动错误：首次 namespace PID 绕过批量缓存，
+后续进程仍使用缓存。Garen 原 fair.c 的未提交修改保留，未纳入该提交。
+
+```bash
+cp config-device-aggregation .config
+make LOCALVERSION= olddefconfig
+make -j16 LOCALVERSION= bzImage
+```
+
+新产物两端均为 /home/xtl/start/bzImage-6.12-vfio-bss2m，SHA256
+89ec32c4b8b803c788641d01a3ece5c7678bf80b9ee9f67ce5e3e12b99ef09b2。
+Garen 同名 .config 为配置归档。host 内核未切换。
+已创建的两块 1 GiB raw 数据镜像仍未挂入 guest，磁盘聚合读写未验收。
+
+## 历史 PF 枚举配置（Garen / Ezreal，2026-10-08）
 
 Garen 为 master（CPU0/1，172.0.1.4），Ezreal 为 slave（CPU2/3，
 172.0.1.2）。两端 host 均为 6.6.32-krdma+，QEMU 9.0.90，一个
