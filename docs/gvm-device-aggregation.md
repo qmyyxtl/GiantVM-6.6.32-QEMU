@@ -2,21 +2,49 @@
 
 本分支在 GVM 的 RDMA 巨虚上移植 Loom PCI owner/remote 结构。一个 OS 分别看到各节点持有的 PCI 设备，设备不合并为逻辑卷或网络接口。
 
-## 当前运行配置（Garen / Ezreal）
+## 当前运行配置（Garen / Ezreal，2026-10-08 VFIO 枚举验证）
 
 Garen 为 master（CPU0/1，172.0.1.4），Ezreal 为 slave（CPU2/3，
-172.0.1.2）。两端 host 均为 6.6.32-krdma+，一个 guest 使用 4 CPU、
-4 GiB，guest 版本 6.12.0-vanilla，可登录 root。当前使用
-clocksource=hpet，两块独立网络设备为 00:07.0、00:08.0，各以本机
-ens101f0np0 的 macvtap 为物理以太网后端。它们不是 VFIO 直通。
+172.0.1.2）。两端 host 均为 6.6.32-krdma+，QEMU 9.0.90，一个
+4 CPU / 4 GiB guest 使用 6.12.0-vanilla、clocksource=hpet，可登录 root。
 
-EDU BAR/DMA/MSI/双向并发通过，物理网络四组各 10 个 1400-byte
-ICMP 包通过。已修复并验证远端 CPU 的 BQL 错配和退出忙等：
-两端并发 QMP quit 均正常退出（状态码 0），接口和端口均清理，
-随后重新启动成功。最终两端 QMP 均为 running；guest CPU0–3 在线，
-时钟源 hpet，两块网卡地址分别为 192.168.100.241/21、.242/21。
+两端各将空闲的 X710 功能 0000:0c:00.1 从 i40e 改绑 vfio-pci。
+该功能各自独占 IOMMU group 25。guest 00:07.0 属于 Garen，00:08.0
+属于 Ezreal，均识别为真实 Intel X710 [8086:1572]，不是 e1000 模型。
+CPU0 和 CPU2 分别读取两块设备的 PCI 配置，四组 vendor/device 均为
+86 80 72 15。两端 QMP query-status 均为 running。
 
-每次 host 重启后先恢复 IB 地址（仅运行时配置，不生成配置文件）：
+启动沿用 scripts/gvm-device-node.sh，设置 GVM_USER_NET=0、
+GVM_IPLIST="172.0.1.4 172.0.1.2"、GVM_GUEST_EXTRA_ARGS=clocksource=hpet；
+master 使用 /home/xtl/start/bzImage-6.12-bss2m。每端追加：
+
+```text
+-device vfio-pci,host=0000:0c:00.1,id=vfio-owner-N,addr=BDF,rombar=0,x-no-mmap=on,x-no-kvm-msi=on,x-no-kvm-msix=on,loom-aggregate=on,loom-numa-node=N
+```
+
+N=0 时 BDF=07.0，N=1 时 BDF=08.0；须先在对应 host 改绑该 PCI 功能。
+本次启动与改绑管理器通过内存执行，未产生实验脚本、日志、镜像或 overlay。
+退出后管理器恢复原 i40e 驱动。不要改绑承载 SSH 的 I350、RDMA 传输卡，
+或仍承载 host/macvtap 网络的 X710 0000:0c:00.0。
+
+**当前只通过 PCI 纳入及配置空间访问，未通过 VFIO 收发或跨机硬件 DMA。**
+guest 没有为 X710 绑定驱动，modprobe i40e 返回缺少
+/lib/modules/6.12.0-vanilla 对应模块。Garen 空闲端口在单机对照退出并
+恢复 i40e 后启用检查，ethtool 报 Link detected: no；Ezreal 空闲端口的
+物理链路在此次验证中未测。后续收发需要匹配的 guest 驱动及有效链路，
+还需要解决 VFIO IOMMU 映射与 RDMA DSM 页面所有权的配合：硬件 DMA
+直接访问 owner host 的 RAM，不经过现有 KVM_DSM_MEMCPY/MEMPIN 软件路径。
+
+此前 macvtap + e1000 配置通过 EDU BAR/DMA/MSI/双向并发及四组各
+10 个 1400-byte ICMP 包，详见后文；这些结果不作为本次 VFIO 的收发结果。
+已修复远端 CPU BQL 错配和退出忙等，并验证退出、接口清理及重新启动。
+
+磁盘后端可以是每个 owner 各自的 raw 或 qcow2 文件，guest 保持两块
+独立磁盘；也可使用独立物理块设备。镜像格式不解决跨机 DMA/virtqueue
+缓存一致性问题。当前 Garen/Ezreal 没有独立空闲物理数据盘，尚未创建
+新数据镜像，也未验收跨机磁盘读写。
+
+每次 host 重启后恢复 IB 地址（仅运行时配置）：
 
 ```bash
 # Garen
@@ -25,9 +53,8 @@ sudo /home/xtl/GVM-qemu/scripts/gvm-rdma-link.py 172.0.1.4/24
 sudo /home/xtl/GVM-qemu/scripts/gvm-rdma-link.py 172.0.1.2/24
 ```
 
-实际启动命令见下方“当前时钟配置与启动命令”。尚未验收物理数据盘
-聚合、真实 VFIO DMA 或长期稳定性。Garen 旧标准 QEMU 的 worker-g4
-另有自定义 KVM exit 42 的 ABI 兼容问题，目前 paused，见末节。
+Garen 标准 QEMU 的 worker-g4 有自定义 KVM exit 42 的 ABI 兼容问题，
+目前 paused，见末节。物理数据盘聚合、真实 VFIO DMA、长期稳定性未验收。
 
 ## 早期启动配置（Ezreal / Jinx）
 
