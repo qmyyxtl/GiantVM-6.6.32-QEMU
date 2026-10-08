@@ -35,6 +35,7 @@ typedef struct VFIOAddressSpace {
  */
 typedef struct VFIOContainerBase {
     Object parent;
+    struct LoomVFIODMA *loom_dma;
     VFIOAddressSpace *space;
     MemoryListener listener;
     Error *error;

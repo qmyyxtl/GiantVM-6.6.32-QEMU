@@ -45,7 +45,8 @@ try:
     Path("/sys/bus/pci/drivers_probe").write_text(args.host)
     if (pci / "driver").resolve().name != "vfio-pci":
         raise RuntimeError("VFIO binding failed")
-    env = dict(os.environ, GVM_USER_NET="0", GVM_QUIET="1")
+    env = dict(os.environ, GVM_USER_NET="0", GVM_QUIET="1",
+               LOOM_VFIO_DSM_DMA="1")
     env.setdefault("GVM_IPLIST", "172.0.1.4 172.0.1.2")
     env.setdefault("GVM_GUEST_KERNEL", "/home/xtl/start/bzImage-6.12-vfio-bss2m")
     env.setdefault("GVM_GUEST_EXTRA_ARGS", "clocksource=hpet")
@@ -55,9 +56,13 @@ try:
                 f"addr=0{7 + args.node}.0,rombar=0,x-no-mmap=on,"
                 "x-no-kvm-msi=on,x-no-kvm-msix=on,"
                 f"loom-aggregate=on,loom-numa-node={args.node}")
+    bridge = (f"loom-dma-bridge,id=dma-owner-{args.node},"
+              f"addr=0{3 + args.node}.0,target-devfn={8 * (7 + args.node)},"
+              f"loom-aggregate=on,loom-numa-node={args.node}")
     print(f"VF {args.host}; host PF {parent.name} remains on i40e", flush=True)
     child = subprocess.Popen([str(root / "scripts/gvm-device-node.sh"),
-                              str(args.node), "-device", endpoint], env=env)
+                              str(args.node), "-device", endpoint,
+                              "-device", bridge], env=env)
     print(f"QEMU PID {child.pid}", flush=True)
     raise SystemExit(child.wait())
 finally:

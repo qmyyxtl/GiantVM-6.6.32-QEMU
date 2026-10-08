@@ -23,6 +23,8 @@
 #include <sys/ioctl.h>
 
 #include "hw/vfio/vfio-common.h"
+#include "hw/vfio/loom-dma.h"
+#include "sysemu/runstate.h"
 #include "hw/hw.h"
 #include "trace.h"
 #include "qapi/error.h"
@@ -145,6 +147,20 @@ bool vfio_set_irq_signaling(VFIODevice *vbasedev, int index, int subindex,
     return false;
 }
 
+static bool vfio_loom_sync(VFIODevice *dev, bool submit)
+{
+    int ret = loom_vfio_dma_sync(dev->bcontainer, false);
+    if (!ret && submit) {
+        ret = loom_vfio_dma_sync(dev->bcontainer, true);
+    }
+    if (ret) {
+        error_report("VFIO DSM DMA synchronization failed for %s: %s",
+                     dev->name, strerror(-ret));
+        vm_stop(RUN_STATE_INTERNAL_ERROR);
+    }
+    return !ret;
+}
+
 /*
  * IO Port/MMIO - Beware of the endians, VFIO is always little endian
  */
@@ -159,6 +175,10 @@ void vfio_region_write(void *opaque, hwaddr addr,
         uint32_t dword;
         uint64_t qword;
     } buf;
+
+    if (!vfio_loom_sync(vbasedev, true)) {
+        return;
+    }
 
     switch (size) {
     case 1:
@@ -210,6 +230,10 @@ uint64_t vfio_region_read(void *opaque,
         uint64_t qword;
     } buf;
     uint64_t data = 0;
+
+    if (!vfio_loom_sync(vbasedev, false)) {
+        return UINT64_MAX;
+    }
 
     if (pread(vbasedev->fd, &buf, size, region->fd_offset + addr) != size) {
         error_report("%s(%s:region%d+0x%"HWADDR_PRIx", %d) failed: %m",

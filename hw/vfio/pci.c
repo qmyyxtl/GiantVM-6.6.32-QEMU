@@ -19,6 +19,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/vfio/loom-dma.h"
+#include "sysemu/runstate.h"
 #include CONFIG_DEVICES /* CONFIG_IOMMUFD */
 #include <linux/vfio.h>
 #include <sys/ioctl.h>
@@ -367,6 +369,13 @@ static void vfio_msi_interrupt(void *opaque)
         abort();
     }
 
+    int dma_ret = loom_vfio_dma_sync(vdev->vbasedev.bcontainer, false);
+    if (dma_ret) {
+        error_report("VFIO DSM DMA completion synchronization failed: %s",
+                     strerror(-dma_ret));
+        vm_stop(RUN_STATE_INTERNAL_ERROR);
+        return;
+    }
     msg = get_msg(&vdev->pdev, nr);
     trace_vfio_msi_interrupt(vdev->vbasedev.name, nr, msg.address, msg.data);
     notify(&vdev->pdev, nr);
@@ -2966,6 +2975,14 @@ static void vfio_realize(PCIDevice *pdev, Error **errp)
     int i, ret;
     char uuid[UUID_STR_LEN];
     g_autofree char *name = NULL;
+
+    if (loom_vfio_dma_enabled()) {
+        vbasedev->no_mmap = true;
+        vdev->no_kvm_msi = true;
+        vdev->no_kvm_msix = true;
+        vdev->no_kvm_ioeventfd = true;
+        vdev->no_vfio_ioeventfd = true;
+    }
 
     if (vbasedev->fd < 0 && !vbasedev->sysfsdev) {
         if (!(~vdev->host.domain || ~vdev->host.bus ||

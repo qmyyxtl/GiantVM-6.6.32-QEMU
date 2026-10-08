@@ -14,6 +14,7 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "hw/vfio/vfio-container-base.h"
+#include "hw/vfio/loom-dma.h"
 
 int vfio_container_dma_map(VFIOContainerBase *bcontainer,
                            hwaddr iova, ram_addr_t size,
@@ -21,8 +22,17 @@ int vfio_container_dma_map(VFIOContainerBase *bcontainer,
 {
     VFIOIOMMUClass *vioc = VFIO_IOMMU_GET_CLASS(bcontainer);
 
+    int ret = loom_vfio_dma_map(bcontainer, iova, size, &vaddr, readonly);
+
+    if (ret) {
+        return ret;
+    }
     g_assert(vioc->dma_map);
-    return vioc->dma_map(bcontainer, iova, size, vaddr, readonly);
+    ret = vioc->dma_map(bcontainer, iova, size, vaddr, readonly);
+    if (ret) {
+        loom_vfio_dma_unmap(bcontainer, iova, size);
+    }
+    return ret;
 }
 
 int vfio_container_dma_unmap(VFIOContainerBase *bcontainer,
@@ -31,8 +41,14 @@ int vfio_container_dma_unmap(VFIOContainerBase *bcontainer,
 {
     VFIOIOMMUClass *vioc = VFIO_IOMMU_GET_CLASS(bcontainer);
 
+    int ret;
+
     g_assert(vioc->dma_unmap);
-    return vioc->dma_unmap(bcontainer, iova, size, iotlb);
+    ret = vioc->dma_unmap(bcontainer, iova, size, iotlb);
+    if (!ret) {
+        loom_vfio_dma_unmap(bcontainer, iova, size);
+    }
+    return ret;
 }
 
 bool vfio_container_add_section_window(VFIOContainerBase *bcontainer,
@@ -112,6 +128,7 @@ static void vfio_container_instance_finalize(Object *obj)
         g_free(giommu);
     }
 
+    loom_vfio_dma_free(bcontainer);
     g_list_free_full(bcontainer->iova_ranges, g_free);
 }
 
