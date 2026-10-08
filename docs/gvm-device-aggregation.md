@@ -1,5 +1,169 @@
 # RDMA 版设备聚合
 
+## 2026-10-08 DMA pin 协议修复与持续写回归
+
+本节是最新状态，后文保留此前验收和故障现场作为历史记录。
+
+### 代码、内核与运行状态
+
+kernel 分支 device-aggregation，当前 commit 878db8c75。
+e74218784 实现三项修复：READ 请求检查所有 pin；
+pin 阻塞而重试的请求不清除 copyset；
+unpin 在 SRCU 读侧保护下直接执行既有原子 release 减计数，
+不再获取 DSM 全局锁或页锁。pin 获取仍受这些锁保护。
+
+878db8c75 补充：所有 DMA pin 都先执行写权限 fault，
+取得本地独占所有权，随后仍按真实 DMA 方向增加 read/write pin 计数，
+unpin 的方向与原映射保持一致。这是保守的页级策略，
+不能把 DMA 读映射持有共享副本等同于持有本地 owner。
+
+两端保留各自原有驱动配置，在清理挂起实例、重启恢复后编译。
+安装更新已有 /boot/vmlinuz-6.6.32-krdma+、System.map、
+config、initrd.img 和 /lib/modules/6.6.32-krdma+，
+没有安装 dsmfix 版本，也没有新增该版本的 GRUB 条目。
+Garen 运行 6.6.32-krdma+ #54，Ezreal 运行同版本 #60；
+新 bzImage SHA256 分别为：
+
+* Garen：611bc6bf80801071270725edf82dc1ebd65d92d069d64d151b320230a975d3db
+* Ezreal：d7b562837fbf3dc665201d17c42f0edf1f3ccd8c7ae94ec4ba1040a550bc0d1c
+
+QEMU 功能代码保持原版本；本次只更新本文件。
+guest 仍为 6.12.0-vanilla-vfio #20，SHA256 与下文一致。
+总计 4 vCPU / 4 GiB、clocksource=hpet、无网络设备。
+Garen master CPU0/1，Ezreal slave CPU2/3；IPoIB 双向 ping 通过，
+两端 IB port1 ACTIVE。guest 登录 root，CPU0--3 在线，
+00:09.0 和 00:0a.0 分别是 Garen / Ezreal 的独立原生 virtio_blk 数据盘。
+两块盘各 1 GiB，仍使用已有 raw；cache=none,aio=threads,
+ioeventfd=off,vectors=0。运行实例保留。
+
+### 为什么需要第二项所有权修复
+
+仅应用 e74218784 的 #53 / #59 时，两端 16 MiB、1 MiB block、
+QD=1/8 的预写/flush/首尾回读通过；两盘各 1 GiB 并行预写也通过。
+随后 single0-r1 持续写再次停止，尚未产生该阶段的有效带宽结果。
+
+这次 Garen QEMU 主线程在 futex 等待，vCPU0 在 KVM_DSM_MEMPIN
+等待 WRITE fetch；真实参数 write=1, unpin=0, length=1，
+HVA=0x76cc08f07310。对应页已有 read pin=1、write pin=0，
+state=65538，即本地 SHARED、prob_owner=1。
+Garen 另有 254 个 read-pinned 页；Ezreal 全部 pin 为零。
+Ezreal vCPU2 持页锁等待 INVALIDATE 确认；
+Garen dsm-conn/0:0 重试处理，不能失效已有 read-pinned 副本。
+
+原因是读 pin 使用 read fault，ivy 的 SHARED readable fast path
+不会把远端 owner 迁回本地。随后同页的写映射需要升级，
+却被先前读映射的 pin 拦住。它与最初 unpin 等页锁的死锁不同，
+因此只改 READ 请求检查和 unpin 顺序还不够。
+878db8c75 让读 pin 也先取得本地独占页，避免上述共享副本升级循环。
+未通过写内核内存、强行减 pin 或取消 DMA 保护来解除现场。
+
+### 回归结果
+
+| 测试 | 结果 |
+| --- | --- |
+| owner0 / CPU0，1 MiB block，QD=1，16 MiB 预写、flush、首尾回读 | 通过 |
+| owner0 / CPU0，同参数 QD=8 | 通过 |
+| owner1 / CPU2，同参数 QD=1 | 通过 |
+| owner1 / CPU2，同参数 QD=8 | 通过 |
+| 双盘各完整预写 1 GiB，QD=8、各自 owner CPU 首触缓冲区、flush、首尾回读 | 通过 |
+| 三轮 single0 / single1 / parallel，各阶段持续 15 秒、QD=8、每轮轮换顺序 | 九个阶段全部完成，所有 AIO 返回长度正确并完成 flush |
+| 两端各写 1 MiB 固定于该轮随机图案的数据到 32 MiB 偏移，再 flush | 通过 |
+| CPU0、CPU2 分别读取两块盘上述完整 1 MiB，逐字节比较 | 四种本地/跨端组合全部通过 |
+| 测试后只读 /proc/kcore 检查各节点全部 1,052,784 个 DSM 页状态 | 两端 read/write refs=0、pinned pages=0、negative pages=0 |
+| host hung task / BUG / panic | 本轮未新增 |
+
+检查 /proc/kcore 使用与当前内核匹配的 vmlinux，
+未 attach QEMU、冻结 vCPU 或修改内核内存。
+这是本次工作负载回归通过，不构成任意工作负载的正确性证明。
+
+### 带宽结果与 locality
+
+单位 MiB/s；1 MiB block、原生 Linux AIO、QD=8、三轮每阶段 15 秒。
+parallel 使用两 worker 的共同时间窗计算合计，并非分别速率的简单相加。
+
+| 系统 / 阶段 | 第 1 轮 | 第 2 轮 | 第 3 轮 | 中位数 |
+| --- | ---: | ---: | ---: | ---: |
+| 跨机 single0 / Garen / CPU0 | 279.27 | 290.50 | 294.21 | 290.50 |
+| 跨机 single1 / Ezreal / CPU2 | 1000.17 | 950.77 | 968.10 | 968.10 |
+| 跨机 parallel 合计 | 745.21 | 774.00 | 758.38 | 758.38 |
+| Lux 普通 VM single0（此前测试） | 837.03 | 448.85 | 974.50 | 837.03 |
+| Lux 普通 VM single1（此前测试） | 1016.05 | 975.51 | 1032.71 | 1016.05 |
+| Lux 普通 VM parallel（此前测试） | 1032.53 | 1031.32 | 1031.76 | 1031.76 |
+
+跨机双盘中位数为最快单盘的 0.7834 倍，比最快单盘低约 21.7%；
+为两端分别测得单盘中位数之和的 0.6026 倍。
+功能上两块独立设备已聚合到一个 OS，本配置没有体现带宽收益。
+
+worker 固定 CPU0/CPU2 后才创建、写入私有匿名缓冲区，
+数据盘后端各在自己的 owner host；但完成 CPU、Linux request/slab 页、
+共享块层和协议处理仍可能跨端。不能把 payload 首触本地解读为没有 DSM 流量。
+同一轮盘数据总写入量与 Garen IB port1 双向数据计数增量如下，
+仅统计一个端点的发送+接收，避免把两端对同一传输的计数重复相加：
+
+| 阶段 | 每阶段 guest 写入 MiB 范围 | 每阶段 IB 双向数据 MiB 范围 |
+| --- | ---: | ---: |
+| single0 | 4193--4417 | 2176--2317 |
+| single1 | 14268--15004 | 688--860 |
+| parallel | 11187--11627 | 2352--2632 |
+
+IB 计数按每单位 4 字节转换，快照窗口约 15.2--16.2 秒，
+略大于 guest 时间窗；包含 DSM 数据、控制通信及共享 OS 后台活动，
+未做逐页归因。5.49 秒空闲参考窗口也有约 42.81 MiB 双向流量。
+这些观测显示首触本地后仍有明显跨端开销，
+尚不能单凭端口计数把带宽损失全部归因于某一类元数据。
+独占 pin 是为正确性采用的保守策略，其性能成本需要后续单独分析。
+
+Lux 仍是相同 4 vCPU / 4 GiB、同 guest 内核、同 I/O 参数的普通 VM，
+其 host 是支持 native KVM 模式的 6.6.32-loom，不是未修改的发行版 KVM。
+Lux 两个 raw 共用宿主 RAID，跨机 raw 位于两个不同 host，
+因此以上仅是对应后端路径的对照，不能从表中直接计算纯分布式软件开销。
+1 GiB 数据集循环覆盖，可能受控制器缓存影响；未宣称介质稳态带宽。
+Lux single0 第二轮原有额外等待仍保留，未删除慢样本。
+
+### 仍存在的告警
+
+两端 guest 启动期间仍各出现一次既有的
+mark_page_dirty_in_slot+0x6c/0xf0 WARN，位置 kvm_main.c:3388，
+调用链经 __kvm_write_guest_page / ivy_kvm_dsm_page_fault / kvm_dsm_memcpy。
+这里检查无 running vCPU 时的 guest 写入许可；
+当前架构的 kvm_arch_allow_write_without_running_vcpu 返回 false。
+这不是本次 pin 计数异常或 hung task；本次未修改或隐藏该警告，
+因此不能声称 dmesg 完全无告警。其 dirty tracking 语义还需另行核实。
+
+### 复现与保持版本名
+
+保留各 host 现有 .config 驱动设置，只保持原版本名：
+
+```bash
+cd /home/xtl/GVM-kernel
+./scripts/config --set-str LOCALVERSION -krdma --disable LOCALVERSION_AUTO
+make LOCALVERSION=+ olddefconfig
+make LOCALVERSION=+ -j16 bzImage modules
+make LOCALVERSION=+ -s kernelrelease  # 6.6.32-krdma+
+```
+
+root 所有的 Ezreal 构建树需 sudo。安装匹配模块时使用
+INSTALL_MOD_STRIP=1 和现有 zstd 压缩配置，更新同名 initramfs。
+挂起实例需先保留并定位现场，通知后重启清理，
+不能一边带着 DSM 死锁一边编译再重启。
+
+两端启动仍使用下文 gvm-device-node.sh 命令和已有专用 raw，
+串口已登录 root 后，从 Garen 执行：
+
+```bash
+/home/xtl/GVM-qemu/scripts/gvm-device-serial-exec.py \
+  /home/xtl/GVM-qemu/scripts/gvm-device-guest-disk-bandwidth.py \
+  --timeout 900 --preserve-on-timeout
+```
+
+单盘短批次用下文 owner / queue-depth / prepare-only 参数。
+测试代码通过串口在内存执行，输出经 SSH 流式读取；
+本次没有创建新的实验脚本、job、日志、结果文件或镜像。
+已有专用数据盘会被预写和持续写覆盖，不选择 host 系统盘。
+本地/跨端逐字节回读诊断同样在内存执行，未落盘脚本。
+
+---
+
 ## 2026-10-08 单盘 AIO 复现：DSM pin / unpin 与所有权转移死锁
 
 Garen master、Ezreal slave，host 均为 6.6.32-krdma+；QEMU commit
@@ -106,7 +270,7 @@ single1 为 1016.05/975.51/1032.71，双盘为 1032.53/1031.32/1031.76。
 
 本分支在 GVM 的 RDMA 巨虚上移植 Loom PCI owner/remote 结构。一个 OS 分别看到各节点持有的 PCI 设备，设备不合并为逻辑卷或网络接口。
 
-## 当前验收：真实 VF + guest 原生驱动 + DSM DMA 同步（2026-10-08）
+## 早期验收：真实 VF + guest 原生驱动 + DSM DMA 同步（2026-10-08）
 
 Garen master 172.0.1.4（CPU0/1），Ezreal slave 172.0.1.2（CPU2/3）。
 两端 host 保持 6.6.32-krdma+，QEMU 9.0.90；一个 4 CPU / 4 GiB
