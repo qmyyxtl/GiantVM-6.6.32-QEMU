@@ -74,6 +74,8 @@ static void *kvm_vcpu_thread_fn(void *arg)
             }
         }
         qemu_mutex_unlock_remote();
+        /* The common vCPU teardown runs with the BQL held. */
+        bql_lock();
     }
 
     kvm_destroy_vcpu(cpu);

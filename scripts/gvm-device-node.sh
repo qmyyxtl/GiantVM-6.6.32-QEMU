@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # One node of a four-vCPU distributed guest; no logs, pidfiles or overlays.
 set -euo pipefail
+# Validation failures must not leave core dump files.
+ulimit -c 0
 node=${1:?Usage: gvm-device-node.sh 0|1 [additional QEMU arguments]}
 shift
 case "$node" in 0|1) ;; *) echo 'node must be 0 or 1' >&2; exit 2 ;; esac
