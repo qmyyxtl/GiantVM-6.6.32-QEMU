@@ -126,3 +126,22 @@ GVM_USER_NET=0 同时指定 -nic none，禁止 QEMU 自动添加默认网卡。
 退出时未重新获得 BQL，就进入公共销毁路径并再次 bql_unlock，
 每节点两个远端线程触发断言。现修复为释放远端锁后重新获得 BQL，
 再执行公共销毁逻辑。启动器关闭 core dump，避免失败时产生文件。
+
+
+### Garen / Ezreal 物理网络后端验收（2026-10-08）
+
+两端各经 macvtap 连接 ens101f0np0，guest 分别枚举 00:07.0、00:08.0，
+e1000 驱动均成功绑定。它们是各自独立的 QEMU PCI 网卡、物理网络
+后端，不是 VFIO 直通，也没有将两块网卡合并成一个逻辑接口。
+
+Guest enp0s7 为 192.168.100.241，enp0s8 为 192.168.100.242。CPU0、
+CPU2 各经 enp0s7 访问 Ezreal 192.168.100.17、经 enp0s8 访问 Garen
+192.168.100.14：四组各 10 个 1400-byte ICMP 包全部收到，丢包为零。
+两块 guest 网卡的 rx_errors/tx_errors/rx_dropped/tx_dropped 均为零。
+代码在串口 Python 内存执行，未保存 guest 脚本；可复用源码为
+scripts/gvm-device-guest-network-test.py，测试只修改 guest 运行时
+网络配置，不写持久化网络文件。这是功能测试，不是性能基准。
+
+Garen 与 Ezreal 各只有系统用的 /dev/sda，未发现独立数据盘；
+当前物理网络配置没有为 guest 附加这些系统盘，未验证真实数据盘
+聚合。现有系统盘、Garen 的保留 DRAM pmem0 都不能冒充独立数据盘。
