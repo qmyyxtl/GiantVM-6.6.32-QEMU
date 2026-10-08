@@ -3426,6 +3426,31 @@ void cpu_physical_memory_unmap(void *buffer, hwaddr len,
     return address_space_unmap(&address_space_memory, buffer, len, is_write, access_len, true);
 }
 
+/* Direct RAM pointers are not coherent across RDMA DSM replicas. */
+static bool dsm_ram_access(void)
+{
+    MachineState *ms = MACHINE(qdev_get_machine());
+    return kvm_enabled() && ms->local_cpus != ms->smp.cpus && !ms->shm_path;
+}
+
+static MemTxResult dsm_ram_copy(void *host, void *buffer, size_t length,
+                               bool write)
+{
+    struct kvm_dsm_memcpy copy = {
+        .write = write, .host_virt_addr = (uintptr_t)host,
+        .userspace_addr = (uintptr_t)buffer, .length = length,
+    };
+    int ret = kvm_vm_ioctl(kvm_state, KVM_DSM_MEMCPY, &copy);
+    if (ret < 0) {
+        if (!write) {
+            memset(buffer, 0, length);
+        }
+        error_report("DSM scalar RAM copy failed: %s", strerror(-ret));
+        return MEMTX_ERROR;
+    }
+    return MEMTX_OK;
+}
+
 #define ARG1_DECL                AddressSpace *as
 #define ARG1                     as
 #define SUFFIX
@@ -3474,6 +3499,10 @@ int64_t address_space_cache_init(MemoryRegionCache *cache,
         cache->ptr = qemu_ram_ptr_length(mr->ram_block, cache->xlat, &l, true,
                                          is_write);
     } else {
+        cache->ptr = NULL;
+    }
+
+    if (dsm_ram_access()) {
         cache->ptr = NULL;
     }
 

@@ -43,7 +43,13 @@ static inline uint32_t glue(address_space_ldl_internal, SUFFIX)(ARG1_DECL,
     } else {
         /* RAM case */
         fuzz_dma_read_cb(addr, 4, mr);
+        uint8_t dsm_data[8];
         ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
+        r = MEMTX_OK;
+        if (dsm_ram_access()) {
+            r = dsm_ram_copy(ptr, dsm_data, 4, false);
+            ptr = dsm_data;
+        }
         switch (endian) {
         case DEVICE_LITTLE_ENDIAN:
             val = ldl_le_p(ptr);
@@ -55,7 +61,7 @@ static inline uint32_t glue(address_space_ldl_internal, SUFFIX)(ARG1_DECL,
             val = ldl_p(ptr);
             break;
         }
-        r = MEMTX_OK;
+
     }
     if (result) {
         *result = r;
@@ -112,7 +118,13 @@ static inline uint64_t glue(address_space_ldq_internal, SUFFIX)(ARG1_DECL,
     } else {
         /* RAM case */
         fuzz_dma_read_cb(addr, 8, mr);
+        uint8_t dsm_data[8];
         ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
+        r = MEMTX_OK;
+        if (dsm_ram_access()) {
+            r = dsm_ram_copy(ptr, dsm_data, 8, false);
+            ptr = dsm_data;
+        }
         switch (endian) {
         case DEVICE_LITTLE_ENDIAN:
             val = ldq_le_p(ptr);
@@ -124,7 +136,7 @@ static inline uint64_t glue(address_space_ldq_internal, SUFFIX)(ARG1_DECL,
             val = ldq_p(ptr);
             break;
         }
-        r = MEMTX_OK;
+
     }
     if (result) {
         *result = r;
@@ -178,9 +190,15 @@ uint8_t glue(address_space_ldub, SUFFIX)(ARG1_DECL,
     } else {
         /* RAM case */
         fuzz_dma_read_cb(addr, 1, mr);
+        uint8_t dsm_data[8];
         ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
-        val = ldub_p(ptr);
         r = MEMTX_OK;
+        if (dsm_ram_access()) {
+            r = dsm_ram_copy(ptr, dsm_data, 1, false);
+            ptr = dsm_data;
+        }
+        val = ldub_p(ptr);
+
     }
     if (result) {
         *result = r;
@@ -216,7 +234,13 @@ static inline uint16_t glue(address_space_lduw_internal, SUFFIX)(ARG1_DECL,
     } else {
         /* RAM case */
         fuzz_dma_read_cb(addr, 2, mr);
+        uint8_t dsm_data[8];
         ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
+        r = MEMTX_OK;
+        if (dsm_ram_access()) {
+            r = dsm_ram_copy(ptr, dsm_data, 2, false);
+            ptr = dsm_data;
+        }
         switch (endian) {
         case DEVICE_LITTLE_ENDIAN:
             val = lduw_le_p(ptr);
@@ -228,7 +252,7 @@ static inline uint16_t glue(address_space_lduw_internal, SUFFIX)(ARG1_DECL,
             val = lduw_p(ptr);
             break;
         }
-        r = MEMTX_OK;
+
     }
     if (result) {
         *result = r;
@@ -282,14 +306,17 @@ void glue(address_space_stl_notdirty, SUFFIX)(ARG1_DECL,
 
         r = memory_region_dispatch_write(mr, addr1, val, MO_32, attrs);
     } else {
-        ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
+        uint8_t dsm_data[4];
+        bool dsm = dsm_ram_access();
+        uint8_t *host = qemu_map_ram_ptr(mr->ram_block, addr1);
+        ptr = dsm ? dsm_data : host;
         stl_p(ptr, val);
 
         dirty_log_mask = memory_region_get_dirty_log_mask(mr);
         dirty_log_mask &= ~(1 << DIRTY_MEMORY_CODE);
         cpu_physical_memory_set_dirty_range(memory_region_get_ram_addr(mr) + addr,
                                             4, dirty_log_mask);
-        r = MEMTX_OK;
+        r = dsm ? dsm_ram_copy(host, dsm_data, 4, true) : MEMTX_OK;
     }
     if (result) {
         *result = r;
@@ -320,7 +347,10 @@ static inline void glue(address_space_stl_internal, SUFFIX)(ARG1_DECL,
                                          MO_32 | devend_memop(endian), attrs);
     } else {
         /* RAM case */
-        ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
+        uint8_t dsm_data[8];
+        bool dsm = dsm_ram_access();
+        uint8_t *host = qemu_map_ram_ptr(mr->ram_block, addr1);
+        ptr = dsm ? dsm_data : host;
         switch (endian) {
         case DEVICE_LITTLE_ENDIAN:
             stl_le_p(ptr, val);
@@ -333,7 +363,7 @@ static inline void glue(address_space_stl_internal, SUFFIX)(ARG1_DECL,
             break;
         }
         invalidate_and_set_dirty(mr, addr1, 4);
-        r = MEMTX_OK;
+        r = dsm ? dsm_ram_copy(host, dsm_data, 4, true) : MEMTX_OK;
     }
     if (result) {
         *result = r;
@@ -382,10 +412,13 @@ void glue(address_space_stb, SUFFIX)(ARG1_DECL,
         r = memory_region_dispatch_write(mr, addr1, val, MO_8, attrs);
     } else {
         /* RAM case */
-        ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
+        uint8_t dsm_data[8];
+        bool dsm = dsm_ram_access();
+        uint8_t *host = qemu_map_ram_ptr(mr->ram_block, addr1);
+        ptr = dsm ? dsm_data : host;
         stb_p(ptr, val);
         invalidate_and_set_dirty(mr, addr1, 1);
-        r = MEMTX_OK;
+        r = dsm ? dsm_ram_copy(host, dsm_data, 1, true) : MEMTX_OK;
     }
     if (result) {
         *result = r;
@@ -416,7 +449,10 @@ static inline void glue(address_space_stw_internal, SUFFIX)(ARG1_DECL,
                                          MO_16 | devend_memop(endian), attrs);
     } else {
         /* RAM case */
-        ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
+        uint8_t dsm_data[8];
+        bool dsm = dsm_ram_access();
+        uint8_t *host = qemu_map_ram_ptr(mr->ram_block, addr1);
+        ptr = dsm ? dsm_data : host;
         switch (endian) {
         case DEVICE_LITTLE_ENDIAN:
             stw_le_p(ptr, val);
@@ -429,7 +465,7 @@ static inline void glue(address_space_stw_internal, SUFFIX)(ARG1_DECL,
             break;
         }
         invalidate_and_set_dirty(mr, addr1, 2);
-        r = MEMTX_OK;
+        r = dsm ? dsm_ram_copy(host, dsm_data, 2, true) : MEMTX_OK;
     }
     if (result) {
         *result = r;
@@ -480,7 +516,10 @@ static void glue(address_space_stq_internal, SUFFIX)(ARG1_DECL,
                                          MO_64 | devend_memop(endian), attrs);
     } else {
         /* RAM case */
-        ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
+        uint8_t dsm_data[8];
+        bool dsm = dsm_ram_access();
+        uint8_t *host = qemu_map_ram_ptr(mr->ram_block, addr1);
+        ptr = dsm ? dsm_data : host;
         switch (endian) {
         case DEVICE_LITTLE_ENDIAN:
             stq_le_p(ptr, val);
@@ -493,7 +532,7 @@ static void glue(address_space_stq_internal, SUFFIX)(ARG1_DECL,
             break;
         }
         invalidate_and_set_dirty(mr, addr1, 8);
-        r = MEMTX_OK;
+        r = dsm ? dsm_ram_copy(host, dsm_data, 8, true) : MEMTX_OK;
     }
     if (result) {
         *result = r;
