@@ -118,7 +118,72 @@ root 登录 Garen guest 串口后，在 Garen 执行：
 
 串口执行器将生产测试代码交给 guest Python 在内存中执行，
 不创建 guest 脚本、实验日志、overlay 或 PID 文件。
-已授权创建的两块 1 GiB raw 数据镜像仍未附加；磁盘聚合读写未验收。
+两块 1 GiB raw 数据镜像现已附加并通过读写校验，见下面的双数据盘验收。
+
+## 双数据盘聚合读写验收（2026-10-08）
+
+当前同一个 guest 同时保留两张真实 X710 VF，并枚举两个独立数据盘：
+
+| owner | guest PCI | guest 块设备 | serial | owner 后端 |
+| --- | --- | --- | --- | --- |
+| Garen | 00:09.0 | /dev/vda | GVM-DATA-OWNER0 | /home/xtl/start/gvm-device-data-node0.raw |
+| Ezreal | 00:0a.0 | /dev/vdb | GVM-DATA-OWNER1 | /home/xtl/start/gvm-device-data-node1.raw |
+
+两盘各 1 GiB，guest 使用内置 virtio_blk。后端为此前已授权创建的
+raw 镜像，通过 virtio-blk-pci 提供；这是 raw 后端的设备聚合，
+未验收 NVMe/VFIO 物理磁盘直通，也没有合并逻辑卷。
+数据路径使用 cache=none、aio=threads、ioeventfd=off、vectors=0，
+设备分别标记 loom-aggregate=on、loom-numa-node=0/1。
+
+首次附加磁盘后，guest 停在 vda 注册阶段，后端 read operations=0。
+定位到 virtqueue 的 MemoryRegionCache 及 scalar RAM load/store
+直接访问各 host 的 RAM 指针，绕过 DSM。commit a6ce1b6075 在 RDMA
+DSM 模式下关闭 cache->ptr 的直接访问，保留区域与范围缓存；
+cached slow path 和常规 scalar RAM 读写改经 KVM_DSM_MEMCPY，
+再进行字节序转换，并返回 ioctl 错误。单节点和共享内存模式
+继续沿用原路径。修复后双盘正常注册，系统启动并可登录。
+
+scripts/gvm-device-guest-disk-test.py 仅选择上述 PCI BDF、serial、
+原生驱动且容量为 1 GiB 的无分区数据盘。以 O_DIRECT 和页对齐
+128 KiB 缓冲区读写，写入后 fsync。每个 CPU 在每块盘写 2 MiB，
+读回时切到另一台 host 的 CPU：0→2、1→3、2→0、3→1。
+数据包含 owner、writer CPU 和 block 编号，分别写入各 CPU 独立区域。
+随后四个 CPU 各自完整读取两盘所有测试区域并逐字节比较。
+写入范围是 8--10、12--14、16--18、20--22 MiB；测试数据留在
+这两块专用 raw 镜像中。没有格式化磁盘、创建 guest 测试文件或
+持久化网络配置，根盘不在测试选择范围内。
+
+实测：8 组跨端写入/读回、8 组完整读取全部通过；两盘总计
+16 MiB 写入、80 MiB O_DIRECT 读回校验通过。每端 host 再独立
+读取对应 raw 镜像的 64 个块 / 8 MiB，与预期 owner 数据全部一致。
+QMP 每端 wr_bytes=8388608、wr_operations=64、flush_operations=4；
+failed_rd_operations、failed_wr_operations、failed_flush_operations
+均为 0。附加磁盘并修复 virtqueue 后，两张真实 VF 的常规网络矩阵
+复测 40/40，零丢包；两端 QMP 仍为 running。未做性能或掉电持久性验收。
+
+```bash
+# Garen master
+sudo /home/xtl/GVM-qemu/scripts/gvm-device-vfio-node.py 0 \
+  --host 0000:0c:02.0 \
+  --data-disk /home/xtl/start/gvm-device-data-node0.raw
+
+# Ezreal slave，紧接着启动
+sudo /home/xtl/GVM-qemu/scripts/gvm-device-vfio-node.py 1 \
+  --host 0000:0c:02.0 \
+  --data-disk /home/xtl/start/gvm-device-data-node1.raw
+
+# guest root 串口已经登录后，在 Garen 内存执行测试。
+/home/xtl/GVM-qemu/scripts/gvm-device-serial-exec.py \
+  /home/xtl/GVM-qemu/scripts/gvm-device-guest-disk-test.py --timeout 180
+
+# 各 host 的只读后端校验，在相应 host 执行。
+# Garen
+/home/xtl/GVM-qemu/scripts/gvm-device-guest-disk-test.py \
+  --backend-owner 0 --backend-image /home/xtl/start/gvm-device-data-node0.raw
+# Ezreal
+/home/xtl/GVM-qemu/scripts/gvm-device-guest-disk-test.py \
+  --backend-owner 1 --backend-image /home/xtl/start/gvm-device-data-node1.raw
+```
 
 ## 历史对照：未同步 DMA 的双 VF 配置（2026-10-08）
 
