@@ -73,8 +73,6 @@ static QemuMutex bql;
  */
 static const AccelOpsClass *cpus_accel;
 
-/* used in wait remote */
-int wait_remote_cpu_count = 0;
 
 bool cpu_is_stopped(CPUState *cpu)
 {
@@ -420,7 +418,13 @@ static QemuCond qemu_pause_cond;
 
 /* mutex and cond for remote cpu */
 static QemuCond qemu_remote_cpu_cond;
+static QemuCond qemu_remote_cpu_ack_cond;
 static QemuMutex qemu_remote_mutex;
+/* All remote-thread lifecycle state is protected by qemu_remote_mutex. */
+static unsigned int remote_cpu_count;
+static unsigned int wait_remote_cpu_count;
+static uint64_t remote_cpu_generation;
+static bool remote_cpu_shutdown;
 
 void qemu_init_cpu_loop(void)
 {
@@ -430,6 +434,7 @@ void qemu_init_cpu_loop(void)
     qemu_mutex_init(&bql);
 
     qemu_cond_init(&qemu_remote_cpu_cond);
+    qemu_cond_init(&qemu_remote_cpu_ack_cond);
     qemu_mutex_init(&qemu_remote_mutex);
 
     qemu_thread_get_self(&io_thread);
@@ -889,44 +894,46 @@ void qmp_inject_nmi(Error **errp)
     nmi_monitor_handle(monitor_get_cpu_index(monitor_cur()), errp);
 }
 
-/* for remote cpu */
-void qemu_cond_wait_remote(void)
+/* Remote placeholders acknowledge each reset/shutdown generation once. */
+void qemu_wait_remote_cpu(CPUState *cpu)
 {
-    qemu_cond_wait(&qemu_remote_cpu_cond, &qemu_remote_mutex);
-}
+    uint64_t generation;
 
-void qemu_cond_signal_remote(void)
-{
-    qemu_cond_signal(&qemu_remote_cpu_cond);
-}
-
-void qemu_cond_broadcast_remote(void)
-{
-    qemu_cond_broadcast(&qemu_remote_cpu_cond);
-}
-
-void qemu_mutex_lock_remote(void)
-{
     qemu_mutex_lock(&qemu_remote_mutex);
-}
-
-void qemu_mutex_unlock_remote(void)
-{
+    remote_cpu_count++;
+    generation = remote_cpu_generation;
+    while (!remote_cpu_shutdown) {
+        while (generation == remote_cpu_generation && !remote_cpu_shutdown) {
+            qemu_cond_wait(&qemu_remote_cpu_cond, &qemu_remote_mutex);
+        }
+        if (generation != remote_cpu_generation) {
+            generation = remote_cpu_generation;
+            cpu->stopped = true;
+            g_assert(wait_remote_cpu_count > 0);
+            wait_remote_cpu_count--;
+            qemu_cond_broadcast(&qemu_remote_cpu_ack_cond);
+        }
+    }
+    cpu->stopped = true;
+    remote_cpu_count--;
     qemu_mutex_unlock(&qemu_remote_mutex);
 }
 
-void remote_cpu_count_dec(void)
+void wakeup_remote_cpu(bool shutdown)
 {
-    wait_remote_cpu_count--;
-}
-
-void wakeup_remote_cpu(void) {
-    qemu_cond_broadcast(&qemu_remote_cpu_cond);
-    MachineState *ms = MACHINE(qdev_get_machine());
-    wait_remote_cpu_count = ms->smp.cpus - ms->local_cpus;
-    while (wait_remote_cpu_count > 0) {
-        /* wait all remote cpu thread to change CPU status */
-        /* Need to do: use cond to improve */
+    qemu_mutex_lock(&qemu_remote_mutex);
+    /* Serialize concurrent notifications and allow duplicate shutdowns. */
+    while (wait_remote_cpu_count) {
+        qemu_cond_wait(&qemu_remote_cpu_ack_cond, &qemu_remote_mutex);
     }
+    if (!remote_cpu_shutdown) {
+        remote_cpu_shutdown = shutdown;
+        remote_cpu_generation++;
+        wait_remote_cpu_count = remote_cpu_count;
+        qemu_cond_broadcast(&qemu_remote_cpu_cond);
+        while (wait_remote_cpu_count) {
+            qemu_cond_wait(&qemu_remote_cpu_ack_cond, &qemu_remote_mutex);
+        }
+    }
+    qemu_mutex_unlock(&qemu_remote_mutex);
 }
-

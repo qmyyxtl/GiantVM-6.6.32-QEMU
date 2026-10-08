@@ -611,7 +611,7 @@ void qemu_system_reset_request(ShutdownCause reason)
     } else {
         reset_requested = reason;
     }
-    wakeup_remote_cpu();
+    wakeup_remote_cpu(false);
     cpu_stop_current();
     qemu_notify_event();
 }
@@ -711,7 +711,7 @@ void qemu_system_shutdown_request(ShutdownCause reason)
     trace_qemu_system_shutdown_request(reason);
     replay_shutdown_request(reason);
     shutdown_requested = reason;
-    wakeup_remote_cpu();
+    wakeup_remote_cpu(true);
     qemu_notify_event();
 }
 
@@ -889,6 +889,8 @@ void qemu_cleanup(int status)
 
 
     /* No more vcpu or device emulation activity beyond this point */
+    /* Also stop remote placeholders for signal-driven shutdown. */
+    wakeup_remote_cpu(true);
     vm_shutdown();
     replay_finish();
 

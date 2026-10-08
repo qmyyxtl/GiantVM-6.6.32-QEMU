@@ -51,11 +51,6 @@ void cpu_synchronize_all_post_init(void);
 void cpu_synchronize_all_pre_loadvm(void);
 
 /* for remote cpu */
-void qemu_cond_wait_remote(void);
-void qemu_cond_signal_remote(void);
-void qemu_cond_broadcast_remote(void);
-void qemu_mutex_lock_remote(void);
-void qemu_mutex_unlock_remote(void);
-void remote_cpu_count_dec(void);
-void wakeup_remote_cpu(void);
+void qemu_wait_remote_cpu(CPUState *cpu);
+void wakeup_remote_cpu(bool shutdown);
 #endif

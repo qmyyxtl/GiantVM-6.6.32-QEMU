@@ -145,3 +145,11 @@ scripts/gvm-device-guest-network-test.py，测试只修改 guest 运行时
 Garen 与 Ezreal 各只有系统用的 /dev/sda，未发现独立数据盘；
 当前物理网络配置没有为 guest 附加这些系统盘，未验证真实数据盘
 聚合。现有系统盘、Garen 的保留 DRAM pmem0 都不能冒充独立数据盘。
+
+
+退出验证进一步确认旧 wakeup_remote_cpu 的非原子计数空循环被
+优化成无限跳转：GDB 中计数已经为 0，反汇编仍为跳回自身的 jmp。
+接收线程不能退出，主线程停在 rdma_router_cleanup 的 pthread_join。
+现使用远端互斥锁、条件变量、通知代次及存活线程计数：先设待确认
+数量再通知，每线程每代确认一次；shutdown 状态保留，重复通知
+不会等待已退出的线程。公共清理还覆盖 SIGTERM 发起的退出。

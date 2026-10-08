@@ -60,20 +60,7 @@ static void *kvm_vcpu_thread_fn(void *arg)
     else {
         printf("CPU %d is remote CPU, pause\n", cpu->cpu_index);
         bql_unlock();
-        /* use a new lock since qemu_global_mutex may cause deadlock */
-        qemu_mutex_lock_remote();
-        while (1) {
-            qemu_cond_wait_remote();
-            remote_cpu_count_dec();
-            if (qemu_shutdown_requested_get()) {
-                cpu->stopped = true;
-                break;
-            }
-            if (qemu_reset_requested_get()) {
-                cpu->stopped = true;
-            }
-        }
-        qemu_mutex_unlock_remote();
+        qemu_wait_remote_cpu(cpu);
         /* The common vCPU teardown runs with the BQL held. */
         bql_lock();
     }
