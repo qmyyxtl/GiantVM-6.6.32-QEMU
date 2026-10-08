@@ -49,7 +49,7 @@ Ezreal /home/xtl/start/gvm-device-data-node1.raw，初始各实际分配 4 KiB�
 两端已连通的 X710 0000:0c:00.0 均为 10 Gb/s，sriov_totalvfs=64、
 sriov_numvfs=0。可以保留 host PF，并从这个物理端口创建 VF 供 guest
 直通；这不需要启用未连通的第二物理端口。PF 直通需要 i40e；VF
-直通需要 iavf。当前 guest 源码配置的 CONFIG_I40E、CONFIG_I40EVF
+直通需要 iavf。原 guest 源码配置的 CONFIG_I40E、CONFIG_I40EVF
 均关闭，已有镜像的驱动模块版本也不匹配运行中的 guest 内核。
 
 每次 host 重启后恢复 IB 地址（仅运行时配置）：
@@ -249,3 +249,31 @@ Guest 网络测试脚本配置运行时地址，见前节；本配置没有附�
 Garen 的旧 libvirt worker-g4 使用系统标准 QEMU，重启后报告
 `KVM: unknown exit reason 42`（自定义 KVM_EXIT_DSM_APIC_BASE），
 目前 paused；常规 QEMU 与该 RDMA 内核的 ABI 兼容需要另行处理。
+
+## 2026-10-08 guest 内置 X710 驱动编译与单机验证
+
+在 Garen /home/xtl/GVM-guest-kernel（d48b38507 基线，原有 fair.c 修改
+保留）启用 CONFIG_I40E=y、CONFIG_I40EVF=y，后者选择 CONFIG_IAVF=y。
+LOCALVERSION=-vanilla-vfio、LOCALVERSION_AUTO=n；使用 make -j16
+LOCALVERSION= bzImage 编译成功，版本 6.12.0-vanilla-vfio。
+
+链接脚本 BSS 起点与终点均使用 ALIGN(PMD_SIZE)，延续正在运行的
+bzImage-6.12-bss2m 的 2 MiB 边界。新 ELF 的 __bss_start 为
+ffffffff83800000，__bss_stop 为 ffffffff83a00000，i40e_init_module、
+iavf_init_module 均已链接进内核。
+
+产物在 Garen /home/xtl/start/bzImage-6.12-vfio-bss2m，配置归档为
+同名 .config；SHA256 为
+ad76802aa96aa68ca277e892f1619d5e0047e040d5e2cbf90f9df3426b6670e2。
+未安装或切换 host 内核。
+
+暂停原跨机配置后，用 Garen 空闲 0000:0c:00.1 做单机 VFIO 对照：
+2 CPU、2 GiB，已有 Ubuntu raw 根盘只读，init=/bin/bash。guest 的
+00:07.0 显示 Kernel driver in use: i40e，出现 eth0，读到固件
+fw 9.140.77473 / nvm 9.40、MAC 9c:c2:c4:ba:9b:20。
+iavf 的初始化日志存在，但此次没有 VF 设备，未验收 VF 驱动 probe。
+物理第二端口没有已确认的有效链路，未验证收发。
+
+单机对照已退出并恢复 host 驱动，随后恢复原双节点 VFIO 枚举配置。
+原跨机配置继续使用旧 6.12.0-vanilla 内核；新内核尚未用于跨机
+硬件 DMA 验证。单机驱动初始化通过不代表 RDMA DSM 的 DMA 路径通过。
