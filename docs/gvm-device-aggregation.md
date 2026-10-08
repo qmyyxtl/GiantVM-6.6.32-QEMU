@@ -1,5 +1,109 @@
 # RDMA 版设备聚合
 
+## 2026-10-08 单盘 AIO 复现：DSM pin / unpin 与所有权转移死锁
+
+Garen master、Ezreal slave，host 均为 6.6.32-krdma+；QEMU commit
+21fd4bfd96，kernel commit ba765c07c327dab0523d02c2549449d3589a6e6b。
+总计 4 vCPU / 4 GiB，guest 为 6.12.0-vanilla-vfio #20，bzImage SHA256
+8efa92af5453f26c93817f197903a55eee097bfd590456ceadc315863271e722。
+本次仅挂两个独立 raw / virtio-blk 数据盘及 edu，未挂 VF；guest 使用原生
+virtio_blk。CPU0 的 I/O 缓冲区在 Garen 首次写入，CPU2 的缓冲区在 Ezreal
+首次写入。文件、设备地址和 cache=none,aio=threads 等参数延续前面的配置。
+
+### 测试结果
+
+| 操作 | Garen owner0 / CPU0 | Ezreal owner1 / CPU2 |
+| --- | --- | --- |
+| 128 KiB 同步直接写 1 MiB、fsync、逐字节回读 | 通过 | 通过 |
+| 128 KiB 原生 Linux AIO，QD=1 | 8 MiB 写入/flush/首尾回读通过 | 16 MiB 写入/flush/首尾回读通过 |
+| 1 MiB 原生 Linux AIO，QD=1 | 16 MiB 写入/flush/首尾回读通过 | 16 MiB 写入/flush/首尾回读通过 |
+| 1 MiB 原生 Linux AIO，QD=8 | 单盘写入即卡住 | 尚未执行，保留 owner0 失败现场 |
+
+这些是短批次诊断，不是稳定带宽结果。没有执行双盘并发，也不能认为 QD=1
+在长时间压力下已经稳定。诊断写入覆盖了已有数据盘的部分旧测试图案；
+旧的 host backend 图案检查需要重新运行对应功能写入测试后才能使用。
+
+### 已读取的现场
+
+故障现场保留，未重启、kill、quit 或修改 KVM / QEMU 设备实现。读取
+/proc 线程栈、io、syscall，以及用 GDB 只读 /proc/kcore；未写内核内存。
+Garen QEMU PID 15120，Ezreal PID 5931。Garen 新安装 GDB 用于读取现场。
+两端 IB ACTIVE、双向 IPoIB ping 正常；QEMU 后端 I/O 计数持续停止。
+
+Garen 主线程 ioctl KVM_DSM_MEMPIN 的真实参数：
+write=1, unpin=1, length=1, host_virt_addr=0x78fc1ce20710。
+它来自 virtqueue 完成时解除设备写入的 1 字节状态映射。
+该 HVA 对应 guest GFN 0x101220，页偏移 0x710。
+
+* Garen 此页 pinned_read=3、pinned_write=3，state=65538：
+  prob_owner=1，DSM_SHARED；页锁由 vCPU0（TID 15141）持有。
+* Ezreal 同页 pinned_read=0、pinned_write=0，state=65542：
+  prob_owner=1，DSM_OWNER|DSM_SHARED，copyset=3；页锁由 vCPU2
+  （TID 5940）持有。
+* Garen vCPU0 停在 ll_back_merge_fn 的 mov %edi,0x18(%rbx)：
+  request=0xffff888101220a80，实际写地址页偏移 0xa98。
+* Ezreal vCPU2 停在 blk_mq_complete_request_remote 的
+  movl $2,0x84(%rdi)：request=0xffff888101220480，写地址页偏移 0x504。
+  两个不同的 Linux request 对象、virtio 状态字节位于同一 4 KiB 页。
+  此处 remote 是 Linux 块层的跨 CPU 完成路径名称。
+
+等待环：
+
+1. Garen QEMU 在 kvm_dsm_mempin 的 unpin 分支之前获取页锁，
+   被持锁的 Garen vCPU0 阻塞（dsm.c:873--880）。
+2. vCPU0 正在 WRITE fault，等待 Ezreal 的 DSM WRITE 响应。
+3. Ezreal dsm-conn/1:0 在 ivy_kvm_dsm_handle_req 中等同页锁，
+   该锁由 vCPU2 持有（ivy.c:583）。
+4. vCPU2 正在写该页，持锁等待发往 Garen 的 INVALIDATE 确认。
+5. Garen dsm-conn/0:0 重试 INVALIDATE：
+   dsm_handle_invalidate_req 发现页仍 pinned，不能确认。
+6. pin 只能由第 1 步解除，因此不能自行前进。
+
+代码直接解释了 owner 转移为何能发生：ivy.c:389 的 READ 请求检查
+dsm_is_pinned_read，而该 helper 定义为 pinned_read>0 && pinned_write==0
+（dsm-util.h:180）。有 write pin 时 READ 仍被接受，随后将 prob_owner
+转移给请求端并降为 SHARED（ivy.c:408--418）。现场正是 active write pin
+与远端 owner 同时存在；之后 unpin 又必须取得被 WRITE fault 持有的页锁。
+
+数据缓冲区首触本地并未限定完成 CPU，也未隔离 Linux request/slab 页。
+CPU2 在单盘 owner0 的完成路径中写同一请求页，说明元数据和完成处理仍会跨端。
+
+修复方向：READ 必须尊重写 pin，保持 DMA 使用期间的页权限/owner 一致；
+unpin 的引用释放不能依赖等待该 pin 解除的 fault 所持有的锁。
+SRCU 生命周期、原子计数和 DMA 完成的内存顺序需一并核对，再回归单盘 QD=1/8、
+远端完成、双盘并发。仅绑完成 CPU 可以用于 locality 对照，不能替代协议修复。
+本次仅分析，没有实施这些内核修改。
+
+### 重现命令与保留现场
+
+数据盘只能是前面创建的独立 1 GiB raw 数据镜像，不选 host 系统盘。
+在串口已经登录 root、巨虚仍正常时，可从 Garen 执行：
+
+```bash
+/home/xtl/GVM-qemu/scripts/gvm-device-serial-exec.py \
+  /home/xtl/GVM-qemu/scripts/gvm-device-guest-disk-bandwidth.py \
+  --guest-args='--owner 0 --block-size 1m --queue-depth 8 --prefill-bytes 16m --prepare-only' \
+  --timeout 30 --preserve-on-timeout
+```
+
+将 owner 改为 1，即固定到 CPU2 和 Ezreal 的盘；queue-depth=1 为短批次对照。
+prepare-only 只执行指定字节数的预写、flush 和首尾回读。
+preserve-on-timeout 超时后不发送 Ctrl-C；不要在已挂起的实例上重复执行。
+命令与 stdout 通过串口/SSH 流式传输，不创建 guest 脚本、fio job、日志或结果文件。
+
+同一新工具/同一 1 MiB、QD=8、16 MiB 工作负载，在 Lux 普通 VM 通过。
+Lux 普通 VM 的原三轮完整测试是 4 vCPU / 4 GiB、同 guest 内核、两块 1 GiB
+raw、cache=none,aio=threads、clocksource=hpet、每轮 15 秒：
+single0 837.03、single1 1016.05、双盘合计 1031.76 MiB/s（中位数）。
+single0 三次分别为 837.03/448.85/974.50，保留全部样本；
+single1 为 1016.05/975.51/1032.71，双盘为 1032.53/1031.32/1031.76。
+单盘0第二轮包含约 8.8 秒额外等待，其实际窗口为 23.79 秒。
+两块 raw 在同一宿主 RAID；1 GiB 数据集可能受控制器缓存影响，
+这些结果只代表当时 QEMU/raw/控制器路径，不能代表独立物理盘的介质持续带宽。
+跨机 QD=8 的有效带宽结果仍缺失。
+
+---
+
 本分支在 GVM 的 RDMA 巨虚上移植 Loom PCI owner/remote 结构。一个 OS 分别看到各节点持有的 PCI 设备，设备不合并为逻辑卷或网络接口。
 
 ## 当前验收：真实 VF + guest 原生驱动 + DSM DMA 同步（2026-10-08）

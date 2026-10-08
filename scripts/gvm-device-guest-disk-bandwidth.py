@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Owner-aware sequential write bandwidth using native Linux AIO, without files.
+Requires dedicated 1 GiB GVM data disks. Fully overwrites them during prefill.
+This measures the current QEMU/raw/controller path, not media steady-state speed.
+"""
+import argparse
+import ctypes as C
+import fcntl
+import json
+import mmap
+import os
+from pathlib import Path
+import select
+import statistics
+import struct
+import time
+import traceback
+
+def parse_size(value):
+    value = value.strip().lower()
+    scale = {'k':1024, 'm':1024**2, 'g':1024**3}
+    return int(value[:-1])*scale[value[-1]] if value[-1] in scale else int(value)
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--owner', type=int, choices=(0,1))
+parser.add_argument('--block-size', type=parse_size, default=1024**2)
+parser.add_argument('--queue-depth', type=int, default=8)
+parser.add_argument('--seconds', type=float, default=15)
+parser.add_argument('--rounds', type=int, default=3)
+parser.add_argument('--prefill-bytes', type=parse_size, default=1024**3)
+parser.add_argument('--prepare-only', action='store_true')
+parser.add_argument('--skip-prefill', action='store_true')
+args = parser.parse_args()
+BS, QD, SECONDS, ROUNDS = args.block_size, args.queue_depth, args.seconds, args.rounds
+CAPACITY = 1024 ** 3
+PREFILL_BYTES = args.prefill_bytes
+if BS < 4096 or BS % 4096 or CAPACITY % BS or not 1 <= QD <= 64 or SECONDS <= 0 or ROUNDS < 1:
+    parser.error('aligned block size dividing 1 GiB, QD 1--64, positive seconds/rounds required')
+if PREFILL_BYTES < BS or PREFILL_BYTES > CAPACITY or PREFILL_BYTES % BS:
+    parser.error('prefill bytes must be a multiple of block size within 1 GiB')
+LIBC = C.CDLL(None, use_errno=True)
+LIBC.syscall.restype = C.c_long
+
+class IOCB(C.Structure):
+    _fields_ = [("data", C.c_uint64), ("key", C.c_uint32), ("rw_flags", C.c_uint32),
+                ("opcode", C.c_uint16), ("priority", C.c_int16), ("fd", C.c_uint32),
+                ("buffer", C.c_uint64), ("bytes", C.c_uint64), ("offset", C.c_int64),
+                ("reserved", C.c_uint64), ("flags", C.c_uint32), ("resfd", C.c_uint32)]
+
+class Event(C.Structure):
+    _fields_ = [("data", C.c_uint64), ("obj", C.c_uint64),
+                ("result", C.c_int64), ("result2", C.c_int64)]
+
+class Timespec(C.Structure):
+    _fields_ = [("sec", C.c_long), ("nsec", C.c_long)]
+
+def call(number, *args):
+    value = LIBC.syscall(C.c_long(number), *args)
+    if value < 0:
+        error = C.get_errno()
+        raise OSError(error, os.strerror(error))
+    return value
+
+def emit(tag, obj):
+    print(tag + " " + json.dumps(obj, sort_keys=True), flush=True)
+
+def disk(owner):
+    slot = ("09", "0a")[owner]
+    blocks = list(Path("/sys/bus/pci/devices/0000:00:" + slot + ".0").glob("virtio*/block/*"))
+    if len(blocks) != 1:
+        raise RuntimeError("dedicated owner disk missing")
+    block = blocks[0]
+    if (block / "serial").read_text().strip() != "GVM-DATA-OWNER%d" % owner:
+        raise RuntimeError("disk serial mismatch")
+    if (block / "device/driver").resolve().name != "virtio_blk":
+        raise RuntimeError("native virtio_blk required")
+    fd = os.open("/dev/" + block.name, os.O_RDWR | os.O_DIRECT)
+    size = struct.unpack("Q", fcntl.ioctl(fd, 0x80081272, bytes(8)))[0]
+    if size != CAPACITY:
+        os.close(fd)
+        raise RuntimeError("dedicated 1 GiB disk required")
+    return fd
+
+def worker(owner, ready, gate, output, full):
+    # Pin before creating the buffer or AIO context: first-touch belongs to owner.
+    cpu = (0, 2)[owner]
+    os.sched_setaffinity(0, {cpu})
+    fd = disk(owner)
+    buffers = []
+    exports = []
+    ctx = C.c_uint64(0)
+    try:
+        call(206, C.c_uint(QD), C.byref(ctx))  # io_setup
+        pattern = os.urandom(BS)
+        for unused in range(QD):
+            b = mmap.mmap(-1, BS, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+            b[:] = pattern
+            buffers.append(b)
+            exports.append((C.c_char * BS).from_buffer(b))
+        cbs = [IOCB(data=i, opcode=1, fd=fd, buffer=C.addressof(exports[i]), bytes=BS)
+               for i in range(QD)]
+        free = list(range(QD))
+        events = (Event * QD)()
+        timeout = Timespec(1, 0)
+        os.write(ready, b"R")
+        os.read(gate, 1)
+        start = time.monotonic()
+        deadline = start + SECONDS
+        sent = completed = inflight = 0
+        weighted_depth = wait_time = 0.0
+        peak = 0
+        stalls = 0
+        while True:
+            running = sent < PREFILL_BYTES // BS if full else time.monotonic() < deadline
+            if running and free:
+                wanted = min(len(free), PREFILL_BYTES // BS - sent) if full else len(free)
+                chosen = free[:wanted]
+                for n, i in enumerate(chosen):
+                    cbs[i].offset = ((sent + n) % (CAPACITY // BS)) * BS
+                pointers = (C.POINTER(IOCB) * wanted)(*[C.pointer(cbs[i]) for i in chosen])
+                accepted = call(209, ctx, C.c_long(wanted), pointers)  # io_submit
+                if accepted:
+                    del free[:accepted]
+                    sent += accepted
+                    inflight += accepted
+                    peak = max(peak, inflight)
+            if not inflight:
+                if not running:
+                    break
+                raise RuntimeError("AIO submit made no progress")
+            before = time.monotonic()
+            count = call(208, ctx, C.c_long(1), C.c_long(QD),
+                         events, C.byref(timeout))  # io_getevents
+            waited = time.monotonic() - before
+            weighted_depth += inflight * waited
+            wait_time += waited
+            if not count:
+                stalls += 1
+                if stalls > 30:
+                    raise RuntimeError("AIO completion stalled")
+                continue
+            stalls = 0
+            for i in range(count):
+                event = events[i]
+                if event.result != BS or event.result2:
+                    raise RuntimeError("AIO short/error completion: %d/%d" %
+                                       (event.result, event.result2))
+                free.append(event.data)
+                completed += 1
+                inflight -= 1
+        end = time.monotonic()
+        os.fsync(fd)
+        flushed = time.monotonic()
+        if full:
+            for offset in (0, PREFILL_BYTES - BS):
+                if os.preadv(fd, [memoryview(buffers[0])], offset) != BS or buffers[0][:] != pattern:
+                    raise RuntimeError("prefill data verification failed")
+        usage = os.times()
+        result = dict(owner=owner, cpu=cpu, bytes=completed * BS, elapsed=end-start,
+                      flush_seconds=flushed-end, mib_s=completed*BS/(1024**2)/(end-start),
+                      flushed_mib_s=completed*BS/(1024**2)/(flushed-start), start=start, end=end,
+                      queue_depth_peak=peak,
+                      queue_depth_during_wait=weighted_depth/wait_time if wait_time else 0,
+                      cpu_seconds=usage.user+usage.system, prefill=full)
+        os.write(output, (json.dumps(result) + "\n").encode())
+    finally:
+        if ctx.value:
+            call(207, ctx)  # io_destroy
+        exports.clear()
+        for b in buffers:
+            b.close()
+        os.close(fd)
+
+def phase(name, owners, full=False):
+    children = []
+    emit("BENCH_PREPARE", dict(name=name, owners=owners, bs=BS, qd=QD))
+    for owner in owners:
+        ready_r, ready_w = os.pipe()
+        gate_r, gate_w = os.pipe()
+        out_r, out_w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                for entry in children:
+                    for fd in entry[1:]:
+                        os.close(fd)
+                os.close(ready_r); os.close(gate_w); os.close(out_r)
+                worker(owner, ready_w, gate_r, out_w, full)
+                os._exit(0)
+            except BaseException:
+                traceback.print_exc()
+                try: os.write(out_w, b'{"error":"worker failed"}\n')
+                except OSError: pass
+                os._exit(1)
+        os.close(ready_w); os.close(gate_r); os.close(out_w)
+        children.append((pid, ready_r, gate_w, out_r))
+    for pid, ready_r, gate_w, out_r in children:
+        if os.read(ready_r, 1) != b"R":
+            raise RuntimeError("worker did not initialize")
+    emit("BENCH_BEGIN", dict(name=name, owners=owners))
+    # Allow the host observer to take both endpoints' counter snapshots.
+    time.sleep(1)
+    for pid, ready_r, gate_w, out_r in children:
+        os.write(gate_w, b"S")
+    results = []
+    for pid, ready_r, gate_w, out_r in children:
+        with os.fdopen(out_r) as pipe:
+            result = json.loads(pipe.readline())
+        unused, status = os.waitpid(pid, 0)
+        os.close(ready_r); os.close(gate_w)
+        if status or "error" in result:
+            raise RuntimeError("benchmark child failed")
+        results.append(result)
+    duration = max(r["end"] for r in results) - min(r["start"] for r in results)
+    total = sum(r["bytes"] for r in results) / (1024**2) / duration
+    obj = dict(name=name, owners=owners, results=results, total_mib_s=total,
+               common_window_seconds=duration)
+    emit("BENCH_END", obj)
+    return obj
+
+if os.uname().machine != "x86_64" or C.sizeof(IOCB) != 64:
+    raise RuntimeError("x86_64 Linux AIO ABI required")
+owners = [args.owner] if args.owner is not None else [0,1]
+emit("BENCH_CONFIG", dict(block_size=BS, queue_depth=QD, seconds=SECONDS,
+                         rounds=ROUNDS, owners=owners, prefill_bytes=PREFILL_BYTES,
+                         full_device_prefill=not args.skip_prefill and PREFILL_BYTES==CAPACITY))
+if not args.skip_prefill:
+    phase("prefill-local", owners, full=True)
+if args.prepare_only:
+    raise SystemExit(0)
+all_results = []
+for round_no in range(1, ROUNDS + 1):
+    cases = [("single%d"%args.owner, owners)] if args.owner is not None else [
+        ("single0",[0]),("single1",[1]),("parallel",[0,1])]
+    rotate = (round_no-1) % len(cases)
+    cases = cases[rotate:] + cases[:rotate]
+    for name, selected in cases:
+        all_results.append(phase(name+"-r"+str(round_no), selected))
+summary = {}
+for name in sorted(set(r["name"].rsplit("-r",1)[0] for r in all_results)):
+    values = [r["total_mib_s"] for r in all_results if r["name"].startswith(name+"-")]
+    summary[name] = dict(median_mib_s=statistics.median(values),samples_mib_s=values)
+if args.owner is None:
+    summary["gain_vs_best_single"] = summary["parallel"]["median_mib_s"] / max(
+        summary["single0"]["median_mib_s"],summary["single1"]["median_mib_s"])
+    summary["ratio_to_separate_single_sum"] = summary["parallel"]["median_mib_s"] / (
+        summary["single0"]["median_mib_s"] + summary["single1"]["median_mib_s"])
+emit("BENCH_SUMMARY",summary)
