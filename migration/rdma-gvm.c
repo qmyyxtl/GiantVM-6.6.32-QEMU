@@ -36,7 +36,8 @@ typedef struct {
     // Send buffers
     void *send_bufs[RDMA_BUFFER_COUNT];
     struct ibv_mr *send_mrs[RDMA_BUFFER_COUNT];
-    int send_free_mask;  // bit mask: 1=free, 0=busy
+    int send_free_mask;  // legacy field; the serialized sender uses buffer 0
+    bool failed;
     
     // Recv buffers
     void *recv_bufs[RDMA_BUFFER_COUNT];
@@ -584,6 +585,8 @@ static int post_all_recvs(rdma_conn_t *conn)
     return 0;
 }
 
+static uint64_t rdma_monotonic_ms(void);
+
 static int rdma_send_msg(rdma_conn_t *conn, rdma_msg_header_t *hdr, const void *data)
 {
     pthread_mutex_lock(&conn->send_lock);
@@ -596,6 +599,10 @@ static int rdma_send_msg(rdma_conn_t *conn, rdma_msg_header_t *hdr, const void *
         return -EMSGSIZE;
     }
 
+    if (conn->failed) {
+        pthread_mutex_unlock(&conn->send_lock);
+        return -ENOTCONN;
+    }
     // Copy message
     void *buf = conn->send_bufs[buf_idx];
     memcpy(buf, hdr, sizeof(*hdr));
@@ -618,6 +625,7 @@ static int rdma_send_msg(rdma_conn_t *conn, rdma_msg_header_t *hdr, const void *
     wr.send_flags = IBV_SEND_SIGNALED;
     
     if (ibv_post_send(conn->qp, &wr, &bad_wr)) {
+        conn->failed = true;
         conn->send_free_mask |= (1 << buf_idx);
         pthread_mutex_unlock(&conn->send_lock);
         fprintf(stderr, "[RDMA] post_send failed\n");
@@ -627,6 +635,7 @@ static int rdma_send_msg(rdma_conn_t *conn, rdma_msg_header_t *hdr, const void *
     // Wait for completion
     struct ibv_wc wc;
     if (rdma_wait_completion(conn, &wc) < 0 || wc.wr_id != buf_idx) {
+        conn->failed = true;
         pthread_mutex_unlock(&conn->send_lock);
         return -1;
     }
@@ -639,7 +648,8 @@ static int rdma_send_msg(rdma_conn_t *conn, rdma_msg_header_t *hdr, const void *
 
 static int rdma_wait_completion(rdma_conn_t *conn, struct ibv_wc *wc)
 {
-    while (1) {
+    uint64_t deadline = rdma_monotonic_ms() + 5000;
+    while (rdma_monotonic_ms() < deadline) {
         int n = ibv_poll_cq(conn->cq, 1, wc);
         if (n < 0) {
             fprintf(stderr, "[RDMA] poll_cq failed\n");
@@ -654,6 +664,7 @@ static int rdma_wait_completion(rdma_conn_t *conn, struct ibv_wc *wc)
         }
         usleep(1);
     }
+    return -ETIMEDOUT;
 }
 
 // ============ 接收线程 ============

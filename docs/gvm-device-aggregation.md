@@ -39,3 +39,17 @@ MSI 目标测试使用 Linux 现有 IRQ-work 向量 0xf6，观察 /proc/interrup
 ## 当前边界
 
 只支持单根总线上的静态 PCI endpoint；动态热插拔、逻辑/广播 MSI、内核 irqfd 加速、真实 VFIO DMA、跨节点故障 supervisor 尚未实现。现有根盘仍使用 master 的旧设备路径。本分支不修改 host 内核。
+
+
+## 已完成的真实双机验证
+
+Ezreal 与 Jinx 均保持 6.6.32-krdma+，各运行 QEMU 9.0.90；同一 guest 为 6.12.0-rc5-g8f585d63b94a-dirty，4 CPU 在线。root/root 可通过串口登录。
+
+- Guest 同时枚举 00:05.0（owner0/Ezreal）和 00:06.0（owner1/Jinx）。
+- CPU0/CPU2 × owner0/owner1 的四组 BAR 身份、有序写读、阶乘计算均通过。
+- 四组 4096-byte DMA 往返均通过；切换到另一节点 CPU 后，数据仍一致。
+- owner × 提交 CPU × 目标 CPU 的八组 MSI 各完成 8 次 IRQ-work 投递。
+- 双向并发访问通过：两个进程分别固定到 CPU0/CPU2，各访问远端 owner 128 轮。
+- 未创建实验日志、镜像、overlay 或 guest 测试文件；测试代码由串口直接送入 Python 内存执行。
+
+上述结果只验收模拟 EDU 与 fixed physical MSI 路由，不代表真实 VFIO DMA、网卡收发、磁盘读写或 Linux PCI 驱动 IRQ 亲和性已经验收。
