@@ -17,7 +17,7 @@ import subprocess
 parser = argparse.ArgumentParser()
 parser.add_argument("node", type=int, choices=(0, 1))
 parser.add_argument("--parent", required=True,
-                    help="physical Ethernet interface (node0) or bridge (node1)")
+                    help="physical Ethernet interface or existing bridge")
 parser.add_argument("--data-disk", help="physical block device, read-only")
 parser.add_argument("--single-node", action="store_true",
                     help="control run: 2 local CPUs, read-only root, no DSM")
@@ -35,6 +35,7 @@ iface = f"gvm-local{args.node}" if args.single_node else f"gvm-net{args.node}"
 fds = []
 created = False
 child = None
+bridge_parent = Path("/sys/class/net", args.parent, "bridge").is_dir()
 
 def run(*command):
     subprocess.run(command, check=True)
@@ -51,7 +52,7 @@ def stop_child(signum, frame):
 try:
     if Path("/sys/class/net", iface).exists():
         parser.error(f"{iface} already exists; refusing to change it")
-    if args.node == 0:
+    if not bridge_parent:
         run("ip", "link", "add", "link", args.parent, "name", iface,
             "type", "macvtap", "mode", "bridge")
     else:
@@ -61,12 +62,12 @@ try:
     mac = f"52:54:00:da:00:{16 + args.node:02x}"
     # A bridge TAP needs a different host MAC; a local bridge FDB entry
     # must not consume unicast replies destined for the guest.
-    host_mac = mac if args.node == 0 else f"52:54:00:da:10:{16 + args.node:02x}"
+    host_mac = mac if not bridge_parent else f"52:54:00:da:10:{16 + args.node:02x}"
     run("ip", "link", "set", "dev", iface, "address", host_mac)
-    if args.node == 1:
+    if bridge_parent:
         run("ip", "link", "set", "dev", iface, "master", args.parent)
     run("ip", "link", "set", "dev", iface, "up")
-    if args.node == 0:
+    if not bridge_parent:
         index = Path("/sys/class/net", iface, "ifindex").read_text().strip()
         netfd = os.open(f"/dev/tap{index}", os.O_RDWR)
     else:
