@@ -1,5 +1,51 @@
 # RDMA 版设备聚合
 
+## 2026-10-09 IRQ locality 对照与配置后回归
+
+本节是最新状态；后续日期段落作为历史现场保留。
+新仓库：KVM https://github.com/qmyyxtl/GiantVM-6.6.32-KVM ，
+QEMU https://github.com/qmyyxtl/GiantVM-6.6.32-QEMU 。
+整理保留原提交历史，功能代码未改变。host/guest 内核版本保持原名。
+
+Garen 的 vda 在 owner0，提交在 CPU0，但 IRQ10 原实际落在远端 CPU2；
+Ezreal 的 vdb 提交在 CPU2，IRQ11 原落在同 host 的 CPU3。
+两条 IRQ 是不同 INTx 线路。允许掩码原均为 0-3，不代表实际处理中断的 CPU。
+保持 1 MiB、QD=8、owner 本地首触，只调整 IRQ10，
+按本地→远端→本地各测 10 秒：
+
+| IRQ10 实际 CPU | MiB/s | 两端 DSM 慢路径 fault / 写入 MiB |
+| --- | ---: | ---: |
+| 本地 CPU0 | 984.45 | 7.36 |
+| 远端 CPU2 | 140.35 | 617.33 |
+| 本地 CPU0 重复 | 927.45 | 8.88 |
+
+因果对照后曾恢复原允许掩码与实际 CPU；随后按用户要求保留本地配置：
+guest IRQ10 的 smp_affinity_list=0，effective=0；
+IRQ11 的 smp_affinity_list=2，effective=2。irqbalance inactive。
+配置只作用于当前 guest 运行期，没有修改 guest OS 代码或重启。
+迁移可能直到下一次 I/O 中断才实际生效；要同时检查 effective 和中断计数。
+
+保留原参数，三轮 15 秒，每轮轮换单盘/并行顺序，跳过已完整预写的准备：
+
+| 工作负载 | 第1轮 MiB/s | 第2轮 MiB/s | 第3轮 MiB/s | 中位数 MiB/s |
+| --- | ---: | ---: | ---: | ---: |
+| Garen 单盘 | 968.50 | 960.89 | 993.31 | 968.50 |
+| Ezreal 单盘 | 973.39 | 940.26 | 928.44 | 940.26 |
+| 双盘并行合计 | 560.50 | 555.78 | 540.25 | 555.78 |
+
+单盘两端合计慢路径 fault/MiB：Garen 6.94–11.20，Ezreal 8.59–9.92；
+并行 149.36–174.43。计数只读读取现有内核全局变量，
+在 fast path 之后计数，非原子且包含后台活动，不是全部 DMA 页面访问数。
+IRQ 本地化解决了主要单盘不对称，但双盘并行仍未产生带宽收益。
+并行共享页面/状态的具体热点尚未逐页归因。
+三个并行阶段 QEMU 的磁盘写量与各自 owner 后端一致，
+不能把全部 IB 流量解释为磁盘 payload 在跨网传输。
+
+本轮未新增实验文件，未修改功能代码、编译、安装内核或重启；
+运行实例保留，host dmesg 没有新增 hung task / BUG / panic。
+此前已记录的启动 dirty tracking WARN 仍是待核实事项。
+新环境构建/启动/配置入口以仓库 README.md 为准。
+
 ## 2026-10-08 DMA pin 协议修复与持续写回归
 
 本节是最新状态，后文保留此前验收和故障现场作为历史记录。
