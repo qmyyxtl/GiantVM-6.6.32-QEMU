@@ -1465,3 +1465,45 @@ Jinx 接收进程及 198.18.10.3 地址已清理；Garen 原有 libvirt VM 保�
 本次没有计数 DSM page fault，不能由吞吐变化直接认定 DSM 为原因。
 下一步优先区分远端 CPU 后台活动引起的页面迁移/共享竞争，与剩余本地
 VT-d、VFIO DMA map/unmap 和队列处理固定成本。
+
+## owner 本地 ioctl 与用户态成本拆分（2026-10-10）
+
+同一次四 CPU 在线的 Garen owner0 单 VF→Jinx 运行中，guest、HPET、
+QEMU 开关与 CPU 0/1 两 worker 配置保持不变，分别执行独立诊断窗口。
+代码仍为 `93412ed86f`，本轮未改运行代码或 guest。
+
+24 秒 BPF 窗口配对 raw ioctl enter/exit，同时按 active 调用记录
+sched_switch 与调用内 kvm_dsm_fetch；停止 enter 后等待在途调用退出，
+最终 active_count=0，所有观察到的调用返回错误数为 0。
+按 ioctl 类别累计（跨线程，不能当作墙钟占比）：
+
+| 类别 | 调用数 | 累计墙钟 ms | 其中 off-CPU ms |
+| --- | ---: | ---: | ---: |
+| DSM memcpy 读 | 4190973 | 2388.152 | 0.562 |
+| DSM memcpy 写 | 1119551 | 558.626 | 0.240 |
+| VFIO DMA map | 674591 | 1178.786 | 0.051 |
+| VFIO DMA unmap | 674591 | 1934.292 | 0.205 |
+
+硬件 map/unmap 都为 4 KiB，平均约 1.75 / 2.87 微秒，主要在本地
+qemu-vcpu0/1 线程内执行。复制调用内仅观察到 72 次 fetch；这不表示 DSM
+没有开销，复制 ioctl 即使不 fetch 仍执行 DSM 锁、页面检查与复制路径。
+没有把该数字解释为所有 DSM fault 或全系统 RDMA 请求数。
+带探针发送三轮 134.14/127.07/123.60 MiB/s，内容与字节数校验通过；
+探针对逐 syscall 路径有扰动，不使用该吞吐证明优化收益或回退。
+
+独立低频 cpu-clock:uH、199 Hz、24 秒、DWARF4096 用户态采样，
+记录 17.366 MB 于 memfd，处理后释放，报告 Lost Samples=0。
+自耗时样本主要包括 ioctl 8.34%、hash lookup 5.16%、malloc 3.49%、
+iova_tree_compare 3.26%、pthread_mutex_lock 2.62%、动态类型检查 2.14%、
+completion 1.91%、calloc 1.75%；其余热点较分散。
+这些比例仅覆盖采样到的 host 用户态 CPU，不包含内核执行、guest 或等待，
+不能与上一窗口的累计 ioctl 时间直接相加，也不能据此宣称锁竞争严重。
+该窗口发送 140.53/131.79/147.76 MiB/s，字节及内容校验通过。
+
+本轮证据确认需要减少的是每次 DMA 生命周期及小块元数据访问的固定成本，
+不只是跨节点 fetch；剩余性能差距尚未完全归因。后续优先检查 4 KiB
+map/buffer 元数据的分配与索引成本，以及已发布失效描述符的读取批量化。
+任何优化都必须保留实际硬件 unmap、翻译失效、completion 发布顺序与
+DSM 访问语义，不能以继续保留失效映射换取吞吐。
+临时探针/采样与接收进程均已结束、memfd 已释放、Jinx 临时地址已删除；
+最终 CPU 0–3 在线、hpet，所检查 BUG/DMA fault/TX timeout 类错误为空。
