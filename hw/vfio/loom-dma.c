@@ -538,8 +538,13 @@ static int publication_pin(VFIOContainerBase *bc, MemoryRegionCache *cache,
         .write = true, .host_virt_addr = (uintptr_t)host, .length = size,
     };
     ret = kvm_vm_ioctl(kvm_state, KVM_DSM_MEMPIN, &pin);
-    if (ret) {
-        return ret < 0 ? ret : -EIO;
+    /*
+     * DSM fault returns a positive access mask on successful shared-page
+     * acquisition (ACC_ALL for write), or zero for private pages. The pin has
+     * been installed in both nonnegative cases and must always be released.
+     */
+    if (ret < 0) {
+        return ret;
     }
     cache->ptr = host;
     *pinned = true;
