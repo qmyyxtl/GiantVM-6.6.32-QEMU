@@ -3871,3 +3871,45 @@ Garen worker-g4 PID6122未动，没有实验文件/新盘/host reboot。
 在一个有界lease内仍只写changed spans并保持DD最后，减少剩余小调用。
 不能扩大为整页复制或跳过ownership；该有序合并尚未实现。
 长期DMA mapping容量与失效、reset恢复及性能验证仍待完成。
+
+## 2026-10-11：碎片发布优化的真实 kernel 调用数量对照
+
+本轮未修改功能代码，仍为 edf6c75ec5；README 同步后为 ac60305f9d。
+先在已运行 PIN1 上采样，再正常 poweroff/两端 EXIT0，以 PIN0 启动相同
+binary，重新配置同样的 NIC/IRQ 后采样，最后恢复 PIN1。
+未改 guest/kernel/HPET；CPU0–3 保持在线。没有 Lux 测试或 host reboot。
+只生成 stdin/memfd 中的探针与流量程序，不保存实验文件。
+
+Garen owner 单卡接收 Jinx：CPU0/enp0s7，单连接 256MiB × 3，
+两 NIC 2 queues、RX512/TX128、RPS/XPS0，data IRQ36/37/39/40→0/1/2/3。
+两个组都验证全部 805,306,368 字节的内容、计数，并收到 source ACK。
+BCC kprobe/kretprobe 只过滤对应 QEMU tgid，记录 kvm_dsm_memcpy 的
+write/length 与 kvm_dsm_mempin 的 pin/unpin；正 access mask 不是错误。
+进入/返回计数完整，两个组 errors=0、dropped=0、pending=0。
+
+| 768MiB 流量窗口中的调用 | PIN0 | PIN1 |
+| --- | ---: | ---: |
+| write MEMCPY，length ≤8 | 5,721,725 | 2,840,235 |
+| MEMPIN acquire，所有 length | 553 | 560,117 |
+| MEMPIN release，所有 length | 553 | 560,117 |
+
+PIN1 的 559,559 对 pin/unpin 落在 1025–2048 字节桶；16/32 字节等短范围
+合计很少。因此现有优化主要覆盖 payload，不等于已合并 RX descriptor。
+≤8 字节写复制减少50.36%；仅对表中三类调用求和，减少30.80%。
+这不是所有 syscall 总数的变化，也不是纯非DSM CPU开销的测量。
+全部 QEMU 活动纳入窗口，不能把所有短写归为 RX descriptor；
+相同流量之外有 idle margins，窗口长度 PIN0 16.071s、PIN1 17.461s，
+两个 boot 的内存分配/DSM 状态、TCP ACK/RSS 等未固定，不能推出精确因果收益。
+ON→OFF 顺序只有各一个采样窗口，不能代替重复/随机对照。
+探针本身增加每次入口/返回处理，ON 各轮2.765/2.815/3.196s、
+OFF3.635/3.658/3.565s；这些速度不能混入上一节无探针带宽表。
+
+代码核对：hw/vfio/loom-iavf.c 的 RX completion 当前仍分别发布
+descriptor[0..7]、descriptor[9..31]，最后 wmb 与 descriptor[8] DD，
+每个 publish_snapshot 独立进入 merge_buffer，故短 metadata 很难达到
+当前“至少4段剩余变化”的 pin 门槛。潜在下一步是在同一个32字节、
+单页且已验证可写的范围中共用 cache/有界 pin，仍仅写变化字节、
+payload先完成、metadata先于DD、release在所有写之后；
+须覆盖失败时部分baseline、dirty、unpin与停止VM语义。
+此处只记录证据与候选设计，尚未实现该新API或报告其收益。
+长期映射/失效/reset 恢复与双卡扩展目标仍未完成。
