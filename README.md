@@ -528,3 +528,25 @@ Tcp RetransSegs 总计 2，TCP 校验错误为 0。较小 ring 的结果仍不�
 不能为了减少扫描直接跳过完成回写。现有 iavf 寄存器将 QTX/QRX tail 与
 VFINT_DYN_CTL 等中断控制分开，而当前 VFIO 写回调统一执行提交同步；
 需要按实际设备协议验证其优化空间，未知设备保持正确的通用路径。
+
+### X710 VF 中断控制写入的提交同步（2026-10-10）
+
+持续 TCP 诊断的 12 秒窗口中，Garen BAR0 0x3800/0x3804 分别出现
+2411/1114 次完成的提交方向同步，累计 866983/408875 us；
+TX tail 0x0 的提交同步累计 2162690 us。采样含探针和 DSM 等待，
+不能将累计时间视为可独立消除的吞吐损失，亦不作为正式吞吐基线。
+
+VFIO 在读取物理 PCI 配置、guest ID override 之前匹配 8086:154c，
+排除 mediated device。仅 BAR0 的对齐 32 位 VFINT_DYN_CTLN1[0..63]
+及 VFINT_DYN_CTL01 写入省掉 guest-to-device 扫描；这些寄存器控制
+中断或请求已提交工作的 writeback，不提交新描述符。每次仍先发布
+from-device 修改；队列 tail、AQ、其他 BAR/宽度/设备保持完整同步。
+这项改变不实现后台 DMA 一致性，也不跳过完成同步。
+
+实际 helpers.c 写回调的 memfd 隔离验证覆盖 0..65535 地址、1/2/4/8
+字节访问、其他 BAR/设备、同步顺序及同步失败阻止 MMIO，均通过；
+Ezreal QEMU 构建通过。尚需新进程上的硬件回归和相同条件性能比较。
+
+捕获 CONFIG_VSI_QUEUES 得到两条 128 项 TX/RX ring 的实际 DMA 地址。
+两次设备 pool 与 baseline 快照中未发现未发布 DD；这是有限快照，
+不足以排除 IRQ 屏蔽期间的瞬态完成可见性问题。HPET 与 guest 驱动不变。

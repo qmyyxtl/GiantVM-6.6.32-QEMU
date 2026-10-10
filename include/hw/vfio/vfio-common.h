@@ -125,6 +125,8 @@ typedef struct VFIODevice {
     int fd;
     int type;
     bool mdev;
+    /* Physical Intel X710 VF: BAR0 interrupt controls do not submit DMA. */
+    bool loom_iavf_irq_control;
     bool reset_works;
     bool needs_reset;
     bool no_mmap;

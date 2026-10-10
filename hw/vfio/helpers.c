@@ -162,6 +162,27 @@ static bool vfio_loom_sync(VFIODevice *dev, bool submit)
 }
 
 /*
+ * X710 VF BAR0 VFINT_DYN_CTLN1[0..63] and VFINT_DYN_CTL01 change
+ * interrupt masking/moderation or request writeback of already-submitted work.
+ * They do not publish new descriptor or payload addresses. Keep completion
+ * publication, but avoid a redundant guest-to-device scan for these writes.
+ * Queue tails, admin commands, other BARs and unknown devices retain full sync.
+ */
+static bool vfio_loom_write_submits_dma(VFIORegion *region,
+                                        hwaddr addr, unsigned size)
+{
+    VFIODevice *dev = region->vbasedev;
+
+    if (dev->type != VFIO_DEVICE_TYPE_PCI ||
+        !dev->loom_iavf_irq_control || region->nr != 0 || size != 4) {
+        return true;
+    }
+
+    return !((addr >= 0x3800 && addr <= 0x38fc && !(addr & 3)) ||
+             addr == 0x5c00);
+}
+
+/*
  * IO Port/MMIO - Beware of the endians, VFIO is always little endian
  */
 void vfio_region_write(void *opaque, hwaddr addr,
@@ -176,7 +197,8 @@ void vfio_region_write(void *opaque, hwaddr addr,
         uint64_t qword;
     } buf;
 
-    if (!vfio_loom_sync(vbasedev, true)) {
+    if (!vfio_loom_sync(vbasedev,
+                        vfio_loom_write_submits_dma(region, addr, size))) {
         return;
     }
 

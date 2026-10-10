@@ -3047,6 +3047,12 @@ static void vfio_realize(PCIDevice *pdev, Error **errp)
         goto error;
     }
 
+    /* Match the physical ID before optional guest-visible ID overrides. */
+    vbasedev->loom_iavf_irq_control =
+        !vbasedev->mdev &&
+        pci_get_word(pdev->config + PCI_VENDOR_ID) == 0x8086 &&
+        pci_get_word(pdev->config + PCI_DEVICE_ID) == 0x154c;
+
     /* vfio emulates a lot for us, but some bits need extra love */
     vdev->emulated_config_bits = g_malloc0(vdev->config_size);
 
