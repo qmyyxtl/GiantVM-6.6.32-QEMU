@@ -804,6 +804,7 @@ static void *request_worker_func(void *arg)
     router_worker_t *worker = &g_ctx.workers[peer];
 
     free(arg);
+    pthread_setname_np(pthread_self(), "gvm-rdma-req");
     rcu_register_thread();
     for (;;) {
         router_work_t *work;
@@ -906,6 +907,7 @@ static void* recv_thread_func(void *arg)
 {
     int peer_id = *(int*)arg;
     free(arg);
+    pthread_setname_np(pthread_self(), "gvm-rdma-rx");
     
     rdma_conn_t *conn = g_ctx.recv_conns[peer_id];
     debugf("[RDMA Router] Recv thread started for peer %d\n", peer_id);
