@@ -591,3 +591,51 @@ Garen 121199、Ezreal 120358 次 fetch，约 12120/12036 次每秒；
 
 后续优先区分业务新增热页、内核对象真共享/假共享以及 owner-local 分配与
 softirq 执行；OS 修改以证据为依据。保留 HPET，不把更换时钟作为优化方案。
+
+### IOMMU QI 控制结构的页面假共享（2026-10-10）
+
+进一步通过准确 guest RIP 定位业务新增的 GPA 0x4afa000：
+qi_submit_sync、其锁和 cache_tag_flush_range/np 在该页触发频繁缺页。
+使用目标 guest 编译选项和头文件在 memfd 中取得结构偏移，随后只读
+/proc/kcore 遍历 dmar_drhd_units，确认 dmar1(regbase fed91000) 的 q_inval
+位于 GPA 0x4afa640，dmar0(fed90000) 位于 0x4afa680，两个独立失效队列
+的锁/head/tail/free_cnt 共用一个 4 KiB 页面，非逻辑上的同一个锁。
+15 秒含短时双卡收发的 EPT 采样，该共享页两端分别 12168/12309 次缺页。
+
+已按用户允许修改 OS 的最新指示，在 Garen /home/xtl/GVM-guest-kernel
+原 origin 分支 device-aggregation 提交 db67bfba7：
+drivers/iommu/intel/dmar.c 的 q_inval 分配大小按 PAGE_SIZE 向上取整，
+desc_status 同样保留完整页面并保持零初始化。仍使用 kmalloc/kzalloc 与
+原 kfree，保留 GFP_ATOMIC、锁、QI 提交/完成及严格 IOMMU 失效语义。
+当前 q_inval=40 字节、desc_status=1024 字节，各变为 4096 字节分配；
+每 IOMMU 额外约 7 KiB 分配空间。用户原有 kernel/sched/fair.c 修改未纳入提交。
+未调整 HPET。新旧 read_hpet 均为 236 字节、地址 ffffffff8106ea00，
+机器码 SHA256 均为 0036f6dfd63d8177140e7a2ce5f3490a72c3181ac1077d6e5e54b4b339c4f363。
+
+构建使用 make -C /home/xtl/GVM-guest-kernel LOCALVERSION= -j8 bzImage，
+release 保持 6.12.0-vanilla-vfio，运行版本 #22；与原部署 .config 无差异。
+直接使用已有构建产物，不覆盖原部署镜像，不创建实验脚本/日志/结果文件。
+master helper 的启动覆盖须在 sudo 之后传入，普通 shell 环境会被 sudo 清掉：
+
+\`\`\`sh
+sudo -n env GVM_GUEST_KERNEL=/home/xtl/GVM-guest-kernel/arch/x86/boot/bzImage \\
+  python3 /home/xtl/GVM-qemu/scripts/gvm-device-vfio-node.py 0 \\
+  --host 0000:0c:02.0 --data-disk /home/xtl/start/gvm-device-data-node0.raw
+\`\`\`
+
+新 guest 中 dmar1 的 qi/status 为 GPA 0x495c000/0x495d000，dmar0 为
+0x495e000/0x495f000：四者均 4 KiB 对齐、各有独立页面。双 VF 原生驱动
+收发、两队列/128 项 ring 重配通过；一次连通失败的现场发现 Ezreal
+测试 IP 198.18.10.1 消失，恢复地址后通过，未为此重启 VM/host。
+
+25 秒包含一次至少 6 秒双卡四 worker 数据验证的采样，四个新元数据页
+EPT 缺页合计 Garen 29、Ezreal 125；对应 fetch 请求 79/127（含 INVALIDATE）。
+与前述 15 秒旧页采样时长/数据量不同，旧页还有邻居对象，不据此推算
+吞吐或完整 DSM 降幅。页面布局与低热点计数支持具体假共享路径已缓解。
+总体 DSM 仍高，两个活动窗口的普通 fetch 约 12022/12212 次每秒，
+热点仍在 read_hpet 共享锁、jiffies/timekeeper、定时器等；不能声称瓶颈已解决。
+带探针短时 TCP 约 14.22 MiB/s，内容和长度校验通过，不作性能提升结论。
+只读 O_RDONLY/O_DIRECT 双盘四 worker 内容回归通过，短时 3052 MiB/s。
+最终 guest HPET=hpet，NIC rx_discards/tx_discards/tx_errors 均 0，
+未发现 DMA fault/QI submission/invalidation error/TX timeout。
+所有 TCP sink 已退出，host 内核不变，Lux 和 Garen 原有 libvirt VM 未动。
