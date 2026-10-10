@@ -87,6 +87,7 @@ static PCIBus *root_bus;
 static unsigned local_node, node_count, owned_count;
 static uint32_t config_address;
 static bool owner_iommu_present;
+static bool local_bar_lock_batch;
 
 G_STATIC_ASSERT(sizeof(LoomPCIDescriptor) == 4288);
 /* Only this prefix changes BAR mappings. Extended config reads use owner RPC. */
@@ -543,6 +544,16 @@ static void collect_device(PCIBus *bus, PCIDevice *dev, void *opaque)
     loom_pci_publish(dev);
 }
 
+static bool get_local_bar_lock_batch(Object *obj, Error **errp)
+{
+    return qatomic_read(&local_bar_lock_batch);
+}
+
+static void set_local_bar_lock_batch(Object *obj, bool enabled, Error **errp)
+{
+    qatomic_set(&local_bar_lock_batch, enabled);
+}
+
 void loom_pci_prepare(void)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
@@ -558,6 +569,11 @@ void loom_pci_prepare(void)
     if (loom_iommu_enabled() && !owner_iommu_present) {
         fatal_error("owner IOMMU mode requires an Intel IOMMU on every node");
     }
+    local_bar_lock_batch =
+        g_strcmp0(getenv("LOOM_PCI_LOCAL_BAR_LOCK_BATCH"), "1") == 0;
+    object_property_add_bool(OBJECT(ms), "loom-local-bar-lock-batch",
+                             get_local_bar_lock_batch,
+                             set_local_bar_lock_batch);
     local_node = ms->local_cpu_start_index / ms->local_cpus;
     node_count = ms->qemu_nums;
     if (local_node >= node_count) {
@@ -1039,8 +1055,8 @@ static void refresh_remote_mappings(void)
     }
 }
 
-static bool bar_access_owner(unsigned owner, hwaddr addr, bool io,
-                             uint8_t *data, unsigned size, bool write)
+static bool bar_access_owner_scan(unsigned owner, hwaddr addr, bool io,
+                                  uint8_t *data, unsigned size, bool write)
 {
     unsigned index, bar;
 
@@ -1075,6 +1091,32 @@ static bool bar_access_owner(unsigned owner, hwaddr addr, bool io,
         }
     }
     return false;
+}
+
+/*
+ * Local descriptors and local device callbacks already require BQL. Keep one
+ * acquisition across their scan and dispatch rather than reacquiring for each
+ * descriptor and again for dispatch. Do not extend this scope to a remote
+ * owner: execute() may wait for an RPC whose completion needs local BQL.
+ *
+ * No routing cache is introduced; the existing snapshots, reset checks and
+ * dispatch generation/BAR validation still run while holding their usual lock.
+ */
+static bool bar_access_owner(unsigned owner, hwaddr addr, bool io,
+                             uint8_t *data, unsigned size, bool write)
+{
+    bool take_lock = owner == local_node &&
+                     qatomic_read(&local_bar_lock_batch) && !bql_locked();
+    bool handled;
+
+    if (take_lock) {
+        bql_lock();
+    }
+    handled = bar_access_owner_scan(owner, addr, io, data, size, write);
+    if (take_lock) {
+        bql_unlock();
+    }
+    return handled;
 }
 
 static bool bar_access(hwaddr addr, bool io, uint8_t *data,
