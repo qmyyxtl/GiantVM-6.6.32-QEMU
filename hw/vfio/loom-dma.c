@@ -159,6 +159,34 @@ void loom_vfio_dma_free(VFIOContainerBase *bc)
  * Copying a whole coherent buffer back would overwrite CPU updates to other
  * fields in a descriptor while the device updates its completion flags.
  */
+
+/*
+ * Skip whole words only when every byte has the requested equality state.
+ * The zero-byte test on XOR detects any unchanged byte; finish a mixed word
+ * byte by byte so publication never includes an unchanged destination byte.
+ * memcpy keeps unaligned buffers and short tails safe.
+ */
+static uint64_t skip_matching_bytes(const uint8_t *a, const uint8_t *b,
+                                    uint64_t pos, uint64_t size, bool equal)
+{
+    while (size - pos >= sizeof(uint64_t)) {
+        uint64_t x, y;
+        memcpy(&x, a + pos, sizeof(x));
+        memcpy(&y, b + pos, sizeof(y));
+        x ^= y;
+        if (equal ? x != 0 :
+            ((x - UINT64_C(0x0101010101010101)) & ~x &
+             UINT64_C(0x8080808080808080)) != 0) {
+            break;
+        }
+        pos += sizeof(uint64_t);
+    }
+    while (pos < size && ((a[pos] == b[pos]) == equal)) {
+        pos++;
+    }
+    return pos;
+}
+
 static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b,
                          uint8_t *snapshot, bool to_device)
 {
@@ -169,13 +197,9 @@ static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b,
     }
     while (pos < b->size) {
         uint64_t start;
-        while (pos < b->size && snapshot[pos] == b->baseline[pos]) {
-            pos++;
-        }
+        pos = skip_matching_bytes(snapshot, b->baseline, pos, b->size, true);
         start = pos;
-        while (pos < b->size && snapshot[pos] != b->baseline[pos]) {
-            pos++;
-        }
+        pos = skip_matching_bytes(snapshot, b->baseline, pos, b->size, false);
         if (pos == start) {
             break;
         }
