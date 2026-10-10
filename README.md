@@ -288,3 +288,28 @@ root 登录、双盘四 worker 读取校验、guest sync/poweroff 后，两端 Q
 将远端设备映射/失效送至 owner，并在解除映射前发布已完成的 DMA 写入。
 当前 master 的 vIOMMU 控制状态不会自动配置 slave；仅添加 intel-iommu 参数
 不能解决问题。现有 staging 仍依赖 DMA bridge，尚未实现上述透明路径。
+
+### Q35 / 标准 vIOMMU 基础验证（2026-10-10）
+
+现有 6.12.0-vanilla-vfio guest 内核已内置 SATA_AHCI、INTEL_IOMMU、I40E 和 IAVF，
+本次不改 guest 内核/驱动。两端 machine 改为 q35,kernel-irqchip=split，
+添加 intel-iommu,caching-mode=on,intremap=off；master guest 命令行增加
+intel_iommu=on iommu.strict=1，保留 clocksource=hpet、四 CPU 和两节点 NUMA。
+
+Q35 巨虚已启动并 root 登录。guest 显示 DMAR enabled、Translated domain、
+strict invalidation、Queued invalidation 和独立 IOMMU groups；两个 owner 盘
+仍可见，双盘四 worker 的短时只读数据校验通过。该检查不作为新的吞吐基线。
+
+两端运行状态直接检查：master dmar_enabled=true、qi_enabled=true、
+root=0x4b78000；slave dmar_enabled=false、qi_enabled=false、root=0。
+这证明单纯添加 vIOMMU 参数不会同步远端设备 DMA 映射。
+
+启动器 scripts/gvm-device-node.sh 新增 GVM_MACHINE=pc|q35（默认 pc）和
+GVM_IOMMU=0|1（默认 0，开启时要求 q35），便于继续验证；本轮运行参数仍使用
+既有 owner IOThread/双 NUMA 配置。仅主节点开启 guest DMA remapping，
+不是已完成的跨节点 vIOMMU/VFIO 方案，暂不应直接据此挂远端真实网卡。
+
+下一步应将 master 上远端 PCI proxy 的标准 IOMMU 映射/失效通知发送到 owner，
+保留 IOVA、GPA、权限和映射生命周期；失效确认前必须完成 owner 的 DMA 回写。
+不能让 slave 独立消费同一失效队列并提前发布完成，也不能假设现有 staging
+中 IOVA=GPA 的约定适用于翻译后的 DMA 地址。HPET 不作调整。
