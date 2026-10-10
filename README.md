@@ -1025,3 +1025,29 @@ enable ACK 发布顺序、RX/TX 不同掩码、失败回复、未知队列、
 重复请求及 disable。原有范围提交、生命周期/错误重试、
 64 KiB GPA 批次和 24 种完成交错检查也通过。
 真实设备的状态保留验证与吞吐验证另行记录，不提前宣称提升。
+
+c7d35b7afe 两端构建并部署后，真实 VF 两队列配置确认成功。
+20 秒只读 BPF 窗口内，Garen/Ezreal 分别收到 478/2919 次
+范围变化通知，24/27 次完成观察采样全部保持 config=3、
+enabled_rx=3、enabled_tx=3，pending/ambiguous 均为 0。
+证明当前收发中的无关映射变化没有误清除队列状态；不能将
+采样解释为所有时间点的完备证明，也不等同于快路径启用。
+
+双网卡各接收 4 MiB、内容校验通过，本轮 owner0/owner1
+RX discards 为 14/0、host TCP total_retrans 为 14/2。
+10 秒 AdminQ 检查两卡各 5 次成功 GET_STATS，未发现定义的
+WARNING/BUG/DMA fault/QI error/TX timeout，HPET=hpet。
+短回归双网卡四 worker 发送 20.53 MiB/s，四流校验通过、
+total_retrans 均为 0；双 raw 数据盘四 worker、每 worker
+QD8 的 O_RDONLY/O_DIRECT 读取 3249.95 MiB/s。
+仅为一次功能回归，不宣称相比前轮提升或退化。guest 启动仍有
+既有 printk 时间偏移/underflow 和 sda15 FAT 非正常卸载提示，
+此次没有修改 HPET 或文件系统。
+另补普通 RAM 多页 RX ring 部分 unmap 检查：剩余映射仍在，
+但完整覆盖及配置立即失效；检查通过。
+
+探针、发送/接收进程及临时 TCP sink 均已退出。guest #26、
+host 6.6.32-krdma+ 保持，未生成实验文件。
+下一步仍是 RX/TX tail 的精确 descriptor/payload 范围，
+需正确处理首次 tail、回绕、RX buffer 复用和完成发布顺序；
+目前 BAR/IRQ 路径仍执行完整 DMA 同步。
