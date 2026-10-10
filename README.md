@@ -3291,3 +3291,75 @@ EzrealRSS4290932KiB/VmLck4202884KiB（包括巨虚本身锁定的4GiB RAM）。
 不是长期映射增长证明，仍需检查长时间运行的页面/映射数量和回收上界。
 后续先重测同版本旧配置作单卡对照，再低频采样双卡的剩余处理路径、
 定位共享竞争；保持guest与HPET不改，不把新native线速视为巨虚目标完成。
+
+### 2026-10-11：同版本回切对照、双卡CPU采样与IRQ配置审计
+
+当前代码保持38937e909a（其后只更新README），正常关闭physical巨虚后，
+同一二进制启用physical=0/vIOMMU=1；再正常关闭，回切physical=1/vIOMMU=0。
+两端均QEMU_EXIT0并恢复VF到iavf后才重新启动，不是修改正在运行的环境。
+guest仍#26、4CPU/4GiB/双NUMA/HPET，相同两队列/RX512/TX128/RPS/XPS0，
+每卡两个owner CPU worker、6秒/轮、3轮，Jinx同一接收服务/IP配置。
+本轮不改guest代码，不改HPET，不重测磁盘，不使用Lux。
+
+| 配置（中位数MiB/s） | 首次physical | 同版本旧vIOMMU | 回切physical |
+| --- | ---: | ---: | ---: |
+| Garen单卡 | 709.497 | 209.199 | 788.340 |
+| Ezreal单卡 | 583.004 | 174.367 | 426.904 |
+| 双卡各2worker同时 | 499.073 | 175.351 | 277.759 |
+
+旧配置三轮：G208.913/209.199/239.366，E151.514/174.367/181.017，
+双卡148.067/184.419/175.351；回切新路径G788.340/809.771/760.020，
+E532.045/409.917/426.904，双卡272.790/277.759/292.108。
+所有发送数据校验正确，源/接收端计时相符；旧配置测试后error级dmesg为空。
+因此单卡改善在同版本回切后重现，但E与双卡跨启动变化很大。
+不能只报告第一次499，不能把3次短测当长期稳定收益。
+双卡仍低于单卡，目标尚未达到，不能归因于Jinx10GbE容量上限。
+
+在回切physical巨虚双卡26秒流量期间，同时采样两个QEMU进程：
+perf6.8.12 cpu-clock:H 99Hz、DWARF8192、24秒、exclude_guest=1确认；
+每端先确认/proc/PID/exe与build二进制inode相同，无旧二进制符号混用。
+数据保存memfd，不写perf.data或buildid缓存，结束后memfd关闭。
+采样时吞吐318.334MiB/s，字节内容正确；不是未采样的性能对照。
+
+互斥分类优先DSM→VFIO→vIOMMU→RPC→OTHER，按sample period加权：
+| 采样主机CPU时间占比 | Garen | Ezreal |
+| --- | ---: | ---: |
+| DSM调用栈 | 48.132% | 58.919% |
+| VFIO（不含上述DSM样本） | 14.993% | 10.808% |
+| RPC（不含上述两类） | 5.046% | 3.295% |
+| OTHER | 31.829% | 26.977% |
+
+Garen2061样本/20.818秒采样CPU权重，Ezreal2276样本/22.990秒，
+解析bad block0、perf script stderr为空；未采到vtd软件处理栈。
+inclusive VFIO为21.349%/14.763%，包含与DSM重叠的样本，不能与DSM相加。
+Garen record报告瞬时线程3997146 open失败后忽略；并未独立核验所有lost events，
+所以不宣称完整捕捉所有线程或零丢样。
+这只反映被采QEMU线程的主机CPU消耗，不包括阻塞等待、guest CPU执行，
+也不包含QEMU外的kernel worker，不能解释成吞吐损失48%/59%。
+
+Garen实际调用栈提供下一步线索：
+gvm-rdma-req → loom_pci_dispatch → vfio_region_write →
+vfio_loom_sync_write → loom_vfio_dma_sync → address_space_read →
+kvm_vm_ioctl_dsm → kvm_dsm_memcpy。
+说明部分设备访问仍落在完整DMA同步兜底路径；其具体BAR地址/频率、
+是否可以只发布AdminQ或已完成data范围，尚未核实，不盲目取消完成同步。
+下一步对实际BAR访问与full-sync调用关联计数，再设计正确的缩小同步范围。
+
+IRQ审计：同样写0-1掩码后，两个Garen data vector本次都实际投递CPU0；
+Ezreal分别CPU2/3。因此owner CPU掩码不能保证各队列均匀分配。
+临时精确绑定Gq0→0/Gq1→1/Eq0→2/Eq1→3后双卡三轮
+313.894/306.924/290.876（中位306.924）；
+恢复原请求掩码后240.270/255.739/291.486（中位255.739）。
+但恢复后的计数显示Gq1仍实际投递CPU1，与初始CPU0不同，
+故这不是有效的恢复对照，不能声称IRQ绑定带来20%收益。
+末尾明确固定四个data vector到0/1/2/3，仅为后续控制配置可重复；
+mailbox掩码保持原设置，没有声称吞吐收益。
+guest两个PCI设备numa_node仍-1；iavf RX资源创建fq.nid为NUMA_NO_NODE。
+这只是潜在分配位置线索，本轮未改设备NUMA配置或guest代码。
+
+当前physical巨虚GarenPID3994428/Ezreal736529保持运行；
+guest在线0-3、HPET、error级dmesg为空，Garen worker-g4 PID6122保持。
+两个Jinx TCP接收服务均STOPLOOM正常退出，IP aliases清理、49161无监听；
+两个perf进程及对应Python任务已正常结束，没有新增实验文件。
+仍需解决双卡波动、完整DMA同步兜底开销，完成RX匹配对照/长期映射增长检查，
+以及physical模式reset恢复；不标记目标完成。
