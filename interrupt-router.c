@@ -528,6 +528,22 @@ static int handle_incoming_message(int peer_id, rdma_msg_header_t *hdr, void *da
 
 /* ============ 启动/关闭 ============ */
 
+static bool router_get_recv_cq_events(Object *obj, Error **errp)
+{
+    return rdma_router_get_recv_cq_events();
+}
+
+static void router_set_recv_cq_events(Object *obj, bool enabled, Error **errp)
+{
+    int ret = rdma_router_set_recv_cq_events(enabled);
+
+    if (ret < 0) {
+        error_setg_errno(errp, -ret,
+                         "RDMA receive CQ event mode unavailable; "
+                         "healthy channels must be created at startup");
+    }
+}
+
 void start_io_router(void)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
@@ -563,6 +579,9 @@ void start_io_router(void)
         exit(1);
     }
     
+    object_property_add_bool(OBJECT(ms), "loom-rdma-recv-cq-events",
+                             router_get_recv_cq_events,
+                             router_set_recv_cq_events);
     printf("RDMA router started successfully\n");
 }
 

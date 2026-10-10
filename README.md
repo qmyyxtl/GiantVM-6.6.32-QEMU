@@ -1761,3 +1761,19 @@ Garen已有libvirt VM未改。
 
 最终10秒健康窗口两端 watchdog 和成功 GET_STATS 各5次；所检查错误为空，
 HPET为hpet，两张NIC的discard/tx_errors均为0（非整个历史无丢包证明）。
+
+## CQ 接收模式运行时控制（同启动对照）
+
+以 `LOOM_RDMA_RECV_CQ_EVENTS=1` 启动以预创建 channels，之后可通过 QMP：
+`qom-set path=/machine property=loom-rdma-recv-cq-events value=false/true`。
+false 恢复 usleep(10) 接收轮询，true 恢复事件等待。getter 同时检查请求策略
+与所有接收连接的健康状态。没有预创建 channel、连接缺失或 channel 已回退
+时，启用操作报错；运行中不会分配/销毁连接，也不会复活失败 channel。
+
+策略及 receiver fallback 标志使用原子访问。切换不更改停止 eventfd；
+阻塞 receiver 最多在100 ms现有 poll超时后观察新策略。暂停事件等待时保留
+receiver 独占的 armed 状态，待恢复或 cleanup 取得并 ack 已排队通知。
+接口只在多 QEMU RDMA router 初始化成功后注册到 machine。
+ASan/UBSan helper/控制 API 测试覆盖 armed 状态下关闭、恢复待处理通知、
+等待期间切换、缺少/失败 channel 拒绝启用，以及已有错误/停止分支。
+真实 poll/eventfd 三线程停止测试继续通过。硬件同启动 A/B 尚待部署验证。

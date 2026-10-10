@@ -87,7 +87,8 @@ static struct {
     pthread_t *recv_threads;
     router_worker_t *workers;
     bool running;
-    bool recv_cq_events;
+    bool recv_cq_events; /* Immutable: channels created at initialization. */
+    bool recv_cq_event_wait; /* Runtime receive policy, atomic access. */
     int stop_fd;
 } g_ctx = { .stop_fd = -1 };
 
@@ -104,6 +105,57 @@ static int rdma_wait_completion(rdma_conn_t *conn, struct ibv_wc *wc);
 static void* recv_thread_func(void *arg);
 static void *request_worker_func(void *arg);
 
+/*
+ * Called by the main-loop control plane after router initialization. Connection
+ * storage stays valid until cleanup; only the receiver changes its fallback
+ * flag, which must be read atomically here. Never re-enable a failed channel.
+ */
+bool rdma_router_get_recv_cq_events(void)
+{
+    if (!qatomic_read(&g_ctx.running) ||
+        !qatomic_read(&g_ctx.recv_cq_event_wait) || !g_ctx.recv_conns) {
+        return false;
+    }
+    for (int i = 0; i < g_ctx.total_nodes; i++) {
+        rdma_conn_t *conn = g_ctx.recv_conns[i];
+
+        if (i != g_ctx.local_id &&
+            (!conn || !qatomic_read(&conn->cq_wait_enabled))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int rdma_router_set_recv_cq_events(bool enabled)
+{
+    if (!qatomic_read(&g_ctx.running) || !g_ctx.recv_conns) {
+        return -ESHUTDOWN;
+    }
+    if (enabled) {
+        if (!g_ctx.recv_cq_events) {
+            return -ENOTSUP;
+        }
+        for (int i = 0; i < g_ctx.total_nodes; i++) {
+            rdma_conn_t *conn = g_ctx.recv_conns[i];
+
+            if (i != g_ctx.local_id &&
+                (!conn || !conn->cq_channel ||
+                 !qatomic_read(&conn->cq_wait_enabled))) {
+                return -ENOTSUP;
+            }
+        }
+    }
+    /*
+     * A blocked receiver observes the new policy within its 100 ms poll bound.
+     * Do not consume or write the shared stop fd for a configuration change.
+     * Pending CQ events/armed state remain owned by the receiver and are
+     * acknowledged on resuming event mode or during shutdown.
+     */
+    qatomic_set(&g_ctx.recv_cq_event_wait, enabled);
+    return 0;
+}
+
 // ============ 初始化 ============
 int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
 {
@@ -114,6 +166,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
     qatomic_set(&g_ctx.running, true);
     g_ctx.recv_cq_events =
         g_strcmp0(getenv("LOOM_RDMA_RECV_CQ_EVENTS"), "1") == 0;
+    qatomic_set(&g_ctx.recv_cq_event_wait, g_ctx.recv_cq_events);
     if (g_ctx.recv_cq_events) {
         g_ctx.stop_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         if (g_ctx.stop_fd < 0) {
@@ -529,10 +582,10 @@ static int create_connection(const char *host, int port, struct rdma_cm_id *serv
             conn->cq = ibv_create_cq(conn->cm_id->verbs, RDMA_CQ_SIZE,
                                      NULL, NULL, 0);
         }
-        conn->cq_wait_enabled = conn->cq_channel != NULL;
+        qatomic_set(&conn->cq_wait_enabled, conn->cq_channel != NULL);
         if (event_receive) {
             fprintf(stderr, "[RDMA] receive CQ mode: %s\n",
-                    conn->cq_wait_enabled ? "events" : "poll");
+                    qatomic_read(&conn->cq_wait_enabled) ? "events" : "poll");
         }
         
     } else {
@@ -789,11 +842,13 @@ static int rdma_recv_completion(rdma_conn_t *conn, struct ibv_wc *wc)
 {
     while (qatomic_read(&g_ctx.running)) {
         int n;
+        bool wait_events = qatomic_read(&g_ctx.recv_cq_event_wait) &&
+                           qatomic_read(&conn->cq_wait_enabled);
 
-        if (conn->cq_wait_enabled && !conn->cq_armed) {
+        if (wait_events && !conn->cq_armed) {
             if (ibv_req_notify_cq(conn->cq, 0)) {
                 fprintf(stderr, "[RDMA] CQ notify failed; using polling\n");
-                conn->cq_wait_enabled = false;
+                qatomic_set(&conn->cq_wait_enabled, false);
             } else {
                 conn->cq_armed = true;
             }
@@ -802,7 +857,7 @@ static int rdma_recv_completion(rdma_conn_t *conn, struct ibv_wc *wc)
         if (n) {
             return n;
         }
-        if (!conn->cq_wait_enabled) {
+        if (!wait_events || !qatomic_read(&conn->cq_wait_enabled)) {
             usleep(10);
             return 0;
         }
@@ -818,7 +873,7 @@ static int rdma_recv_completion(rdma_conn_t *conn, struct ibv_wc *wc)
         }
         if (ret < 0 || (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
             fprintf(stderr, "[RDMA] CQ event wait failed; using polling\n");
-            conn->cq_wait_enabled = false;
+            qatomic_set(&conn->cq_wait_enabled, false);
             continue;
         }
         if (!qatomic_read(&g_ctx.running) || (fds[1].revents & POLLIN)) {
@@ -831,14 +886,14 @@ static int rdma_recv_completion(rdma_conn_t *conn, struct ibv_wc *wc)
             if (ibv_get_cq_event(conn->cq_channel, &cq, &context)) {
                 if (errno != EAGAIN && errno != EINTR) {
                     fprintf(stderr, "[RDMA] CQ event read failed; using polling\n");
-                    conn->cq_wait_enabled = false;
+                    qatomic_set(&conn->cq_wait_enabled, false);
                 }
                 continue;
             }
             ibv_ack_cq_events(cq, 1);
             if (cq != conn->cq) {
                 fprintf(stderr, "[RDMA] unexpected CQ event; using polling\n");
-                conn->cq_wait_enabled = false;
+                qatomic_set(&conn->cq_wait_enabled, false);
                 continue;
             }
             conn->cq_armed = false;

@@ -4,6 +4,7 @@
 #include <rdma/rdma_cma.h>
 #include <infiniband/verbs.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <stddef.h>
 
 #define RDMA_BUFFER_COUNT 1024
@@ -49,6 +50,10 @@ typedef int (*msg_handler_t)(int peer_id, rdma_msg_header_t *hdr, void *data);
 void rdma_router_set_handler(msg_handler_t handler);
 /* Return 1 for a consumed control message. Must not acquire the BQL or RPC. */
 void rdma_router_set_control_handler(msg_handler_t handler);
+
+/* Runtime receive policy; enabling requires healthy pre-created channels. */
+bool rdma_router_get_recv_cq_events(void);
+int rdma_router_set_recv_cq_events(bool enabled);
 
 // 清理
 void rdma_router_cleanup(void);
