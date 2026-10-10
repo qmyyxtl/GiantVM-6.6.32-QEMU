@@ -2439,3 +2439,58 @@ ON恢复启动样本main/vCPU0/1在124/129/37（N0），不代表全窗口线程
 三个单机VM均正常关机EXIT0、VF恢复iavf、模块引用0，再恢复两端巨虚。
 此前开启候选的巨虚也正常退出，两端EXIT0/refs0。
 HPET、guest#26、host内核及模块参数保持；没有使用Lux或新增实验文件。
+
+### host NUMA 放置的无 DSM 对照（2026-10-11）
+
+代码仍为 7e03f0d475；本轮没有修改 guest 或实现代码。
+采用同源码单机本地暂存模式：LOOM_VFIO_DSM_DMA=1、
+LOOM_VFIO_LOCAL_STAGE=1、pool cache1024、buffer recycle1、
+GVM_OWNER_IOMMU=0，不设置 -local-cpu。
+重复清零候选保持OFF，严格 vIOMMU、guest#26、HPET、
+4CPU/4GiB/两个2GiB guest NUMA backend、VFIO fast-path 开关不变。
+guest CPU0/1 两个6秒发送worker，2队列、RX512/TX128、RPS/XPS0、
+IRQ0-1，同一VF向Jinx198.18.10.3:49161发送，核对接收字节及内容。
+
+只改变QEMU的host启动包装：
+- near：env [原变量] numactl --cpunodebind=0 --membind=0 [原QEMU参数]；
+- far：env [原变量] numactl --cpunodebind=1 --membind=1 [原QEMU参数]；
+- near恢复：再次0/0。
+VF 0000:0c:02.0 numa_node=0。host节点CPU为
+N0=0-47,96-143，N1=48-95,144-191。
+这是CPU与内存一起改变的联合放置对照，不能分别归因到其中一项。
+
+三次启动各六轮无探针MiB/s：
+near：[291.726,311.448,311.075,299.663,326.845,295.977]，中位数305.369；
+far：[271.461,282.811,281.449,273.404,285.261,261.937]，中位数277.427；
+near恢复：[287.196,289.058,312.188,288.170,323.058,308.756]，中位数298.907。
+全部内容校验通过。两次near比far中位数高10.07%/7.74%，
+near前后中位数差-2.12%；本轮所有near样本均高于所有far样本。
+结果支持在此单机暂存配置下靠近NIC放置，而非证明巨虚已经获得同样提升，
+也不能证明10%适用于所有负载。
+
+独立12秒探针窗口先卸载再读冻结计数：
+near map785757、far748455、near恢复851992；
+read错误、map返回错误、DSM ioctl均0，候选跳过清零次数均0。
+带探针的两轮预热吞吐不计入性能表。
+逐线程检查实际Cpus_allowed_list，读取numa_maps的策略及各节点驻留页；
+两块2GiB主要guest RAM VMA均采用目标bind策略且驻留页在目标node。
+near初始测试后匿名VMA统计169358页在N0、0在N1
+（首版统计含少量file/COW映射，后版将file VMA排除）；
+near恢复测试后非file匿名VMA169325页在N0、0在N1。
+
+far的核验发现200个非file匿名驻留页在N0、170386在N1。
+host KSM run=1、merge_across_nodes=1。
+两处64KiB/2MiB VMA的smaps KSM分别60KiB/740KiB。
+用numa_move_pages的只读查询得到实际node，再读pagemap/kpageflags：
+528个被检查页中200个node0页全部带KPF_KSM，328个其他页在node1；
+没有迁移页或关闭host KSM。故不能声称far的所有匿名页都在N1，
+但已核实off-node部分是KSM共享页，而非将绑定失败静默忽略。
+主要guest RAM VMA仍全部在N1，策略为bind:1。
+这也提示后续严格放置对照应考虑VM自身的内存合并配置，
+不动其他VM使用的host KSM。
+
+三个单机VM均正常关机EXIT0、VF恢复iavf、模块引用0。
+恢复巨虚原host未绑定配置和候选清零OFF，避免将未测的巨虚放置收益写成结论。
+下一步在巨虚做原配置/near/原配置对照；
+NIC在N0、RDMA HCA在N1，应同时核实RDMA线程与缓冲位置的取舍。
+HPET、guest、host内核和模块参数保持，worker-g4保留，Lux未使用。
