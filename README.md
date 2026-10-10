@@ -791,3 +791,32 @@ aq_required 非零时以 20 ms 重排，因此 owner0 等待统计回复并频�
 临时 guest kprobe 全部移除、tracing_on 恢复，host BPF 已结束，
 receiver/sink/serial observer 已退出，无新增实验文件。
 两端自己的 QEMU 保持运行，Lux 和 Garen 原有 libvirt VM 未动。
+
+### BAR 读取与 DMA 完成发布顺序修复（2026-10-10）
+
+QEMU a7292672aa 修正 vfio_region_read 的顺序：先读取物理 BAR，
+再发布一次设备 DMA 完成快照，最后返回已保存的 BAR 值。
+此前先同步 DMA 再读取 BAR，设备若在两者之间完成 AdminQ，
+guest 会读到已前进的 ARQ head，却仍看到旧 descriptor/payload。
+iavf 按 head 消费并回收这个空回复，GET_STATS 留在 pending，
+watchdog 因 REQUEST_STATS 未清除持续以 20 ms 重排。
+
+实际源码的受控交错验证：旧版本返回 head=1，但 guest opcode=0、
+DD=0、payload=00；修复后 head=1、opcode=15、DD=1、payload=55。
+短 BAR 读、DMA 发布失败、1/2/4/8 字节读取及普通非分布式路径
+也通过验证；未增加同步次数。两端构建、推送原 origin、正常关闭并
+重新启动自己的 QEMU 后，两张 VF 的硬件统计均恢复更新。
+
+负载前后分别观察 10 秒，两个 adapter 的 watchdog 均各运行 5 次，
+GET_STATS 均各解析 5 个成功回复（104 字节）；host PF 同样各收到
+5 个请求。未再观察到持续 pending 和 20 ms 重排。有限窗口不能
+证明所有完成交错均已覆盖。
+
+双端各 4 MiB RX 长度/内容通过，但 rx_discards 为 173/112，
+TCP 重传为 173/113，RX 处理仍有瓶颈。短时双卡四 worker TX
+21.66 MiB/s、全部内容正确、四连接重传均为 0；
+双盘四 worker O_RDONLY/O_DIRECT 回归 3115 MiB/s。
+这些不是正式性能对照，不能声称吞吐提升或线性扩展。
+负载后的 guest 无 WARNING/BUG/DMA fault/QI error/TX timeout。
+guest 仍为 #26，HPET、host 内核不变；临时探针和收发进程均已清理，
+无新增实验文件。两端自己的 QEMU 保留运行。
