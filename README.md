@@ -1777,3 +1777,36 @@ receiver 独占的 armed 状态，待恢复或 cleanup 取得并 ack 已排队�
 ASan/UBSan helper/控制 API 测试覆盖 armed 状态下关闭、恢复待处理通知、
 等待期间切换、缺少/失败 channel 拒绝启用，以及已有错误/停止分支。
 真实 poll/eventfd 三线程停止测试继续通过。硬件同启动 A/B 尚待部署验证。
+
+## CQ 运行时开关的真实同启动验证（2026-10-10）
+
+两端运行 `821986ba72`，启动时创建 events channel，随后两端 QMP
+`/machine/loom-rdma-recv-cq-events` 反复 false/true 并读回确认。
+同一个 Garen接收TID3466728在false时实际syscall为clock_nanosleep，
+true时为poll两个fd、100ms；通过/proc/mem读取pollfd，确认channel
+infinibandevent与stop eventfd。guest#26、CPU0–3在线、HPET、4GiB、
+IRQ/队列/host mask保持一致，QI pair关闭。
+
+无测试流量但有guest后台消息，各12秒/proc监测：
+poll接收线程host CPU2.02秒、967311次voluntary switch；
+events为0.15秒、10346次，run_ns分别2022473856/147030295。
+事件模式减少了观测到的接收线程固定CPU/调度成本；它不是DSM成本归零证明。
+该监测与吞吐窗口分开，没有perf/BPF采样干扰吞吐比较。
+
+无监测、Garen单VF→第三方Jinx，2个CPU0/1 worker，每样本6秒，
+交替顺序poll/events、events/poll、poll/events：
+poll 132.69/135.77/129.77，中位数132.69 MiB/s；
+events 129.84/138.48/126.96，中位数129.84 MiB/s。
+所有字节/内容校验通过；样本重叠，events观察值低2.15%，
+没有证据说明它提高单卡吞吐，不能将CPU下降外推为带宽收益。
+另一个发送窗口中，两端events→poll→events切换成功，
+接收字节/内容校验通过，约138.47 MiB/s仅作为功能测试、未纳入性能对照。
+
+最终两端events=true，10秒watchdog/成功GET_STATS各5次，
+所检查BUG/DMA/QI/TX timeout错误为空，HPET=hpet，
+discard/tx_errors=0（非整个历史无丢包证明）。
+接收进程、/proc监测、临时trace探针和Jinx地址已清理，未创建实验文件。
+guest仍运行，Garen既有libvirt VM未改，host未重启，guest代码未改。
+本版本真实开关/消息已经验证；新版本正常shutdown尚未另测，
+此前event版本正常cleanup返回与当前实际poll/eventfd三线程stop测试
+提供相关证据，不把它们当作新版本完整shutdown硬件证明。
