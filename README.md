@@ -617,11 +617,11 @@ release 保持 6.12.0-vanilla-vfio，运行版本 #22；与原部署 .config 无
 直接使用已有构建产物，不覆盖原部署镜像，不创建实验脚本/日志/结果文件。
 master helper 的启动覆盖须在 sudo 之后传入，普通 shell 环境会被 sudo 清掉：
 
-\`\`\`sh
-sudo -n env GVM_GUEST_KERNEL=/home/xtl/GVM-guest-kernel/arch/x86/boot/bzImage \\
-  python3 /home/xtl/GVM-qemu/scripts/gvm-device-vfio-node.py 0 \\
+```sh
+sudo -n env GVM_GUEST_KERNEL=/home/xtl/GVM-guest-kernel/arch/x86/boot/bzImage \
+  python3 /home/xtl/GVM-qemu/scripts/gvm-device-vfio-node.py 0 \
   --host 0000:0c:02.0 --data-disk /home/xtl/start/gvm-device-data-node0.raw
-\`\`\`
+```
 
 新 guest 中 dmar1 的 qi/status 为 GPA 0x495c000/0x495d000，dmar0 为
 0x495e000/0x495f000：四者均 4 KiB 对齐、各有独立页面。双 VF 原生驱动
