@@ -649,7 +649,7 @@ void pio_forwarding(uint16_t port, MemTxAttrs attrs, void *data, int direction,
 void mmio_forwarding(hwaddr addr, MemTxAttrs attrs, uint8_t *data, int len, bool is_write)
 {
     qemu_mutex_lock(&io_forwarding_mutex);
-    printf("[RDMA Router] MMIO forwarding: addr=0x%llx, len=%d, is_write=%d\n",
+    debugf("[RDMA Router] MMIO forwarding: addr=0x%llx, len=%d, is_write=%d\n",
            (unsigned long long)addr, len, is_write);
     /* 准备消息数据 */
     size_t data_size = sizeof(int32_t) + sizeof(hwaddr) + sizeof(MemTxAttrs) + 
