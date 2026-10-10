@@ -4340,6 +4340,32 @@ static Notifier vtd_machine_done_notify = {
     .notify = vtd_machine_done_hook,
 };
 
+/* QMP property callbacks run with the BQL, like the QI MMIO control path. */
+static bool vtd_get_notify_context_cache(Object *obj, Error **errp)
+{
+    IntelIOMMUState *s = INTEL_IOMMU_DEVICE(obj);
+    bool enabled;
+
+    vtd_iommu_lock(s);
+    enabled = s->loom_notify_context_cache;
+    vtd_iommu_unlock(s);
+    return enabled;
+}
+
+static void vtd_set_notify_context_cache(Object *obj, bool enabled,
+                                          Error **errp)
+{
+    IntelIOMMUState *s = INTEL_IOMMU_DEVICE(obj);
+
+    if (enabled && !loom_iommu_enabled()) {
+        error_setg(errp, "context notification cache requires owner IOMMU");
+        return;
+    }
+    vtd_iommu_lock(s);
+    s->loom_notify_context_cache = enabled;
+    vtd_iommu_unlock(s);
+}
+
 static void vtd_realize(DeviceState *dev, Error **errp)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
@@ -4414,6 +4440,9 @@ static void vtd_realize(DeviceState *dev, Error **errp)
     /* Pseudo address space under root PCI bus. */
     x86ms->ioapic_as = vtd_host_dma_iommu(bus, s, Q35_PSEUDO_DEVFN_IOAPIC);
     qemu_add_machine_init_done_notifier(&vtd_machine_done_notify);
+    object_property_add_bool(OBJECT(s), "loom-notify-context-cache",
+                             vtd_get_notify_context_cache,
+                             vtd_set_notify_context_cache);
 }
 
 static void vtd_class_init(ObjectClass *klass, void *data)

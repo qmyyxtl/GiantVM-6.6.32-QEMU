@@ -1383,3 +1383,8 @@ translation 缓存共享、全局及设备失效、function mask 0/1/2/3、跨 b
 root 替换、翻译启停、reset、generation 回绕、失败/非 present 重试，
 以及关闭开关和 scalable fallback。测试通过且两端源码构建另行核验。
 这些测试不是硬件性能证据；真实 VF 的开关对照与健康检查在部署后记录。
+
+同一次 guest 启动中可通过 owner 的 QMP `qom-set` 修改 `intel-iommu` 对象的
+`loom-notify-context-cache` 布尔属性；`qom-get` 读取实际状态。该属性只在设备
+完成 realize 后注册，使用已有 IOMMU 锁；切换不清除 context 缓存或改变硬件
+DMA 生命周期，既有失效机制持续生效。开启要求 owner IOMMU 模式。
