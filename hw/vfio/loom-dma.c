@@ -223,8 +223,21 @@ bool loom_vfio_dma_enabled(void)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
     const char *mode = getenv("LOOM_VFIO_DSM_DMA");
-    return mode && !strcmp(mode, "1") && kvm_enabled() &&
-           ms->local_cpus != ms->smp.cpus && !ms->shm_path;
+    if (!mode || strcmp(mode, "1") || !kvm_enabled() || ms->shm_path) {
+        return false;
+    }
+    if (ms->local_cpus != ms->smp.cpus) {
+        return true;
+    }
+
+    /*
+     * Opt-in single-host control for measuring the staging path without DSM.
+     * This is a startup setting: changing it with active DMA maps is unsafe.
+     * Use it with guest IOMMU translations, as in the distributed path.
+     */
+    const char *local_stage = getenv("LOOM_VFIO_LOCAL_STAGE");
+
+    return local_stage && !strcmp(local_stage, "1");
 }
 
 int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
