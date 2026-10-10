@@ -25,6 +25,7 @@ typedef struct LoomDMABuffer {
     uint64_t size;
     unsigned direction, references;
     uint8_t *baseline, *scratch, *pool;
+    bool snapshot_ready;
 } LoomDMABuffer;
 
 struct LoomVFIODMA {
@@ -155,41 +156,10 @@ void loom_vfio_dma_free(VFIOContainerBase *bc)
  * Copying a whole coherent buffer back would overwrite CPU updates to other
  * fields in a descriptor while the device updates its completion flags.
  */
-static int sync_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
+static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
 {
     uint64_t pos = 0;
     int ret;
-    if ((to_device && b->direction == 2) ||
-        (!to_device && b->direction == 1)) {
-        return 0;
-    }
-    if (to_device) {
-        if (address_space_read(&address_space_memory, b->gpa,
-                               MEMTXATTRS_UNSPECIFIED, b->scratch, b->size)
-            != MEMTX_OK) {
-            return -EIO;
-        }
-    } else {
-        smp_rmb();
-        /*
-         * Unchanged device buffers need no scratch copy. If DMA changes the
-         * pool after this comparison, the next exchange observes it, just as
-         * with the existing memcpy snapshot. Changed buffers still use a
-         * scratch snapshot before publishing to guest memory.
-         */
-        if (b->pool && !memcmp(b->pool, b->baseline, b->size)) {
-            /* Keep completed DMA reads ordered before IRQ publication. */
-            smp_rmb();
-            return 0;
-        }
-        ret = buffer_pool_copy(bc->loom_dma, b, 0,
-                                b->scratch, b->size, false);
-        if (ret) {
-            return ret;
-        }
-        /* Device writes preceding its interrupt precede the DSM publication. */
-        smp_rmb();
-    }
     if (!memcmp(b->scratch, b->baseline, b->size)) {
         return 0;
     }
@@ -223,6 +193,52 @@ static int sync_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
         smp_wmb();
     }
     return 0;
+}
+
+static int snapshot_from_device(VFIOContainerBase *bc, LoomDMABuffer *b)
+{
+    int ret;
+
+    b->snapshot_ready = false;
+    if (b->direction == 1) {
+        return 0;
+    }
+    smp_rmb();
+    if (b->pool && !memcmp(b->pool, b->baseline, b->size)) {
+        smp_rmb();
+        return 0;
+    }
+    ret = buffer_pool_copy(bc->loom_dma, b, 0,
+                           b->scratch, b->size, false);
+    if (ret) {
+        return ret;
+    }
+    smp_rmb();
+    b->snapshot_ready = true;
+    return 0;
+}
+
+static int sync_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
+{
+    int ret;
+
+    if (to_device) {
+        if (b->direction == 2) {
+            return 0;
+        }
+        if (address_space_read(&address_space_memory, b->gpa,
+                               MEMTXATTRS_UNSPECIFIED, b->scratch, b->size)
+            != MEMTX_OK) {
+            return -EIO;
+        }
+    } else {
+        ret = snapshot_from_device(bc, b);
+        if (ret || !b->snapshot_ready) {
+            return ret;
+        }
+        b->snapshot_ready = false;
+    }
+    return merge_buffer(bc, b, to_device);
 }
 
 static LoomDMABuffer *buffer_slice(LoomDMABuffer *b, uint64_t offset,
@@ -354,9 +370,37 @@ int loom_vfio_dma_sync(VFIOContainerBase *bc, bool to_device)
     if (!bc || !bc->loom_dma) {
         return 0;
     }
-    /* Newer payload mappings precede older coherent descriptor mappings. */
+    if (to_device) {
+        for (GList *p = bc->loom_dma->buffers; p; p = p->next) {
+            ret = sync_buffer(bc, p->data, true);
+            if (ret) {
+                return ret;
+            }
+        }
+        return 0;
+    }
+    /*
+     * Coherent descriptors are registered before their streaming payloads.
+     * Capture older descriptor state first, then the newer payload buffers;
+     * the DMA read barriers order payload snapshots after observed completion.
+     * Publish in the opposite order, using only these snapshots.  Resampling
+     * a descriptor after publishing its payload can expose a newly completed
+     * descriptor whose DMA payload arrived after that payload's scan.
+     */
+    for (GList *p = g_list_last(bc->loom_dma->buffers); p; p = p->prev) {
+        ret = snapshot_from_device(bc, p->data);
+        if (ret) {
+            return ret;
+        }
+    }
     for (GList *p = bc->loom_dma->buffers; p; p = p->next) {
-        ret = sync_buffer(bc, p->data, to_device);
+        LoomDMABuffer *b = p->data;
+
+        if (!b->snapshot_ready) {
+            continue;
+        }
+        b->snapshot_ready = false;
+        ret = merge_buffer(bc, b, false);
         if (ret) {
             return ret;
         }
