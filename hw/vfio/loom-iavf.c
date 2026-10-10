@@ -851,6 +851,37 @@ static bool payload_intersects_descriptors(LoomIAVFQueues *s, uint64_t iova,
     return false;
 }
 
+static bool tx_snapshot_types_valid(const uint8_t *snapshot, unsigned count)
+{
+    unsigned n = 0;
+
+    /* Pack four little-endian descriptor type bytes into independent lanes.
+     * Only 0/1 (CPU descriptors) and 15 (hardware writeback) are supported.
+     * Each add is below 256, so carries cannot cross byte lanes.
+     */
+    for (; count - n >= 4; n += 4) {
+        const uint8_t *p = snapshot + n * 16 + 8;
+        uint32_t types = (p[0] & 15) | ((p[16] & 15) << 8) |
+                         ((p[32] & 15) << 16) | ((p[48] & 15) << 24);
+        uint32_t not01 = ((types & UINT32_C(0x0e0e0e0e)) +
+                          UINT32_C(0x7f7f7f7f)) & UINT32_C(0x80808080);
+        uint32_t not15 = ((types ^ UINT32_C(0x0f0f0f0f)) +
+                          UINT32_C(0x7f7f7f7f)) & UINT32_C(0x80808080);
+
+        if (not01 & not15) {
+            return false;
+        }
+    }
+    for (; n < count; n++) {
+        unsigned type = snapshot[n * 16 + 8] & 15;
+
+        if (type != 0 && type != 1 && type != 15) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /*
  * Data-vector interrupts and native data doorbells need only data queues.
  * Control-vector interrupts and unknown operations retain the full DMA path.
@@ -900,12 +931,8 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
             if (ret) {
                 return ret;
             }
-            for (unsigned n = 0; n < q->tx_count; n++) {
-                unsigned type = ldq_le_p(c->tx_snapshot + n * 16 + 8) & 15;
-
-                if (type != 0 && type != 1 && type != 15) {
-                    return 0;
-                }
+            if (!tx_snapshot_types_valid(c->tx_snapshot, q->tx_count)) {
+                return 0;
             }
         }
         if (!(s->enabled_rx & (1U << id))) {
