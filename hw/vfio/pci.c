@@ -21,6 +21,7 @@
 #include "qemu/osdep.h"
 #include "hw/vfio/loom-dma.h"
 #include "hw/vfio/loom-iavf.h"
+#include "hw/vfio/loom-iavf-admin.h"
 #include "sysemu/runstate.h"
 #include CONFIG_DEVICES /* CONFIG_IOMMUFD */
 #include <linux/vfio.h>
@@ -2426,6 +2427,13 @@ void vfio_pci_pre_reset(VFIOPCIDevice *vdev)
     PCIDevice *pdev = &vdev->pdev;
     uint16_t cmd;
 
+    /* post_reset is called even after a failed hardware reset. Until a
+     * quiescent restart is implemented, an existing sparse gate stays failed.
+     * Fresh initial realization has no gate; pools remain until backend close.
+     */
+    if (vdev->bars[0].region.loom_iavf_admin) {
+        vdev->bars[0].region.loom_iavf_admin->failed = true;
+    }
     loom_iavf_reset(&vdev->vbasedev);
     vfio_disable_interrupts(vdev);
 

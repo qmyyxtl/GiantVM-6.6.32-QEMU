@@ -36,7 +36,7 @@ typedef struct LoomIAVFAdminOps {
  * Caller holds BQL. Zero-initialize only after hardware reset/quiescence.
  * 1 handled, 0 not an AdminQ register, negative fatal error: never resume the
  * mode or free DMA pools until hardware access is stopped/its backend closes.
- * No production callers or physical-mode startup flag exist yet.
+ * BAR adapter is connected only for sparse RAM; no startup flag exists yet.
  */
 int loom_iavf_admin_write(LoomIAVFAdminState *, hwaddr, uint32_t,
                           const LoomIAVFAdminOps *, void *);

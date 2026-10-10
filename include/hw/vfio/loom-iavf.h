@@ -3,6 +3,7 @@
 #define HW_VFIO_LOOM_IAVF_H
 #include "exec/hwaddr.h"
 typedef struct VFIODevice VFIODevice;
+typedef struct VFIORegion VFIORegion;
 typedef struct VFIOContainerBase VFIOContainerBase;
 typedef struct LoomIAVFQueues LoomIAVFQueues;
 /* Control hooks observe already-published DMA baselines. */
@@ -28,4 +29,23 @@ void loom_iavf_dma_invalidate_container(VFIOContainerBase *, hwaddr, uint64_t);
 int loom_iavf_prepare_physical_admin(VFIODevice *, bool arq, bool enabling,
                                     uint64_t base, unsigned count,
                                     unsigned next, unsigned tail);
+/*
+ * Sparse data preparation, no BAR writes:
+ * 0 not a physical data doorbell; 1 ready; 2 deferred (MUST NOT forward); <0 error.
+ * Caller publishes/reconciles prior completions, then prepares, observes the
+ * original write with record_physical_data (which retains the old tail), writes
+ * the hardware tail, and commits only after success.
+ * A write/prepare failure is fatal to the mode; keep pools until DMA stops.
+ * Before ENABLE_QUEUES, flush deferred RX tails only after config ACK and
+ * validate/prepare every newly exposed slot. Do not infer a ring from a tail.
+ */
+int loom_iavf_prepare_physical_data(VFIODevice *, hwaddr, uint32_t);
+int loom_iavf_record_physical_data(VFIODevice *, hwaddr, uint32_t);
+int loom_iavf_commit_physical_data(VFIODevice *, hwaddr, uint32_t);
+bool loom_iavf_deferred_physical_rx(VFIODevice *, unsigned, uint32_t *);
+/* 1 config ACK ready for RX hints, 0 not ready, negative invalid state. */
+int loom_iavf_physical_rx_configuration(VFIODevice *);
+/* Adapter: 1 handled (including deferred), 0 legacy, negative fatal. */
+int loom_iavf_physical_bar_write(VFIORegion *, hwaddr, uint64_t, unsigned);
+void loom_iavf_physical_bar_read(VFIORegion *, hwaddr, unsigned, uint64_t *);
 #endif

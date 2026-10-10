@@ -245,6 +245,20 @@ void vfio_region_write(void *opaque, hwaddr addr,
         uint64_t qword;
     } buf;
 
+    if (vbasedev->bcontainer && vbasedev->bcontainer->loom_ram) {
+        int ret = loom_iavf_physical_bar_write(region, addr, data, size);
+
+        if (ret < 0) {
+            error_report("VFIO sparse BAR submission failed for %s: %s",
+                         vbasedev->name, strerror(-ret));
+            vm_stop(RUN_STATE_INTERNAL_ERROR);
+            return;
+        }
+        if (ret) {
+            goto written;
+        }
+    }
+
     if (!vfio_loom_sync_write(region, addr, data, size)) {
         return;
     }
@@ -280,6 +294,7 @@ void vfio_region_write(void *opaque, hwaddr addr,
         loom_iavf_reset(vbasedev);
     }
 
+written:
     trace_vfio_region_write(vbasedev->name, region->nr, addr, data, size);
 
     /*
@@ -342,6 +357,7 @@ uint64_t vfio_region_read(void *opaque,
         break;
     }
 
+    loom_iavf_physical_bar_read(region, addr, size, &data);
     trace_vfio_region_read(vbasedev->name, region->nr, addr, size, data);
 
     /* Same as write above */
@@ -590,6 +606,9 @@ void vfio_region_exit(VFIORegion *region)
 void vfio_region_finalize(VFIORegion *region)
 {
     int i;
+
+    g_free(region->loom_iavf_admin);
+    region->loom_iavf_admin = NULL;
 
     if (!region->mem) {
         return;

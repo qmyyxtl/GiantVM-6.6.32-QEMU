@@ -59,6 +59,7 @@ typedef struct VFIORegion {
     uint32_t nr_mmaps;
     VFIOMmap *mmaps;
     uint8_t nr; /* cache the region number for debug */
+    struct LoomIAVFAdminState *loom_iavf_admin;
 } VFIORegion;
 
 typedef struct VFIOMigration {

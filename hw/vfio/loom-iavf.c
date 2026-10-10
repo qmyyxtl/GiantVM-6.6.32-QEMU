@@ -31,6 +31,12 @@ typedef struct LoomIAVFCompletion {
     bool seeded;
 } LoomIAVFCompletion;
 
+typedef struct LoomIAVFPhysicalData {
+    uint16_t deferred_rx[VF_QUEUE_COUNT];
+    uint16_t prepared_rx[VF_QUEUE_COUNT], prepared_tx[VF_QUEUE_COUNT];
+    uint16_t deferred_mask, rx_prepared_mask, tx_prepared_mask;
+} LoomIAVFPhysicalData;
+
 struct LoomIAVFQueues {
     uint64_t asq_base, arq_base, epoch;
     uint16_t asq_count, arq_count, asq_next, arq_next;
@@ -46,6 +52,7 @@ struct LoomIAVFQueues {
     uint32_t tx_length[4096];
     LoomIAVFCompletion completion[VF_QUEUE_COUNT];
     uint8_t *completion_payload;
+    LoomIAVFPhysicalData physical;
 };
 
 static void completion_free(LoomIAVFQueues *s)
@@ -238,6 +245,8 @@ static void queues_invalidate(LoomIAVFQueues *s)
     s->pending_rx = s->pending_tx = 0;
     s->enable_pending = false;
     s->rx_tail_known = s->tx_tail_known = 0;
+    s->physical.rx_prepared_mask = s->physical.tx_prepared_mask = 0;
+    /* Deferred initial RX tails must survive the CONFIG request and its ACK. */
 }
 
 void loom_iavf_reset(VFIODevice *dev)
@@ -399,6 +408,9 @@ static void observe_request(VFIODevice *dev, LoomIAVFQueues *s,
     }
     if (op == 2 || op == 4 || op == 5 || op == 9 || op == 29) {
         queues_invalidate(s);
+    }
+    if (op == 2 || op == 9 || op == 29) {
+        s->physical.deferred_mask = 0;
     }
     if (op == 2) {
         s->ambiguous = false;
@@ -1319,4 +1331,295 @@ int loom_iavf_prepare_physical_admin(VFIODevice *dev, bool arq, bool enabling,
         ret = physical_stage(dev, base, (span - first) * AQ_DESC_SIZE);
     }
     return ret;
+}
+
+/* Sparse data queues: never forward a tail whose new DMA addresses are absent. */
+static int physical_read_ring(VFIODevice *dev, uint64_t base, unsigned entries,
+                               unsigned stride, unsigned start, unsigned count,
+                               uint8_t *desc)
+{
+    unsigned copied = 0;
+
+    while (copied < count) {
+        unsigned pos = (start + copied) % entries;
+        unsigned n = MIN(count - copied, MIN(entries - pos, 65536 / stride));
+        int ret = loom_vfio_ram_read_cpu(dev->bcontainer, base + pos * stride,
+                                         desc + copied * stride, n * stride);
+
+        if (ret) {
+            return ret;
+        }
+        copied += n;
+    }
+    return 0;
+}
+
+int loom_iavf_prepare_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value)
+{
+    LoomIAVFQueues *s;
+    LoomIAVFQueue *q;
+    bool rx;
+    unsigned id, entries, stride, old, span, first;
+    uint64_t base;
+    uint8_t *desc;
+    uint64_t *payload;
+    uint32_t *length;
+    int ret;
+
+    if (addr <= 0x3c && !(addr & 3)) {
+        rx = false;
+        id = addr / 4;
+    } else if (addr >= 0x2000 && addr <= 0x203c && !(addr & 3)) {
+        rx = true;
+        id = (addr - 0x2000) / 4;
+    } else {
+        return 0;
+    }
+    if (!dev || !dev->bcontainer || !dev->bcontainer->loom_ram ||
+        !dev->loom_iavf_irq_control) {
+        return 0;
+    }
+    s = queues_get(dev);
+    if (!s || s->ambiguous || value >= 4096) {
+        return -EINVAL;
+    }
+    if (!(s->valid_mask & (1U << id))) {
+        if (s->enabled_rx || s->enabled_tx || s->enable_pending) {
+            return -ENOTSUP;
+        }
+        if (rx) {
+            /* Native RX initialization precedes PF CONFIG_VSI_QUEUES. */
+            s->physical.deferred_rx[id] = value;
+            s->physical.deferred_mask |= 1U << id;
+            return 2;
+        }
+        /* An initial TX clear exposes no descriptors; no later flush needed. */
+        return value ? -ENOTSUP : 2;
+    }
+    if (s->pending ||
+        ((rx ? s->physical.rx_prepared_mask : s->physical.tx_prepared_mask) &
+         (1U << id))) {
+        return -EBUSY;
+    }
+    q = &s->queue[id];
+    entries = rx ? q->rx_count : q->tx_count;
+    stride = rx ? 32 : 16;
+    base = rx ? q->rx_iova : q->tx_iova;
+    if (!entries || entries > 4096 || (entries % (rx ? 32 : 8)) ||
+        !base || (base & 127) || base > UINT64_MAX - entries * stride ||
+        value >= entries) {
+        return -ESTALE;
+    }
+    if (!rx && value &&
+        !((s->enabled_tx | s->pending_tx) & (1U << id))) {
+        return -ENOTSUP;
+    }
+    old = ((rx ? s->rx_tail_known : s->tx_tail_known) & (1U << id)) ?
+          (rx ? s->rx_tail[id] : s->tx_tail[id]) : 0;
+    if (old >= entries || (rx && (!q->rx_buffer_size ||
+                                 q->rx_buffer_size > 4096))) {
+        return -ESTALE;
+    }
+    span = (value + entries - old) % entries;
+    first = MIN(span, entries - old);
+    desc = s->submit_desc;
+    payload = s->submit_payload;
+    length = s->tx_length;
+    ret = physical_read_ring(dev, base, entries, stride, old, span, desc);
+    if (ret) {
+        return ret;
+    }
+    for (unsigned n = 0; n < span; n++) {
+        const uint8_t *d = desc + n * stride;
+
+        if (rx) {
+            if (ldq_le_p(d + 8)) {
+                return -ENOTSUP;
+            }
+            payload[n] = ldq_le_p(d);
+            length[n] = q->rx_buffer_size;
+        } else {
+            uint64_t command = ldq_le_p(d + 8);
+            unsigned type = command & 15;
+
+            length[n] = 0;
+            if (type == 1) {
+                /* Native TSO/VLAN context contains no external DMA address. */
+                if (lduw_le_p(d + 6) ||
+                    (((command >> 4) & 0xffff) & ~0x7fU) ||
+                    (command & ((UINT64_C(0x3ff) << 20) |
+                                (UINT64_C(3) << 48)))) {
+                    return -ENOTSUP;
+                }
+                continue;
+            }
+            if (type != 0) {
+                return -ENOTSUP;
+            }
+            payload[n] = ldq_le_p(d);
+            length[n] = (command >> 34) & 0x3fff;
+        }
+        if (!payload[n] || !length[n] ||
+            payload[n] > UINT64_MAX - length[n] ||
+            payload_intersects_descriptors(s, payload[n], length[n])) {
+            return -ENOTSUP;
+        }
+    }
+    if (rx) {
+        uint8_t sentinel[8];
+
+        /* NTU is exclusive: its cleared status is not a payload address. */
+        ret = loom_vfio_ram_read_cpu(dev->bcontainer,
+                                     base + value * 32ULL + 8,
+                                     sentinel, sizeof(sentinel));
+        if (ret) {
+            return ret;
+        }
+        if (ldq_le_p(sentinel)) {
+            return -ENOTSUP;
+        }
+    }
+    for (unsigned n = 0; n < span; n++) {
+        if (!length[n]) {
+            continue;
+        }
+        ret = physical_stage(dev, payload[n], length[n]);
+        if (ret) {
+            return ret;
+        }
+    }
+    if (span) {
+        ret = physical_stage(dev, base + old * stride, first * stride);
+        if (!ret && first < span) {
+            ret = physical_stage(dev, base, (span - first) * stride);
+        }
+        if (ret) {
+            return ret;
+        }
+    }
+    if (rx) {
+        ret = physical_stage(dev, base + value * 32ULL + 8, 8);
+        if (ret) {
+            return ret;
+        }
+        s->physical.prepared_rx[id] = value;
+        s->physical.rx_prepared_mask |= 1U << id;
+    } else {
+        s->physical.prepared_tx[id] = value;
+        s->physical.tx_prepared_mask |= 1U << id;
+    }
+    return 1;
+}
+
+/*
+ * Seed completion tracking before DMA can begin, without committing the tail.
+ * The ordinary observer advances next; retain it for the legacy path only.
+ */
+int loom_iavf_record_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value)
+{
+    LoomIAVFQueues *s;
+    bool rx;
+    unsigned id;
+    uint16_t old, known;
+
+    if (!dev || !dev->bcontainer || !dev->bcontainer->loom_ram ||
+        !(s = dev->loom_iavf_queues)) {
+        return -ENOTSUP;
+    }
+    if (addr >= 0x2000 && addr <= 0x203c && !(addr & 3)) {
+        rx = true;
+        id = (addr - 0x2000) / 4;
+    } else if (addr <= 0x3c && !(addr & 3)) {
+        rx = false;
+        id = addr / 4;
+    } else {
+        return -EINVAL;
+    }
+    if (!((rx ? s->physical.rx_prepared_mask :
+                s->physical.tx_prepared_mask) & (1U << id)) ||
+        (rx ? s->physical.prepared_rx[id] :
+              s->physical.prepared_tx[id]) != value) {
+        return -ESTALE;
+    }
+    old = rx ? s->rx_tail[id] : s->tx_tail[id];
+    known = rx ? s->rx_tail_known : s->tx_tail_known;
+    loom_iavf_observe_write(dev, addr, value);
+    if (rx) {
+        s->rx_tail[id] = old;
+        s->rx_tail_known = known;
+    } else {
+        s->tx_tail[id] = old;
+        s->tx_tail_known = known;
+    }
+    return 0;
+}
+
+int loom_iavf_commit_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value)
+{
+    LoomIAVFQueues *s;
+    unsigned id;
+
+    if (!dev || !dev->bcontainer || !dev->bcontainer->loom_ram ||
+        !(s = dev->loom_iavf_queues)) {
+        return -ENOTSUP;
+    }
+    if (addr >= 0x2000 && addr <= 0x203c && !(addr & 3)) {
+        id = (addr - 0x2000) / 4;
+        if (!(s->physical.rx_prepared_mask & (1U << id)) ||
+            s->physical.prepared_rx[id] != value) {
+            return -ESTALE;
+        }
+        s->physical.rx_prepared_mask &= ~(1U << id);
+        s->rx_tail[id] = value;
+        s->rx_tail_known |= 1U << id;
+        if (s->physical.deferred_rx[id] == value) {
+            s->physical.deferred_mask &= ~(1U << id);
+        }
+    } else if (addr <= 0x3c && !(addr & 3)) {
+        id = addr / 4;
+        if (!(s->physical.tx_prepared_mask & (1U << id)) ||
+            s->physical.prepared_tx[id] != value) {
+            return -ESTALE;
+        }
+        s->physical.tx_prepared_mask &= ~(1U << id);
+        s->tx_tail[id] = value;
+        s->tx_tail_known |= 1U << id;
+    } else {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+bool loom_iavf_deferred_physical_rx(VFIODevice *dev, unsigned id, uint32_t *value)
+{
+    LoomIAVFQueues *s;
+
+    if (!dev || !dev->bcontainer || !dev->bcontainer->loom_ram || !value ||
+        id >= VF_QUEUE_COUNT || !(s = dev->loom_iavf_queues) ||
+        !(s->physical.deferred_mask & (1U << id))) {
+        return false;
+    }
+    *value = s->physical.deferred_rx[id];
+    return true;
+}
+
+
+int loom_iavf_physical_rx_configuration(VFIODevice *dev)
+{
+    LoomIAVFQueues *s;
+
+    if (!dev || !dev->bcontainer || !dev->bcontainer->loom_ram ||
+        !(s = dev->loom_iavf_queues)) {
+        return -ENOTSUP;
+    }
+    if (s->ambiguous) {
+        return -ESTALE;
+    }
+    if (s->pending || !s->valid_mask) {
+        return 0;
+    }
+    if (s->physical.deferred_mask & ~s->valid_mask) {
+        return -ESTALE;
+    }
+    return 1;
 }

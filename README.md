@@ -3120,3 +3120,57 @@ address为0但其他字段非零仍拒绝。有效 packet address 仍必须完�
 新增 N-1 缓冲正常布局及 null-address/dirty字段三个拒绝检查。
 QEMU 编译与 diff --check通过；运行巨虚、guest、HPET保持不变，
 没有实验文件，没有使用Lux。
+
+### 2026-10-11：稀疏 data doorbell 与真实 BAR 适配器
+
+loom_iavf_prepare_physical_data 只准备新提交的 TX [old,tail)、
+RX [old,next_to_use)；按实际队列大小回绕，CPU 读取每段不超过64KiB。
+TX data 描述符准备非空 payload，原生 TSO/VLAN context 没有外部
+payload；其他类型、保留字段、描述符别名、越界/只读/未授权地址拒绝。
+RX 只准备提交区间的非零 buffer，单独验证/同步 exclusive NTU 槽
+已清零的 status，不把该槽保留的 RSS/writeback 地址当作新 DMA 地址。
+payload 先于 ring 同步；任一步失败都不产生 prepared tail。
+
+原生 iavf 可能在 CONFIG_VSI_QUEUES ACK 前写 RX tail。
+这时只暂存最新 hint，绝不写硬件；TX 初始 tail0也不转发。
+CONFIG 请求保留 hint，RESET/DISABLE/REQUEST_QUEUES 丢弃旧 hint；
+配置失效清除 prepared tail。配置 ACK 后才能使用真实 ring/count，
+不能把准备成功当成 PF ACK。已知配置不覆盖 hint queue 时拒绝提交。
+
+新增 record_physical_data：在 doorbell 前记录完成跟踪需要的状态，
+保留旧 tail/known；原有 observe_write 用于 legacy 路径，不能直接用于
+新路径的提交位置。硬件 pwrite 完整成功后才 commit_physical_data；
+错误值、未准备、配置失效、重复 commit 均拒绝。写失败不前移 next。
+
+新增 hw/vfio/loom-iavf-bar.c，并在 helpers 的实际 BAR 读写路径接入：
+仅当 bcontainer->loom_ram 存在时拦截，默认路径保持原行为。
+确认 X710 VF/BAR0，拒绝关键寄存器的非32位/未对齐/部分重叠写入；
+初次门控前读两个 AQ LEN，发现仍 enabled 或读取失败则拒绝。
+先发布已有完成，再做 sparse prepare；内部 LEN disable/enable
+不覆盖原始 guest 请求。CONFIG ACK 后、ASQ 命令 tail 前刷新 RX hints，
+然后观察原始命令并写硬件。初始化 hint 不重复透传。
+门控处理成功后跳过 legacy submission 与第二次 pwrite，仍执行 trace/EOI；
+读取仅合并 pending LEN，请求/真实硬件 reset 状态按 gate 约定呈现。
+
+每个 VFIORegion 保存独立 gate；finalize 只释放 gate 元数据。
+短写、读写/DMA 准备失败使 gate failed，尽力关闭 AQ，停止 guest，
+不把 disable readback 当作 DMA 已排空证明，不释放仍可能使用的 pool。
+PCI pre_reset 的已有 gate 保持 failed：当前 post_reset 即使 reset
+失败也会执行，因此未证明硬件静止前不能直接清空 gate 再恢复。
+该原型一旦 PCI reset，需要关闭后台并重新启动 QEMU；fresh 初次启动
+尚无 gate 不受影响。后续需要完成有成功证据的 reset/restart 生命周期。
+物理模式仍没有 RAM listener 或启动开关，不能仅删除 guest vIOMMU
+就启用；没有运行这条新硬件路径，不宣称吞吐提升或实际启动通过。
+
+验证：memfd GCC ASan/UBSan 抽取当前实际 parser/prepare/data/record/commit、
+observer request/write、完整 AdminQ gate 与完整生产 BAR adapter，
+18547 次断言 PASS。外部 RAM授权/map/sync、VFIO fd 与 PF ACK 模拟；
+scoped completion 的外部实现模拟，不覆盖真实 DMA/DSM 或硬件时序。
+覆盖所有 RX32/TX8 old/tail 回绕组合、4095 RX slot 分段读取、
+early hint/config ACK/ENABLE 顺序、完整六种 AQ 配置顺序、
+部分重叠/短读/短写/启用状态/权限与同步失败、
+实际 adapter payload→ring→hardware 顺序、失败 tail不前移、
+pending LEN影子与真实 reset可见、默认禁用时无IO/无gate分配。
+同时源文件 diff --check、QEMU 编译链接通过。
+guest代码、HPET、现有巨虚和 Garen worker-g4 保持不变；不使用 Lux，
+未生成实验脚本/日志/数据文件。
