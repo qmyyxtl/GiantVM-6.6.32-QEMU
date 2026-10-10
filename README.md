@@ -2553,3 +2553,73 @@ A/B/C均正常关机两端EXIT0、refs0，VF恢复iavf后才再次启动。
 新代码双卡发送内容校验通过，guest error级dmesg为空。
 原Garen libvirt worker-g4保持，host和guest内核、HPET、模块参数保持，
 Lux未使用，没有产生实验脚本、日志、pcap或新磁盘。
+
+### 同次启动的RDMA接收线程亲和性与RPC等待（2026-10-11）
+
+代码3d1fcd14c7，guest#26/HPET/4CPU/严格owner vIOMMU保持，
+不重启VM、不迁移内存、不改变其他线程的亲和性。
+只对两端gvm-rdma-rx切换CPU mask：
+N0=0-47,96-143；N1=48-95,144-191（HCA在N1）。
+6对次序交替0→1、1→0，每个条件分别测Garen和Ezreal卡，
+两本地guest CPU worker、6秒、Jinx10.3/11.3接收字节/内容校验。
+两卡顺序测，非并发聚合。性能窗口无BCC/perf。
+
+原始每对N0/N1 MiB/s：
+| 对 | Garen N0 | Garen N1 | Ezreal N0 | Ezreal N1 |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 236.900 | 191.786 | 191.294 | 160.506 |
+| 1 | 206.144 | 202.178 | 178.211 | 185.679 |
+| 2 | 201.077 | 212.459 | 186.730 | 169.301 |
+| 3 | 196.645 | 204.829 | 171.310 | 185.547 |
+| 4 | 211.912 | 198.458 | 150.198 | 150.958 |
+| 5 | 197.956 | 205.915 | 194.008 | 175.033 |
+
+Garen中位数203.610/203.503（N1 -0.05%），
+Ezreal182.471/172.167（N1 -5.65%）。
+两卡均只有3/6对N1更快，区间重叠，没有一致改善证据。
+24个发送测试全部内容校验通过。
+终于恢复两端原mask0-191，并通过实际sched_getaffinity再次验证，
+不是只恢复启动命令。没有采用新的接收线程默认绑定。
+
+只读/proc统计取约81.6/81.4秒区间，覆盖部分交替负载而非每个条件：
+Garen活跃vCPU0/1 CPU时间24.086/21.766秒，
+request线程4.637秒、receiver3.420秒、主线程3.918秒；
+Ezreal活跃vCPU2/3为31.286/18.638秒，
+request0.569、receiver0.512、主线程1.704秒。
+主要vCPU运行队列等待约4–10毫秒，但调度次数很多：
+Ezreal vCPU2/3增量3782455/1841285。
+schedstat CPU时间包含guest执行，不能当作纯QEMU/VFIO或DSM开销；
+低runqueue等待也不等于没有阻塞/同步等待。
+瞬间wchan接收线程为do_sys_poll、请求线程为futex_wait_queue，
+与CQ事件接收和FIFO worker的代码一致。
+
+随后另开22秒探针窗口，只观测Ezreal真实PID687902，
+用rdma_router_call、rdma_send_msg及libc usleep的入口/返回
+按TID、消息类型、调用嵌套范围累计墙钟时间，结束卸载后读取冻结表。
+没有嵌套同线程call冲突；该窗口的带探针吞吐不计入上表。
+在MMIO（type2，来源interrupt-router.c枚举）：
+RPC完成205458次，累计调用墙钟5022.746毫秒；
+嵌套send_msg累计1604.929毫秒；
+send范围usleep205429次/1108.909毫秒；
+send之外、RPC内部usleep436746次/2401.373毫秒。
+睡眠两个范围互斥，合计3510.282毫秒，约占本窗口RPC累计墙钟69.89%。
+平均单次usleep约5.4–5.6微秒，不能按默认50微秒推算；
+读到进程主线程timerslack_ns为1，并非实测所有线程的timer slack。
+外层RPC时间包含锁、发送及回复等待，跨线程累计也不等于独占实际墙钟；
+探针本身会增加时延，不能将比例解释为带宽损失或未观测的正常延迟。
+
+源码rdma_send_msg同步消费SEND CQ后才复用发送缓冲；
+rdma_wait_completion和rdma_router_call在CQ为空时usleep(1)。
+回复CQ每peer只有一个consumer，由response_lock保护。
+普通mmio_forwarding还持有io_forwarding_mutex。
+尚未确认这些MMIO对应哪些设备地址，也未将它们全归因于某个设备或HPET。
+它们是QEMU设备RPC等待，与kernel DSM页传输需要分别核实。
+
+下一步针对具体等待路径评估有上限的CQ短轮询：
+保持发送完成验证、缓冲生命周期、序号/类型/长度验证、
+每个回复CQ的单consumer约束、原超时和错误行为、IO顺序。
+不能直接去掉usleep变成无界忙等，或跳过完成就复用缓冲。
+HPET设备、guest时钟和guest OS保持。
+本轮没有实施轮询优化，没有宣称提升性能。
+原运行配置保留，host/guest内核及模块参数未变；
+Garen worker-g4保持、Lux未用，没有产生实验脚本/日志/pcap/磁盘。
