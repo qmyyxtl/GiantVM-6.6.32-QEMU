@@ -1035,6 +1035,16 @@ static int physical_stage(VFIODevice *dev, uint64_t addr, uint64_t size)
         loom_vfio_dma_sync_to_device_range(dev->bcontainer, addr, size);
 }
 
+/* Descriptor bytes have already been captured and validated under BQL. */
+static int physical_stage_snapshot(VFIODevice *dev, uint64_t addr,
+                                    const void *snapshot, uint64_t size)
+{
+    int ret = loom_vfio_ram_materialize(dev->bcontainer, addr, size, true);
+
+    return ret ? ret :
+        loom_vfio_dma_submit_snapshot(dev->bcontainer, addr, snapshot, size);
+}
+
 static bool physical_inline_op(unsigned op)
 {
     switch (op) {
@@ -1361,7 +1371,7 @@ int loom_iavf_prepare_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value
     bool rx;
     unsigned id, entries, stride, old, span, first;
     uint64_t base;
-    uint8_t *desc;
+    uint8_t *desc, sentinel[8];
     uint64_t *payload;
     uint32_t *length;
     int ret;
@@ -1466,8 +1476,6 @@ int loom_iavf_prepare_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value
         }
     }
     if (rx) {
-        uint8_t sentinel[8];
-
         /* NTU is exclusive: its cleared status is not a payload address. */
         ret = loom_vfio_ram_read_cpu(dev->bcontainer,
                                      base + value * 32ULL + 8,
@@ -1489,16 +1497,19 @@ int loom_iavf_prepare_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value
         }
     }
     if (span) {
-        ret = physical_stage(dev, base + old * stride, first * stride);
+        ret = physical_stage_snapshot(dev, base + old * stride, desc,
+                                      first * stride);
         if (!ret && first < span) {
-            ret = physical_stage(dev, base, (span - first) * stride);
+            ret = physical_stage_snapshot(dev, base, desc + first * stride,
+                                           (span - first) * stride);
         }
         if (ret) {
             return ret;
         }
     }
     if (rx) {
-        ret = physical_stage(dev, base + value * 32ULL + 8, 8);
+        ret = physical_stage_snapshot(dev, base + value * 32ULL + 8,
+                                      sentinel, sizeof(sentinel));
         if (ret) {
             return ret;
         }

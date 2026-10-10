@@ -1288,6 +1288,54 @@ int loom_vfio_dma_read_pool(VFIOContainerBase *bc, hwaddr iova,
 }
 
 /*
+ * Submit a caller-owned, validated CPU snapshot without rereading guest RAM.
+ * BQL pins registration lifetimes throughout preflight and merge. Reject a
+ * device-write-only registration before changing any pool or producer baseline.
+ * Preserve device changes outside CPU-modified bytes, as normal range sync does.
+ */
+int loom_vfio_dma_submit_snapshot(VFIOContainerBase *bc, hwaddr iova,
+                                  const void *snapshot, uint64_t size)
+{
+    const uint8_t *bytes = snapshot;
+    hwaddr end;
+    int ret;
+
+    assert(bql_locked());
+    if (!bc || !bc->loom_dma) {
+        return -ENODEV;
+    }
+    if (!snapshot || !size || size > 64 * MiB || iova > UINT64_MAX - size) {
+        return -EINVAL;
+    }
+    if (!loom_vfio_dma_range_covered(bc, iova, size)) {
+        return -ENOENT;
+    }
+    end = iova + size;
+    for (hwaddr pos = iova; pos < end; ) {
+        LoomDMABuffer *b = buffer_at(bc->loom_dma, pos);
+
+        if (b->direction == 2) {
+            return -EACCES;
+        }
+        pos += MIN(end - pos, b->size - (pos - b->iova));
+    }
+    while (iova < end) {
+        LoomDMABuffer *b = buffer_at(bc->loom_dma, iova);
+        uint64_t len = MIN(end - iova, b->size - (iova - b->iova));
+        LoomDMABuffer part = buffer_view(b, iova - b->iova, len);
+
+        ret = merge_buffer(bc, &part, (uint8_t *)bytes, true);
+        if (ret) {
+            return ret;
+        }
+        iova += len;
+        bytes += len;
+    }
+    smp_wmb();
+    return 0;
+}
+
+/*
  * Publish only a caller-owned immutable snapshot. Never re-read device memory:
  * doing so could expose a late descriptor completion before its payload.
  * Preflight coverage before the first guest write; merge only changed bytes,
