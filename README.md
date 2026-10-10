@@ -135,3 +135,52 @@ worker 在 CPU0/CPU2 固定后才创建并首触缓冲区；每端写自己的 o
 
 保留上游 `README.rst`、版权、许可证和历史署名。许可见 `COPYING` 等原文件。
 guest 镜像、部署 raw、编译产物不纳入本次整理。
+
+## 2026-10-10：不修改 guest 的 owner 本地 I/O 路径
+
+后续开发继续在原 origin `git@github.com:xue-123-song/GVM-qemu.git` 的
+`device-aggregation` 分支进行；上面的 GiantVM 新仓库是供同事使用的快照，
+本轮未向该副本推送。
+
+`500b5fa0e8` 将 BAR 路由改为先检查 owner 本地目录。本地命中仍校验设备
+generation，但不再刷新无关远端目录。两端 CPU 对两端 EDU 寄存器读写及
+PCI memory-enable 关闭/恢复通过；探针观察到约 1.24 万次本地磁盘 doorbell，
+对应的远端目录 RPC 为零。远端访问与未知地址仍保留原有刷新行为，
+因此 HPET/串口等非 PCI 访问的目录轮询尚未消除，不能宣称控制面失效机制已完成。
+
+聚合模式禁止本地 irqfd，以免完成中断绕过 QEMU 的跨节点 MSI 路由。
+virtio PCI 应在选择 guest notifier 时直接使用用户态 notifier，而不是先尝试
+被禁止的 irqfd 再导致 virtio-blk 数据路径回退。MSI-X、owner 本地 ioeventfd
+和 IOThread 可以组合使用；普通非聚合模式的 irqfd 选择保持原样。
+
+在两端各自增加一个 IOThread，并将本地数据盘连接到该线程：
+```
+-object iothread,id=owner-io,poll-max-ns=0
+-device virtio-blk-pci,...,ioeventfd=on,vectors=5,iothread=owner-io,loom-aggregate=on,loom-numa-node=N
+```
+这里的省略号需替换为前面例子的 drive/id/addr/serial；不改变 raw 后端
+`cache=none,aio=threads`，不启用 IOThread 忙轮询。QMP `query-iothreads`
+与线程级探针均确认两端队列在各自 IOThread 上处理，数据校验读测试通过。
+当前四队列 MSI-X 中断为 managed IRQ，直接写 affinity 可能返回 EPERM；
+应核对队列与 CPU 的实际对应关系，不能照搬上面的 INTx 配置。
+
+4 vCPU / 4 GiB / 双 NUMA，1 MiB O_DIRECT Linux AIO 顺序读；
+单盘两 worker、每 worker QD4；双盘四 worker、总 QD16。
+worker 在对应 owner CPU 上固定后首触缓冲区；使用既有 1 GiB raw 数据，
+计时读取降低频率，每阶段 8 秒、三轮，无性能探针：
+
+| 配置 | Garen 单盘 | Ezreal 单盘 | 双盘合计 |
+| --- | ---: | ---: | ---: |
+| 本地 BAR 优化，ioeventfd=off | 1895.9 | 1617.0 | 1662.5 |
+| 本地 BAR 优化，ioeventfd=on + IOThread | 1562.0 | 1712.8 | 2303.0 |
+
+单位 MiB/s，数值为三轮中位数。双盘提高约 39%，但 Garen 单盘下降约 18%；
+双盘只达到两端单盘吞吐之和的约 70%，尚未达到线性扩展。
+两组之间重启了 guest，DSM 页状态会变化，不能把全部差值归因于单项代码。
+小容量循环读取和硬件 RAID 缓存也限制了结果的外推，不代表持续介质带宽。
+本轮没有挂网卡，没有测量 VFIO 网卡聚合吞吐。
+
+跨节点完成路径也已验证：在 CPU2/3 上读取 Garen 盘、在 CPU0/1 上读取
+Ezreal 盘，数据校验通过。Garen 盘 req.0/1 分别在远端 CPU2/3 增加
+902/857 次中断；Ezreal 盘 req.2/3 分别在远端 CPU0/1 增加 754/768 次中断。
+该短测用于验证路由正确性，缓冲区处于远端，不能作为本地吞吐对照。

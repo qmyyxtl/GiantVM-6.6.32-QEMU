@@ -24,6 +24,7 @@
 #include "hw/virtio/virtio.h"
 #include "migration/qemu-file-types.h"
 #include "hw/pci/pci.h"
+#include "hw/pci/loom.h"
 #include "hw/pci/pci_bus.h"
 #include "hw/qdev-properties.h"
 #include "qapi/error.h"
@@ -1217,8 +1218,11 @@ static int virtio_pci_set_guest_notifiers(DeviceState *d, int nvqs, bool assign)
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
     VirtioDeviceClass *k = VIRTIO_DEVICE_GET_CLASS(vdev);
     int r, n;
+    /* RDMA MSI routing runs in QEMU. Keep userspace completion notifiers
+     * while allowing owner-local ioeventfd/IOThread queue processing.
+     */
     bool with_irqfd = msix_enabled(&proxy->pci_dev) &&
-        kvm_msi_via_irqfd_enabled();
+        kvm_msi_via_irqfd_enabled() && !loom_pci_enabled();
 
     nvqs = MIN(nvqs, VIRTIO_QUEUE_MAX);
 
@@ -1422,7 +1426,8 @@ static void virtio_pci_set_vector(VirtIODevice *vdev,
                                   uint16_t new_vector)
 {
     bool kvm_irqfd = (vdev->status & VIRTIO_CONFIG_S_DRIVER_OK) &&
-        msix_enabled(&proxy->pci_dev) && kvm_msi_via_irqfd_enabled();
+        msix_enabled(&proxy->pci_dev) && kvm_msi_via_irqfd_enabled() &&
+        !loom_pci_enabled();
 
     if (new_vector == old_vector) {
         return;
