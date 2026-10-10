@@ -2315,3 +2315,47 @@ Garen 的 libvirt worker-g4 PID6122 保持；Lux 未使用；
 后续应检查是否能将 owner 本地 DMA 暂存和数据队列同步与虚拟 IOMMU 解耦，
 或建立不启用 DSM 的本地暂存对照，以定位暂存层的独立成本。
 尚未实现或验证这些替代路径，不关闭现有失效机制或把 DMA 直接指向 DSM 页。
+
+### 单机暂存对照（2026-10-11，代码 f988c1673a）
+
+新增默认关闭的启动选项 LOOM_VFIO_LOCAL_STAGE=1，必须同时设置
+LOOM_VFIO_DSM_DMA=1；仅用于 KVM 单机、无 shm 的严格 guest vIOMMU 对照。
+保留 intel-iommu,caching-mode=on,intremap=off，以及 guest
+intel_iommu=on iommu.strict=1。单机 -smp 4，不设置 -local-cpu，
+GVM_OWNER_IOMMU=0。不能运行时切换，不能据此直接移除巨虚的 vIOMMU。
+原分布式启用条件保持，guest 内核与 HPET 未改。
+
+对照双方均显式使用 x-no-mmap=on,x-no-kvm-msi=on,x-no-kvm-msix=on,
+x-no-kvm-ioeventfd=on,x-no-vfio-ioeventfd=on，避免暂存自动禁用 fast path
+造成额外配置差异。开启方设置 LOOM_VFIO_POOL_CACHE_PAGES=1024、
+LOOM_VFIO_BUFFER_RECYCLE=1。沿用既有 VF 绑定/正常退出恢复流程，
+不要改绑 PF。实际启用函数旧/新差分与边界测试 864 项通过（744 项原行为比较），
+ASan/UBSan、两端编译及 git diff --check 通过。
+
+同一 Garen VF、guest 4CPU/4GiB/2NUMA、HPET、两个 CPU0/1 TCP worker，
+每轮 6 秒，向 Jinx 198.18.10.3:49161 发流量并校验接收内容。
+三次启动各六轮无探针总吞吐 MiB/s：
+- 暂存 ON：[268.754,255.498,275.109,251.934,285.845,271.803]，中位数 270.279。
+- 暂存 OFF：[447.492,407.003,430.644,408.613,428.384,432.034]，中位数 429.514。
+- 恢复 ON：[287.065,310.987,314.715,288.916,289.493,296.550]，中位数 293.022。
+
+有跨启动波动；该对照下开启暂存吞吐下降约 32–37%，不能当作稳定的精确比例，
+也不能将损失全算成 memcpy 或从巨虚吞吐直接减出纯 DSM。
+单机使用普通 vIOMMU，巨虚有 owner shadow/coalesce，二者不能作严格加性分解。
+开启暂存的独立 20 秒计数：DSM ioctl 0、启用 true 1799596、
+注册成功 899798/错误 0、scoped TX 51740/fallback 33。
+单机确实没有启用 DSM；额外 Jinx→guest 接收 256MiB 内容校验通过。
+所有探针窗口吞吐均不纳入性能对照。
+
+恢复 ON 的独立 199Hz/26 秒 CPU 采样：7974 次读取、错误 0；
+实际 BQL 持锁样本 3512，其中用户态 2086（59.4%）、
+VFIO/IOMMU 1258（35.8%）、其他内核 168。
+用户态包含未解析 libc/GLib、哈希、分配、队列完成处理等，
+不能把全部用户态样本归因于复制。IOMMU 栈涉及失效提交、同步和 xarray 遍历，
+采样比例不是吞吐损失比例。7 个非持锁 DSM/RDMA 栈分类样本包含普通路径守卫，
+不推翻实际 DSM ioctl 为 0 的计数。
+
+这次新增的是定位开关，没有声称提高性能。下一步拆分注册基线初始化、
+暂存复制、队列同步、元数据与映射生命周期的成本，保留失效及发布顺序。
+两端巨虚已恢复原分布式启动配置，单机对照正常退出并恢复 VF；
+不安装覆盖 host 模块，不改 guest，不使用 Lux，不生成实验脚本、日志或 pcap。
