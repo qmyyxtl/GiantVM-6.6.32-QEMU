@@ -42,6 +42,9 @@ struct LoomVFIODMA {
     GHashTable *page_maps, *page_buffers;
     uint64_t registration_sequence;
     GList *large_maps;
+    bool recycle_pages;
+    unsigned free_page_count;
+    uint8_t *free_pages[64];
 };
 
 /*
@@ -72,6 +75,36 @@ static void page_index_layout(LoomVFIODMA *ctx, hwaddr iova, uint64_t size)
 static bool map_is_page(const LoomDMAMap *m)
 {
     return !(m->iova & 4095) && m->size == 4096;
+}
+
+/*
+ * Reuse only owner-local staging pages, after the caller has removed the
+ * hardware IOMMU mapping and invalidation has retired buffer/queue state.
+ * Hardware mappings and registration generations are never cached. Bound the
+ * idle storage to 64 pages (256 KiB) per container; larger/partial unmaps retain
+ * their existing mmap lifetime. Clear every reused page before registration.
+ */
+static uint8_t *pool_alloc(LoomVFIODMA *ctx, uint64_t size)
+{
+    uint8_t *page;
+
+    if (ctx->recycle_pages && size == 4096 && ctx->free_page_count) {
+        page = ctx->free_pages[--ctx->free_page_count];
+        memset(page, 0, 4096);
+        return page;
+    }
+    return mmap(NULL, size, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+}
+
+static void pool_retire_page(LoomVFIODMA *ctx, LoomDMAMap *m)
+{
+    if (ctx->recycle_pages && map_is_page(m) &&
+        ctx->free_page_count < G_N_ELEMENTS(ctx->free_pages)) {
+        ctx->free_pages[ctx->free_page_count++] = m->pool;
+    } else {
+        munmap(m->pool, m->size);
+    }
 }
 
 static void map_index_add(LoomVFIODMA *ctx, LoomDMAMap *m)
@@ -199,6 +232,9 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
     }
     if (!bc->loom_dma) {
         bc->loom_dma = g_new0(LoomVFIODMA, 1);
+        const char *recycle = getenv("LOOM_VFIO_POOL_RECYCLE");
+        bc->loom_dma->recycle_pages = qemu_real_host_page_size() == 4096 &&
+                                     (!recycle || strcmp(recycle, "0"));
         bc->loom_dma->page_indexed = sizeof(uintptr_t) == 8 &&
                                     qemu_real_host_page_size() == 4096;
         if (bc->loom_dma->page_indexed) {
@@ -222,8 +258,7 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
         }
     }
     m = g_new0(LoomDMAMap, 1);
-    m->pool = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    m->pool = pool_alloc(bc->loom_dma, size);
     if (m->pool == MAP_FAILED) {
         g_free(m);
         return -errno;
@@ -315,6 +350,9 @@ void loom_vfio_dma_free(VFIOContainerBase *bc)
 
         munmap(m->pool, m->size);
         g_free(m);
+    }
+    for (unsigned i = 0; i < bc->loom_dma->free_page_count; i++) {
+        munmap(bc->loom_dma->free_pages[i], 4096);
     }
     g_list_free(bc->loom_dma->maps);
     g_list_free(bc->loom_dma->large_maps);
@@ -642,7 +680,7 @@ int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
             buffer_free(b);
         }
         if (m) {
-            munmap(m->pool, m->size);
+            pool_retire_page(ctx, m);
             map_index_remove(ctx, m);
             ctx->maps = g_list_delete_link(ctx->maps, m->link);
             g_free(m);

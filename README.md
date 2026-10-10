@@ -1297,3 +1297,28 @@ retains RSS in the sentinel with cleared status: the old implementation
 fails, the corrected cache remains seeded. Scoped completion, DD-last,
 MSI-X publication and BAR error-order regressions pass. Runtime performance
 after this correction remains to be verified. Guest and HPET are unchanged.
+
+## 2026-10-10：VFIO owner 暂存页复用
+
+原生 VT-d 单卡发送观察到大量 4 KiB DMA 映射生命周期。owner 现在最多保留
+64 个空闲 4 KiB 暂存页（每 container 256 KiB），复用前清零。
+硬件 IOMMU 映射/解除映射、buffer publication、queue invalidation 和 registration
+生成号仍按原生命周期执行；较大映射与部分解除映射继续使用原 mmap 路径。
+设置环境变量 `LOOM_VFIO_POOL_RECYCLE=0` 可以关闭复用进行同版本对照。
+在正常解除映射中，仅在 backend 成功解除 IOMMU 映射、publication 成功且
+buffer/queue 状态失效后回收页。失败 publication 不回收页；容器退出释放空闲页。
+
+实际源码的内存中 ASan/UBSan 验证通过：零初始化、generation ABA、失败同步重试、
+缓存容量与释放、部分解除映射、immutable completion、RX descriptor cache。
+1024 次串行 4 KiB staging map/unmap 只调用一次 mmap，容器释放时一次 munmap；
+这只是生命周期系统调用验证，不能视为硬件吞吐提升。真实 VF 性能对照另行记录。
+
+普通 VM 对照用 Ezreal upstream KVM 6.6.32 和系统 QEMU 8.2.2，guest 内核保持
+6.12.0-vanilla-vfio #26，4 vCPU/4 GiB、两 NUMA 节点；巨虚使用 QEMU 9.0.90。
+同一张 VF 向 Jinx 发送，单卡双 worker、6 秒三轮中位数：普通 VFIO 463.4 MiB/s，
+关闭 BAR mmap 与 KVM MSI/MSI-X 直送 384.5 MiB/s，巨虚先前同规格 98.8 MiB/s。
+QEMU 版本和系统镜像实例存在差异，不能把全部差距归因于单一代码路径。
+磁盘同一 Ezreal 1 GiB raw、单盘双 worker、每 worker QD4、1 MiB 顺序 I/O、
+8 秒三轮：普通 VM 读 2048.0、写含 fsync 1001.6 MiB/s；当前巨虚读 1768.6、
+写含 fsync 986.5 MiB/s，写后直接读回检查通过。小范围循环 I/O 不代表大数据集稳态性能。
+用户已要求磁盘保留当前结果、不继续重测；TCP 重传排查暂时搁置，HPET 与 guest 代码不变。
