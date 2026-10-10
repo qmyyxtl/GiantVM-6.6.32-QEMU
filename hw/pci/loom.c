@@ -756,47 +756,72 @@ static void refresh_remote_mappings(void)
     }
 }
 
+static bool bar_access_owner(unsigned owner, hwaddr addr, bool io,
+                             uint8_t *data, unsigned size, bool write)
+{
+    unsigned index, bar;
+
+    for (index = 0; index < directory[owner].count; index++) {
+        LoomPCIDescriptor d;
+        snapshot(&directory[owner].devices[index], &d);
+        for (bar = 0; bar < PCI_NUM_REGIONS; bar++) {
+            LoomBAR *b = &d.bars[bar];
+            LoomPCIRequest req;
+            LoomPCIResponse resp;
+            if (!b->size || b->address == PCI_BAR_UNMAPPED ||
+                !!(b->type & PCI_BASE_ADDRESS_SPACE_IO) != io ||
+                addr < b->address || addr - b->address >= b->size) {
+                continue;
+            }
+            req = (LoomPCIRequest) {
+                .operation = write ? LOOM_PCI_BAR_WRITE : LOOM_PCI_BAR_READ,
+                .device_id = owner * LOOM_MAX_DEVICES + index,
+                .generation = d.generation, .bar = bar,
+                .offset = addr - b->address, .size = size,
+            };
+            if (write) {
+                memcpy(&req.value, data, size);
+                req.value = le64_to_cpu(req.value);
+            }
+            execute(owner, &req, &resp);
+            if (!write) {
+                uint64_t value = cpu_to_le64(resp.value);
+                memcpy(data, &value, size);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool bar_access(hwaddr addr, bool io, uint8_t *data,
                         unsigned size, bool write)
 {
-    unsigned owner, index, bar;
+    unsigned owner;
+
     if (!directory) {
         return false;
     }
     if (!(size == 1 || size == 2 || size == 4 || size == 8)) {
         fatal_error("unsupported BAR access width");
     }
+    /*
+     * Owner-local descriptors are authoritative and published under the BQL.
+     * Local access still validates the generation in loom_pci_dispatch(), but
+     * must not wait for an unrelated peer's configuration snapshot.
+     */
+    if (bar_access_owner(local_node, addr, io, data, size, write)) {
+        return true;
+    }
+
+    /* Keep remote mapping/reset validation until control-plane invalidation
+     * replaces polling. Unknown addresses cannot safely use a stale proxy.
+     */
     refresh_remote_mappings();
     for (owner = 0; owner < node_count; owner++) {
-        for (index = 0; index < directory[owner].count; index++) {
-            LoomPCIDescriptor d;
-            snapshot(&directory[owner].devices[index], &d);
-            for (bar = 0; bar < PCI_NUM_REGIONS; bar++) {
-                LoomBAR *b = &d.bars[bar];
-                LoomPCIRequest req;
-                LoomPCIResponse resp;
-                if (!b->size || b->address == PCI_BAR_UNMAPPED ||
-                    !!(b->type & PCI_BASE_ADDRESS_SPACE_IO) != io ||
-                    addr < b->address || addr - b->address >= b->size) {
-                    continue;
-                }
-                req = (LoomPCIRequest) {
-                    .operation = write ? LOOM_PCI_BAR_WRITE : LOOM_PCI_BAR_READ,
-                    .device_id = owner * LOOM_MAX_DEVICES + index,
-                    .generation = d.generation, .bar = bar,
-                    .offset = addr - b->address, .size = size,
-                };
-                if (write) {
-                    memcpy(&req.value, data, size);
-                    req.value = le64_to_cpu(req.value);
-                }
-                execute(owner, &req, &resp);
-                if (!write) {
-                    uint64_t value = cpu_to_le64(resp.value);
-                    memcpy(data, &value, size);
-                }
-                return true;
-            }
+        if (owner != local_node &&
+            bar_access_owner(owner, addr, io, data, size, write)) {
+            return true;
         }
     }
     return false;
