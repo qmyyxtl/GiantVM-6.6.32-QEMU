@@ -46,7 +46,7 @@ int vfio_container_dma_unmap(VFIOContainerBase *bcontainer,
     g_assert(vioc->dma_unmap);
     ret = vioc->dma_unmap(bcontainer, iova, size, iotlb);
     if (!ret) {
-        loom_vfio_dma_unmap(bcontainer, iova, size);
+        ret = loom_vfio_dma_unmap(bcontainer, iova, size);
     }
     return ret;
 }

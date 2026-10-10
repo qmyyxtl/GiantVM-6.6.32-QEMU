@@ -73,22 +73,6 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
     return 0;
 }
 
-void loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
-{
-    if (!bc->loom_dma) {
-        return;
-    }
-    for (GList *p = bc->loom_dma->maps; p; p = p->next) {
-        LoomDMAMap *m = p->data;
-        if (m->iova == iova && m->size == size) {
-            bc->loom_dma->maps = g_list_delete_link(bc->loom_dma->maps, p);
-            munmap(m->pool, m->size);
-            g_free(m);
-            return;
-        }
-    }
-}
-
 static int pool_copy(LoomVFIODMA *ctx, hwaddr iova, uint8_t *buf,
                      uint64_t size, bool write)
 {
@@ -132,10 +116,13 @@ void loom_vfio_dma_free(VFIOContainerBase *bc)
     if (!bc->loom_dma) {
         return;
     }
-    while (bc->loom_dma->maps) {
-        LoomDMAMap *m = bc->loom_dma->maps->data;
-        loom_vfio_dma_unmap(bc, m->iova, m->size);
+    for (GList *p = bc->loom_dma->maps; p; p = p->next) {
+        LoomDMAMap *m = p->data;
+
+        munmap(m->pool, m->size);
+        g_free(m);
     }
+    g_list_free(bc->loom_dma->maps);
     g_list_free_full(bc->loom_dma->buffers, buffer_free);
     g_free(bc->loom_dma);
     bc->loom_dma = NULL;
@@ -200,6 +187,123 @@ static int sync_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
     }
     if (to_device) {
         smp_wmb();
+    }
+    return 0;
+}
+
+static LoomDMABuffer *buffer_slice(LoomDMABuffer *b, uint64_t offset,
+                                   uint64_t size)
+{
+    LoomDMABuffer *part = g_new(LoomDMABuffer, 1);
+
+    *part = *b;
+    part->iova += offset;
+    part->gpa += offset;
+    part->size = size;
+    part->baseline = g_memdup2(b->baseline + offset, size);
+    part->scratch = g_malloc(size);
+    return part;
+}
+
+/*
+ * Called only after the backend has stopped DMA to the invalidated range.
+ * Publish device writes before dropping staging memory. A range invalidation
+ * may cover multiple mappings, or split one mapping into two surviving parts.
+ */
+int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
+{
+    LoomVFIODMA *ctx = bc->loom_dma;
+    GList *p, *next;
+    hwaddr end;
+    int ret;
+
+    if (!ctx) {
+        return 0;
+    }
+    if (!size || (iova + size < iova && iova + size != 0)) {
+        return -EINVAL;
+    }
+    /* A valid invalidation may extend to the end of the address space. */
+    end = iova + size ? iova + size : UINT64_MAX;
+    for (p = ctx->maps; p; p = p->next) {
+        LoomDMAMap *m = p->data;
+        hwaddr start = MAX(iova, m->iova);
+        hwaddr stop = MIN(end, m->iova + m->size);
+        uintptr_t page_size = qemu_real_host_page_size();
+
+        if (start < stop &&
+            ((start - m->iova) % page_size ||
+             (stop < m->iova + m->size &&
+              (stop - m->iova) % page_size))) {
+            return -EINVAL;
+        }
+    }
+    /* Finish all publications before altering either list on a read error. */
+    for (p = ctx->buffers; p; p = p->next) {
+        LoomDMABuffer *b = p->data;
+        hwaddr start = MAX(iova, b->iova);
+        hwaddr stop = MIN(end, b->iova + b->size);
+        LoomDMABuffer part;
+
+        if (start >= stop) {
+            continue;
+        }
+        part = *b;
+        part.iova = start;
+        part.gpa += start - b->iova;
+        part.size = stop - start;
+        part.baseline += start - b->iova;
+        part.scratch += start - b->iova;
+        ret = sync_buffer(bc, &part, false);
+        if (ret) {
+            return ret;
+        }
+    }
+    for (p = ctx->buffers; p; p = next) {
+        LoomDMABuffer *b = p->data;
+        hwaddr start = MAX(iova, b->iova);
+        hwaddr stop = MIN(end, b->iova + b->size);
+
+        next = p->next;
+        if (start >= stop) {
+            continue;
+        }
+        if (start > b->iova) {
+            ctx->buffers = g_list_prepend(ctx->buffers,
+                buffer_slice(b, 0, start - b->iova));
+        }
+        if (stop < b->iova + b->size) {
+            ctx->buffers = g_list_prepend(ctx->buffers,
+                buffer_slice(b, stop - b->iova, b->iova + b->size - stop));
+        }
+        ctx->buffers = g_list_delete_link(ctx->buffers, p);
+        buffer_free(b);
+    }
+    for (p = ctx->maps; p; p = next) {
+        LoomDMAMap *m = p->data;
+        hwaddr start = MAX(iova, m->iova);
+        hwaddr stop = MIN(end, m->iova + m->size);
+
+        next = p->next;
+        if (start >= stop) {
+            continue;
+        }
+        if (stop < m->iova + m->size) {
+            LoomDMAMap *right = g_new(LoomDMAMap, 1);
+
+            *right = *m;
+            right->pool += stop - m->iova;
+            right->size -= stop - m->iova;
+            right->iova = stop;
+            ctx->maps = g_list_prepend(ctx->maps, right);
+        }
+        munmap(m->pool + start - m->iova, stop - start);
+        if (start > m->iova) {
+            m->size = start - m->iova;
+        } else {
+            ctx->maps = g_list_delete_link(ctx->maps, p);
+            g_free(m);
+        }
     }
     return 0;
 }
