@@ -2216,6 +2216,40 @@ static void vtd_iotlb_domain_invalidate(IntelIOMMUState *s, uint16_t domain_id)
     }
 }
 
+/*
+ * Shadow notifications need the same context information as DMA translation.
+ * Reuse its positive cache in owner-local legacy mode: context invalidations,
+ * root replacement, translation toggles and reset already invalidate its
+ * generation. IOTLB invalidation alone does not invalidate a context entry.
+ * Do not cache faults or reuse scalable/PASID context state here.
+ */
+static int vtd_notify_context_entry(VTDAddressSpace *vtd_as,
+                                    VTDContextEntry *ce)
+{
+    IntelIOMMUState *s = vtd_as->iommu_state;
+    VTDContextCacheEntry *cached = &vtd_as->context_cache_entry;
+    int ret = 0;
+
+    if (!s->loom_notify_context_cache || s->root_scalable) {
+        return vtd_dev_to_context_entry(s, pci_bus_num(vtd_as->bus),
+                                        vtd_as->devfn, ce);
+    }
+
+    vtd_iommu_lock(s);
+    if (cached->context_cache_gen == s->context_cache_gen) {
+        *ce = cached->context_entry;
+    } else {
+        ret = vtd_dev_to_context_entry(s, pci_bus_num(vtd_as->bus),
+                                       vtd_as->devfn, ce);
+        if (!ret) {
+            cached->context_entry = *ce;
+            cached->context_cache_gen = s->context_cache_gen;
+        }
+    }
+    vtd_iommu_unlock(s);
+    return ret;
+}
+
 static void vtd_iotlb_page_invalidate_notify(IntelIOMMUState *s,
                                            uint16_t domain_id, hwaddr addr,
                                              uint8_t am, uint32_t pasid)
@@ -2229,8 +2263,7 @@ static void vtd_iotlb_page_invalidate_notify(IntelIOMMUState *s,
         if (pasid != PCI_NO_PASID && pasid != vtd_as->pasid) {
             continue;
         }
-        ret = vtd_dev_to_context_entry(s, pci_bus_num(vtd_as->bus),
-                                       vtd_as->devfn, &ce);
+        ret = vtd_notify_context_entry(vtd_as, &ce);
         if (!ret && domain_id == vtd_get_domain_id(s, &ce, vtd_as->pasid)) {
             if (vtd_as_has_map_notifier(vtd_as)) {
                 /*
@@ -4339,6 +4372,9 @@ static void vtd_realize(DeviceState *dev, Error **errp)
                    "intremap=off, pasid=off and device-iotlb=off");
         return;
     }
+
+    s->loom_notify_context_cache = loom_iommu_enabled() &&
+        g_strcmp0(getenv("LOOM_VTD_NOTIFY_CONTEXT_CACHE"), "0") != 0;
 
     QLIST_INIT(&s->vtd_as_with_notifiers);
     qemu_mutex_init(&s->iommu_lock);

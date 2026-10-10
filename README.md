@@ -1365,3 +1365,21 @@ ioctl 的固定成本。它尚未证明这些成本足以解释普通 VM 与巨�
 后续需分别检查缓存的失效语义、可合并的访问、锁等待和 owner 本地执行路径；
 不能绕过 DSM 直接读取 guest RAM，也不能删除实际硬件 DMA 解除映射。
 诊断接收端和所有探针已退出，Jinx 临时地址已删除。guest/host 内核代码未修改。
+
+## owner 页级通知复用 context 缓存（guest 不变）
+
+`vtd_iotlb_page_invalidate_notify` 在 owner-local legacy VT-d 模式下复用
+现有 DMA translation 的正 context 缓存。缓存仍使用同一个 generation 和
+IOMMU 锁；全局/设备 context invalidation、root 替换、翻译启停与 reset
+沿用已有失效路径。读取失败不缓存，scalable/PASID 路径保留原读取方式。
+设置 QEMU 环境变量 `LOOM_VTD_NOTIFY_CONTEXT_CACHE=0` 关闭本优化。
+普通 VM 不启用 owner 模式时不受影响；不缓存页表项、不改变 DMA 映射生命周期。
+依据 [Intel VT-d 规范](https://cdrdv2-public.intel.com/831418/vt-directed-io-spec.pdf)
+第 6.5 节，context-cache 与 IOTLB 使用各自的失效命令；修改 root/context
+所需的 context 失效仍必须执行，不能用这一缓存绕过失效要求。
+
+实际源码提取后在 memfd 中编译运行 ASan/UBSan 验证：重复命中、正缓存与已有
+translation 缓存共享、全局及设备失效、function mask 0/1/2/3、跨 bus 隔离、
+root 替换、翻译启停、reset、generation 回绕、失败/非 present 重试，
+以及关闭开关和 scalable fallback。测试通过且两端源码构建另行核验。
+这些测试不是硬件性能证据；真实 VF 的开关对照与健康检查在部署后记录。
