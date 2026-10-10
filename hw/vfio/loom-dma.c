@@ -282,12 +282,26 @@ static int buffer_pool_copy(LoomVFIODMA *ctx, LoomDMABuffer *b,
     return 0;
 }
 
+/*
+ * Registration and slicing limit buffers to 64 MiB. Keep metadata, baseline
+ * and scratch in one allocation; only metadata needs zero initialization.
+ * Borrowed buffer_view() values never own or release this storage.
+ */
+static LoomDMABuffer *buffer_new(uint64_t size)
+{
+    LoomDMABuffer *b;
+
+    assert(size && size <= 64 * MiB);
+    b = g_malloc(sizeof(*b) + 2 * size);
+    memset(b, 0, sizeof(*b));
+    b->baseline = (uint8_t *)(b + 1);
+    b->scratch = b->baseline + size;
+    return b;
+}
+
 static void buffer_free(gpointer data)
 {
-    LoomDMABuffer *b = data;
-    g_free(b->scratch);
-    g_free(b->baseline);
-    g_free(b);
+    g_free(data);
 }
 
 void loom_vfio_dma_free(VFIOContainerBase *bc)
@@ -570,7 +584,7 @@ int loom_vfio_dma_sync_to_device_range(VFIOContainerBase *bc, hwaddr iova,
 static LoomDMABuffer *buffer_slice(LoomDMABuffer *b, uint64_t offset,
                                    uint64_t size)
 {
-    LoomDMABuffer *part = g_new(LoomDMABuffer, 1);
+    LoomDMABuffer *part = buffer_new(size);
 
     *part = *b;
     part->iova += offset;
@@ -579,8 +593,10 @@ static LoomDMABuffer *buffer_slice(LoomDMABuffer *b, uint64_t offset,
     if (part->pool) {
         part->pool += offset;
     }
-    part->baseline = g_memdup2(b->baseline + offset, size);
-    part->scratch = g_malloc(size);
+    /* Metadata copying must not retain the original buffer's storage. */
+    part->baseline = (uint8_t *)(part + 1);
+    part->scratch = part->baseline + size;
+    memcpy(part->baseline, b->baseline + offset, size);
     part->snapshot_ready = false;
     part->snapshot_next = NULL;
     return part;
@@ -887,14 +903,12 @@ int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
             return -EBUSY;
         }
     }
-    b = g_new0(LoomDMABuffer, 1);
+    b = buffer_new(size);
     b->iova = iova;
     b->gpa = gpa;
     b->size = size;
     b->direction = direction;
     b->references = 1;
-    b->baseline = g_malloc(size);
-    b->scratch = g_malloc(size);
     if (address_space_read(&address_space_memory, gpa,
                            MEMTXATTRS_UNSPECIFIED, b->baseline, size)
         != MEMTX_OK) {
