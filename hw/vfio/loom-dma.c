@@ -270,6 +270,85 @@ static int sync_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
     return merge_buffer(bc, b, b->scratch, to_device);
 }
 
+
+/*
+ * A temporary view borrows the registered buffer's storage. Only the selected
+ * bytes of its baseline are updated; neither registration nor lifetime changes.
+ */
+static LoomDMABuffer buffer_view(LoomDMABuffer *b, uint64_t offset,
+                                 uint64_t size)
+{
+    LoomDMABuffer part = *b;
+
+    assert(offset <= b->size && size <= b->size - offset);
+    part.iova += offset;
+    part.gpa += offset;
+    part.size = size;
+    if (part.pool) {
+        part.pool += offset;
+    }
+    part.baseline += offset;
+    part.scratch += offset;
+    part.snapshot_ready = false;
+    part.snapshot_next = NULL;
+    return part;
+}
+
+/*
+ * Queue submission may touch only part of a mapping or span several mappings.
+ * Check the entire registration coverage before publishing any CPU changes.
+ * Preserve registration order and every overlapping registration's baseline.
+ * The caller must first publish device completions and supply all descriptor
+ * and payload ranges transferred back to the device before ringing its tail.
+ */
+int loom_vfio_dma_sync_to_device_range(VFIOContainerBase *bc, hwaddr iova,
+                                       uint64_t size)
+{
+    LoomVFIODMA *ctx;
+    hwaddr end, pos;
+    int ret;
+
+    if (!bc || !bc->loom_dma) {
+        return -ENODEV;
+    }
+    if (!size || size > 64 * MiB || iova + size < iova) {
+        return -EINVAL;
+    }
+    ctx = bc->loom_dma;
+    end = iova + size;
+    for (pos = iova; pos < end; ) {
+        hwaddr covered = pos;
+
+        for (GList *p = ctx->buffers; p; p = p->next) {
+            LoomDMABuffer *b = p->data;
+
+            if (b->iova <= pos && pos - b->iova < b->size) {
+                covered = MAX(covered, MIN(end, b->iova + b->size));
+            }
+        }
+        if (covered == pos) {
+            return -ENOENT;
+        }
+        pos = covered;
+    }
+    for (GList *p = ctx->buffers; p; p = p->next) {
+        LoomDMABuffer *b = p->data;
+        hwaddr start = MAX(iova, b->iova);
+        hwaddr stop = MIN(end, b->iova + b->size);
+        LoomDMABuffer part;
+
+        if (start >= stop) {
+            continue;
+        }
+        part = buffer_view(b, start - b->iova, stop - start);
+        ret = sync_buffer(bc, &part, true);
+        if (ret) {
+            return ret;
+        }
+    }
+    return 0;
+}
+
 static LoomDMABuffer *buffer_slice(LoomDMABuffer *b, uint64_t offset,
                                    uint64_t size)
 {
@@ -627,9 +706,11 @@ int loom_vfio_dma_command(VFIOContainerBase *bc, unsigned command,
         }
         return 0;
     case LOOM_DMA_SYNC_CPU:
-        return sync_buffer(bc, b, false);
-    case LOOM_DMA_SYNC_DEVICE:
-        return sync_buffer(bc, b, true);
+    case LOOM_DMA_SYNC_DEVICE: {
+        LoomDMABuffer part = buffer_view(b, iova - b->iova, size);
+
+        return sync_buffer(bc, &part, command == LOOM_DMA_SYNC_DEVICE);
+    }
     default:
         return -EINVAL;
     }

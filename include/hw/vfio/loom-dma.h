@@ -15,5 +15,7 @@ int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
                            uint64_t size, unsigned direction);
 int loom_vfio_dma_command(VFIOContainerBase *, unsigned, hwaddr, uint64_t, unsigned);
 int loom_vfio_dma_sync(VFIOContainerBase *, bool);
+/* CPU submission only; caller preserves completion and doorbell ordering. */
+int loom_vfio_dma_sync_to_device_range(VFIOContainerBase *, hwaddr, uint64_t);
 uint64_t loom_vfio_dma_count(VFIOContainerBase *);
 #endif

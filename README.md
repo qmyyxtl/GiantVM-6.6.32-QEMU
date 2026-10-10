@@ -898,3 +898,32 @@ unmap、未知格式必须失效或回退全量同步。完成侧仍保持现有
 回复；无 WARNING/BUG/DMA fault/QI error/TX timeout。
 临时 BPF/guest probes、receiver/sender/observer 均已清理。
 两端自己的 QEMU 保留运行，host PF up，无新增实验文件。
+
+### 范围提交同步接口及原有子范围修复（2026-10-10）
+
+为队列范围提交增加 loom_vfio_dma_sync_to_device_range：
+接受 IOVA/长度，先检查注册 buffer 对整个区间的覆盖，再按原有
+注册顺序提交相交部分，保留 IOVA→GPA 转换和每个重叠注册对象
+的 baseline。同步仅针对指定字节，借用原有 pool/baseline/scratch，
+不改变注册/引用计数/生命周期。空洞返回 ENOENT，非法长度/溢出
+返回 EINVAL，DSM 读取失败返回 EIO。覆盖缺失时尚未发布任何
+变化；运行中读取失败仍可能已完成前面部分，调用者须按现有
+DMA 错误路径停止，不把 EIO 当成安全快速路径回退信号。
+
+同时修正既有 LOOM_DMA_SYNC_CPU/DEVICE 子范围命令：原代码
+找到包含范围的 buffer 后，仍把整个 buffer 传给 sync_buffer；
+现在传入只覆盖请求范围的临时视图。实际源码普通 RAM 检查中，
+原版本请求 7 字节却把范围外的 0 更新成 0x55，修复版范围外
+保持原值。CPU 完成方向同样只发布选定的 9 字节。
+
+实际源码 memfd 检查覆盖：非恒等 IOVA/GPA、跨 4 KiB 边界、
+指定范围外的 pool/guest 字节保留、后续全量同步仍发现剩余变化、
+读失败、零长度/溢出/空上下文、解除中间映射后的覆盖空洞、
+已有 direction=2 的提交过滤。原有生命周期/失败重试、GPA 批次
+及 24 种完成交错检查也通过。
+
+该接口尚未接入真实 VF 的 RX tail，原生 guest 的稳态路径仍
+采用原有全量同步。因此只证明范围接口/命令语义，不宣称本轮
+减少真实网络扫描或提高带宽。后续仍须建立并验证 AdminQ 队列
+配置、tail 回绕、payload 复用以及 reset/unmap 失效机制后接入。
+guest #26、HPET、host 内核不改，无新增实验文件。
