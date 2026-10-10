@@ -3774,3 +3774,100 @@ Jinx临时10.3/11.3 IP已删、49162无监听。
 巨虚继续运行，guest error级dmesg空、CPU0–3/HPET保持，
 Garen worker-g4 PID6122未动，没有host reboot或实验文件。
 整体目标仍未完成，双卡线性吞吐、长时间mapping生命周期及reset恢复仍缺证据。
+
+## 2026-10-11：同页碎片发布使用有界 DSM write pin
+
+最终代码为 `edf6c75ec5`（候选 `03c30cd22e` 的正返回值判断已修正）。
+只改 QEMU hw/vfio/loom-dma.c；未改 guest/host kernel、HPET。
+针对上轮大量1–8字节KVM_DSM_MEMCPY，复用当前内核已有的MEMPIN接口。
+
+默认关闭，需要显式 `LOOM_VFIO_PUBLICATION_PIN=1`，
+同时保持 `LOOM_VFIO_PHYSICAL_DMA=1`、publication cache开启。
+开关可通过启动wrapper外层sudo env传给QEMU；`=0`关闭。
+容器创建时读取，不能当运行时开关。
+只在BQL/RCU持有、完整可写普通RAM cache、RDMA DSM、host4KiB、
+当前merge范围落在同一个host4KiB页内时使用。
+第一次changed run仍走原路径；从第二段起至少还有4段变化，
+才用pin/unpin两个ioctl替代这些片段的独立MEMCPY。
+只写snapshot相对baseline变过的字节，不复制整页，
+保持每段成功后的baseline更新、dirty/TB accounting；
+所有直接写与dirty/baseline更新在release barrier/unpin前完成。
+缓存直接指针只在pin成功后暂时提供，返回前清除、销毁缓存、释放RCU。
+pin失败不做直接写；单页限制避免多页pin失败的部分回滚。
+unpin失败会设置容器publication_failed，之后所有merge均失败；
+既有VFIO错误路径停止VM，映射/暂存页保持，不能当正常完成继续。
+不更改既有payload→metadata→最后DD字节发布顺序。
+短片段/native/private布局等不满足条件时保留既有路径。
+
+此实验依赖**atomic、无需DSM mutex的unpin实现**，不能只看kernel名字。
+Garen运行vmlinux Build ID
+d02a26705ec6d1a898f9d819d0e27ba508760a49，
+与树中vmlinux ELF notes匹配；反汇编确认unpin分支原子减引用，
+在独立pin路径的mutex_lock之前分支返回。
+Ezreal运行KVM module Build ID
+cf7c63a0013c211941cbbac133c5be12888c4b91，
+sysfs module note与树中kvm.ko匹配、反汇编确认相同分支。
+此处没有替换host模块或重启host。其他kernel应先核实，不默认开启。
+
+首次候选版本暴露真实ABI问题：ivy fault写成功返回ACC_ALL访问掩码，
+mempin安装pin后也会返回该正数（private页可返回0）。
+不能把非0当失败；初版误判后master停在internal-error、pin未正常释放。
+现场先查QMP/日志，slave仍running，master日志为VFIO DMA同步EIO；
+在约kernel初始化1秒阶段暂停，没有运行性能测试。
+两端通过QMP quit退出，EXIT0/VF恢复iavf，销毁旧KVM上下文后修正代码；
+退出时master曾报RDMA transport retry，是对端先退出后的teardown消息。
+修正版接受所有非负pin返回，成功后始终unpin，不继续复用旧context。
+这次失败及修正前关闭组不计入下面同一修正版binary的正式对照。
+
+验证实际helper/merge抽取、内存/cache/ioctl外部接口替身，memfd ASAN/UBSAN，
+118,218案例PASS，随机案例一半用正掩码7、一半0，
+另有专门正返回成功/释放案例。覆盖0/短/未对齐/4KiB、跨页回退、
+fragment threshold/flags/non-DSM/shm/host page大小、pin负返回、
+写失败仍释放、unpin失败sticky错误、baseline部分提交与CPU未变字节保留。
+替身测试不能替代实际kernel一致性验证。Ezreal/Garen build与diff --check PASS。
+
+同一最终binary，Garen master/Ezreal slave，PIN0→1→0，仅改该环境变量。
+#26、4CPU在线、4GiB/两NUMA、HPET、两VF0c:02.0、
+两队列/RX512/TX128/RPSXPS0、data IRQ按名称绑CPU0/1/2/3保持。
+guest parent0/1，接收CPU0、enp0s7；Jinx10.3单连接256MiB×3轮，
+source8MiB×32、recv最多64KiB，pattern/计数/source elapsed一致。
+
+| 单卡RX MiB/s | r0 | r1 | r2 | median |
+| --- | ---: | ---: | ---: | ---: |
+| OFF | 131.535 | 130.424 | 122.264 | 130.424 |
+| ON | 148.177 | 148.464 | 140.313 | 148.177 |
+| OFF_RESTORED | 127.935 | 134.198 | 122.090 | 127.935 |
+
+开启高于前后关闭组，本次中位数约高14–16%，仅为这组短测试。
+host线程/内存落点、guest页分配/DSM状态、TCP4tuple/RSS等并未严格固定，
+不能当稳定收益比例、纯syscall收益或标准长期benchmark结论。
+第三组时Jinx source达到600秒正常EXIT0、aliases/listeners消失；
+在场核实是流量服务退出，VM仍存活，未重启VM/host。
+受影响3轮timeout/no-route全部舍弃；相同source重启、
+guest只flush该测试目标的failed neighbor并ping确认后重测完整3轮。
+表格只用重测PASS数据。连接/ARP服务恢复不计为带宽收益。
+原有FAT warning/部分hrtimer耗时warning仍在，未fsck/未改时钟；
+少量printk时间戳跨CPU前后跳动可见，测试固定CPU0并核实独立source elapsed，
+不据此推出全系统时钟正确性。
+
+开启组另验证两卡同时各接收256MiB，G4.448425s/E5.794540s，均PASS；
+发送各卡2workers×6秒，每种1轮：G537.636/E700.041/双卡总315.548MiB/s，
+8条流接收计数/内容PASS。此发送测试用于功能，
+没有同一binary关闭/开启/关闭的TX性能对照，不能报TX收益。
+双卡吞吐仍差，整体目标未完成；TCP重传仍有、两NIC错误/丢包计数0、
+guest error级dmesg空。开启组正常guest poweroff、两QEMU EXIT0/VF恢复，
+未出现pin残留导致关机卡住；不能据短测试证明所有长期/异常生命周期。
+
+最后重新以PIN1启动已核实的两端：
+Garen4089937（session18988）、Ezreal762540（session84767），
+两进程environ核实PIN1、QMP均running、guest正常login/配置，
+CPU0–3/HPET/#26、两NIC UP、两既有1GiB data disk枚举保持，
+data IRQ36/37/39/40分别CPU0/1/2/3，error级dmesg空。
+source/sinks已结束、Jinx临时IP删除、49161/49162无监听；
+Garen worker-g4 PID6122未动，没有实验文件/新盘/host reboot。
+
+下一步先核实真实调用数量减少多少，再评估把RX descriptor的有序
+8字节metadata/23字节metadata/最后DD作为一次32字节范围内的发布，
+在一个有界lease内仍只写changed spans并保持DD最后，减少剩余小调用。
+不能扩大为整页复制或跳过ownership；该有序合并尚未实现。
+长期DMA mapping容量与失效、reset恢复及性能验证仍待完成。
