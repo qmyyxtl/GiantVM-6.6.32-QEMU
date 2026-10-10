@@ -24,7 +24,7 @@ typedef struct LoomDMABuffer {
     hwaddr iova, gpa;
     uint64_t size;
     unsigned direction, references;
-    uint8_t *baseline, *scratch;
+    uint8_t *baseline, *scratch, *pool;
 } LoomDMABuffer;
 
 struct LoomVFIODMA {
@@ -104,6 +104,27 @@ static int pool_copy(LoomVFIODMA *ctx, hwaddr iova, uint8_t *buf,
     return 0;
 }
 
+/*
+ * Standard IOMMU buffers fit inside one pool mapping. Cache the host address
+ * while registered; range invalidation slices buffers before releasing pool
+ * memory. Legacy buffers spanning several mappings retain the lookup path.
+ */
+static int buffer_pool_copy(LoomVFIODMA *ctx, LoomDMABuffer *b,
+                            uint64_t offset, uint8_t *buf,
+                            uint64_t size, bool write)
+{
+    assert(offset <= b->size && size <= b->size - offset);
+    if (!b->pool) {
+        return pool_copy(ctx, b->iova + offset, buf, size, write);
+    }
+    if (write) {
+        memcpy(b->pool + offset, buf, size);
+    } else {
+        memcpy(buf, b->pool + offset, size);
+    }
+    return 0;
+}
+
 static void buffer_free(gpointer data)
 {
     LoomDMABuffer *b = data;
@@ -150,7 +171,8 @@ static int sync_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
         }
     } else {
         smp_rmb();
-        ret = pool_copy(bc->loom_dma, b->iova, b->scratch, b->size, false);
+        ret = buffer_pool_copy(bc->loom_dma, b, 0,
+                                b->scratch, b->size, false);
         if (ret) {
             return ret;
         }
@@ -173,8 +195,8 @@ static int sync_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
             break;
         }
         if (to_device) {
-            ret = pool_copy(bc->loom_dma, b->iova + start,
-                             b->scratch + start, pos - start, true);
+            ret = buffer_pool_copy(bc->loom_dma, b, start,
+                                    b->scratch + start, pos - start, true);
         } else {
             ret = address_space_write(&address_space_memory, b->gpa + start,
                                        MEMTXATTRS_UNSPECIFIED,
@@ -201,6 +223,9 @@ static LoomDMABuffer *buffer_slice(LoomDMABuffer *b, uint64_t offset,
     part->iova += offset;
     part->gpa += offset;
     part->size = size;
+    if (part->pool) {
+        part->pool += offset;
+    }
     part->baseline = g_memdup2(b->baseline + offset, size);
     part->scratch = g_malloc(size);
     return part;
@@ -253,6 +278,9 @@ int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
         part.iova = start;
         part.gpa += start - b->iova;
         part.size = stop - start;
+        if (part.pool) {
+            part.pool += start - b->iova;
+        }
         part.baseline += start - b->iova;
         part.scratch += start - b->iova;
         ret = sync_buffer(bc, &part, false);
@@ -374,7 +402,16 @@ int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
         buffer_free(b);
         return -EIO;
     }
-    ret = pool_copy(ctx, iova, b->baseline, size, true);
+    for (GList *p = ctx->maps; p; p = p->next) {
+        LoomDMAMap *m = p->data;
+
+        if (iova >= m->iova && size <= m->size &&
+            iova - m->iova <= m->size - size) {
+            b->pool = m->pool + iova - m->iova;
+            break;
+        }
+    }
+    ret = buffer_pool_copy(ctx, b, 0, b->baseline, size, true);
     if (ret) {
         buffer_free(b);
         return ret;

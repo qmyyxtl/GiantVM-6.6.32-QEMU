@@ -446,3 +446,17 @@ Ezreal: sudo ip addr del 198.18.10.1/24 dev ens101f0np0
 Garen: sudo ip addr del 198.18.11.1/24 dev ens101f0np0
 停止本实验 QEMU、VF 恢复 iavf 后，确认 VF 未被其他进程使用，再将各 PF
 sriov_numvfs 恢复 0。不得在 VF 仍直通时直接删除。Garen 的其他 libvirt VM 未操作。
+
+### DMA pool 地址缓存（2026-10-10）
+
+标准 IOMMU 的单映射 buffer 在注册时缓存 pool HVA，sync_buffer 直接复制，
+不再为每个 buffer 或改变的字节段扫描 map 链表。部分失效的临时视图和存活
+片段同时调整缓存地址；缓存不指向 LoomDMAMap 对象，map 结构拆分不使存活
+pool 地址失效。跨多个映射的旧 bridge buffer 保留原查找路径。
+
+真实源码配合模拟 RAM/backend 的生命周期测试通过，包括中间拆分后的
+双向同步、失效范围最终写回、跨 map buffer fallback、映射失败回滚。
+固定 Ezreal host CPU0，1178 个 4 KiB buffer，连续 200 次无变化 from-device
+同步、三轮：修改前每次约 5210-5225 us，修改后约 551-557 us。
+此测试隔离 DSM 和硬件，不是网卡吞吐结果；实际网络效果仍需实测。
+guest 和 HPET 均未修改。
