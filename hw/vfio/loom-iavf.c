@@ -154,6 +154,15 @@ static void completion_refresh_rx(VFIODevice *dev, LoomIAVFQueues *s,
         unsigned slot = (start + n) % q->rx_count;
         uint8_t desc[32];
 
+        /*
+         * The tail is the exclusive next_to_use sentinel. Native iavf clears
+         * its status but may retain hardware RSS writeback in qword 0. On the
+         * first tail, do not mistake that unposted slot for a DMA address.
+         * Subsequent [old_tail, new_tail) ranges already exclude it.
+         */
+        if (!(s->rx_tail_known & (1U << id)) && slot == tail) {
+            continue;
+        }
         if (loom_vfio_dma_read_baseline(dev->bcontainer,
                          q->rx_iova + slot * 32ULL, desc, sizeof(desc))) {
             c->seeded = false;

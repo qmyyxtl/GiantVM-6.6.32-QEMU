@@ -1284,3 +1284,16 @@ completion reconciliation before rearm. Actual BAR and MSI-X handlers are
 checked for publication-before-doorbell/notify and error suppression. These
 source checks do not yet establish runtime fast-path hits or throughput gains;
 real-device rollout is recorded separately.
+
+### Native RX first-tail completion cache
+
+The first RX tail excludes its next-to-use sentinel. Native iavf can clear
+the sentinel status while retaining RSS writeback in qword 0; it is not a
+posted DMA address. Runtime probes on both owners found first-tail slot 15
+with tail 15 and an invalid RSS-shaped address, disabling scoped completion.
+Skip that sentinel only for the first-tail harvest; subsequent
+[old_tail, new_tail) ranges already exclude it. An actual-source regression
+retains RSS in the sentinel with cleared status: the old implementation
+fails, the corrected cache remains seeded. Scoped completion, DD-last,
+MSI-X publication and BAR error-order regressions pass. Runtime performance
+after this correction remains to be verified. Guest and HPET are unchanged.
