@@ -927,3 +927,27 @@ DMA 错误路径停止，不把 EIO 当成安全快速路径回退信号。
 减少真实网络扫描或提高带宽。后续仍须建立并验证 AdminQ 队列
 配置、tail 回绕、payload 复用以及 reset/unmap 失效机制后接入。
 guest #26、HPET、host 内核不改，无新增实验文件。
+
+### 原生 X710 AdminQ 队列配置观察器（2026-10-10）
+
+新增 loom-iavf.c：仅在原生 X710 VF 的 AdminQ BAR 控制写、
+ARQ head 读以及 vector0 完成中观察，不在 RX/TX tail 数据路径
+额外读取 guest RAM。解析 virtchnl v1 的 CONFIG_VSI_QUEUES，
+记录候选队列的 RX/TX IOVA、长度及 RX buffer 大小；收到对应
+成功回复后才确认配置。此阶段不启用范围快速路径，原有全量
+同步仍执行，valid_mask 只表示观察到了配置 ACK，尚不表示队列
+已 enable 或可以省略全量同步。
+
+读取使用 QEMU 已完成发布的 baseline，避免再次读取 live DMA
+pool 将新 descriptor 与旧 payload 混合。DMA 映射/注册失效
+代际变化、AQ 重配、VF reset、disable、未知队列配置形式、
+重复待确认配置、失败回复均使缓存失效。代际失效目前较保守，
+包括与 ring 无关的映射变化，后续须验证有效覆盖再细化。
+PF reset impending/driver close 事件亦失效；设备销毁释放状态。
+
+实际源码普通 RAM 协议检查验证：请求未 ACK 不确认；
+hardware pool 已写 ACK、但尚未发布时不确认；发布后的成功
+ACK 才确认两队列；失败 ACK、重复 queue id、多个待确认请求
+的歧义、映射代际变化、非法 tail、reset/free 均正确处理。
+原有范围语义、生命周期/错误重试及 24 种完成交错检查通过。
+这不是带宽提升证明；真实设备观察结果另行补充。

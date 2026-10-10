@@ -4,6 +4,7 @@ vfio_ss.add(files(
   'common.c',
   'container-base.c',
   'loom-dma.c',
+  'loom-iavf.c',
   'container.c',
   'migration.c',
   'cpr.c',

@@ -24,6 +24,7 @@
 
 #include "hw/vfio/vfio-common.h"
 #include "hw/vfio/loom-dma.h"
+#include "hw/vfio/loom-iavf.h"
 #include "sysemu/runstate.h"
 #include "hw/hw.h"
 #include "trace.h"
@@ -225,6 +226,9 @@ void vfio_region_write(void *opaque, hwaddr addr,
                      ",%d) failed: %m",
                      __func__, vbasedev->name, region->nr,
                      addr, data, size);
+        loom_iavf_reset(vbasedev);
+    } else if (region->nr == 0 && size == 4) {
+        loom_iavf_observe_write(vbasedev, addr, data);
     }
 
     trace_vfio_region_write(vbasedev->name, region->nr, addr, data, size);
@@ -266,6 +270,9 @@ uint64_t vfio_region_read(void *opaque,
      */
     if (!vfio_loom_sync(vbasedev, false)) {
         return UINT64_MAX;
+    }
+    if (region->nr == 0 && size == 4 && addr == 0x7400) {
+        loom_iavf_observe_completion(vbasedev);
     }
 
     switch (size) {

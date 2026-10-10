@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/vfio/loom-dma.h"
+#include "hw/vfio/loom-iavf.h"
 #include "sysemu/runstate.h"
 #include CONFIG_DEVICES /* CONFIG_IOMMUFD */
 #include <linux/vfio.h>
@@ -375,6 +376,9 @@ static void vfio_msi_interrupt(void *opaque)
                      strerror(-dma_ret));
         vm_stop(RUN_STATE_INTERNAL_ERROR);
         return;
+    }
+    if (nr == 0) {
+        loom_iavf_observe_completion(&vdev->vbasedev);
     }
     msg = get_msg(&vdev->pdev, nr);
     trace_vfio_msi_interrupt(vdev->vbasedev.name, nr, msg.address, msg.data);
@@ -2414,6 +2418,7 @@ void vfio_pci_pre_reset(VFIOPCIDevice *vdev)
     PCIDevice *pdev = &vdev->pdev;
     uint16_t cmd;
 
+    loom_iavf_reset(&vdev->vbasedev);
     vfio_disable_interrupts(vdev);
 
     /* Make sure the device is in D0 */
@@ -3275,6 +3280,8 @@ error:
 static void vfio_instance_finalize(Object *obj)
 {
     VFIOPCIDevice *vdev = VFIO_PCI(obj);
+
+    loom_iavf_free(&vdev->vbasedev);
 
     vfio_display_finalize(vdev);
     vfio_bars_finalize(vdev);

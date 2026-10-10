@@ -32,6 +32,7 @@ typedef struct LoomDMABuffer {
 struct LoomVFIODMA {
     GList *maps, *buffers, *buffers_tail;
     uint8_t *read_buffer;
+    uint64_t epoch;
 };
 
 /* Linux enum dma_data_direction: bidirectional=0, to-device=1, from-device=2. */
@@ -73,6 +74,7 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
     m->size = size;
     m->readonly = readonly;
     bc->loom_dma->maps = g_list_prepend(bc->loom_dma->maps, m);
+    bc->loom_dma->epoch++;
     *vaddr = m->pool;
     return 0;
 }
@@ -446,6 +448,7 @@ int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
         ctx->buffers = g_list_delete_link(ctx->buffers, p);
         buffer_free(b);
     }
+    ctx->epoch++;
     ctx->buffers_tail = g_list_last(ctx->buffers);
     for (p = ctx->maps; p; p = next) {
         LoomDMAMap *m = p->data;
@@ -644,6 +647,7 @@ int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
         buffer_free(b);
         return ret;
     }
+    ctx->epoch++;
     ctx->buffers = g_list_prepend(ctx->buffers, b);
     if (!ctx->buffers_tail) {
         ctx->buffers_tail = ctx->buffers;
@@ -698,6 +702,7 @@ int loom_vfio_dma_command(VFIOContainerBase *bc, unsigned command,
             return ret;
         }
         if (!--b->references) {
+            ctx->epoch++;
             if (ctx->buffers_tail == entry) {
                 ctx->buffers_tail = entry->prev;
             }
@@ -719,4 +724,46 @@ int loom_vfio_dma_command(VFIOContainerBase *bc, unsigned command,
 uint64_t loom_vfio_dma_count(VFIOContainerBase *bc)
 {
     return bc && bc->loom_dma ? g_list_length(bc->loom_dma->buffers) : 0;
+}
+
+uint64_t loom_vfio_dma_epoch(VFIOContainerBase *bc)
+{
+    return bc && bc->loom_dma ? bc->loom_dma->epoch : 0;
+}
+
+/* Read QEMU's already-published baseline, never the live DMA pool. */
+int loom_vfio_dma_read_baseline(VFIOContainerBase *bc, hwaddr iova,
+                                void *buffer, uint64_t size)
+{
+    uint8_t *out = buffer;
+
+    if (!bc || !bc->loom_dma) {
+        return -ENODEV;
+    }
+    if (!size || size > 64 * MiB || iova + size < iova) {
+        return -EINVAL;
+    }
+    while (size) {
+        LoomDMABuffer *found = NULL;
+        uint64_t offset, len;
+
+        for (GList *p = bc->loom_dma->buffers; p; p = p->next) {
+            LoomDMABuffer *b = p->data;
+
+            if (iova >= b->iova && iova - b->iova < b->size) {
+                found = b;
+                break;
+            }
+        }
+        if (!found) {
+            return -ENOENT;
+        }
+        offset = iova - found->iova;
+        len = MIN(size, found->size - offset);
+        memcpy(out, found->baseline + offset, len);
+        out += len;
+        iova += len;
+        size -= len;
+    }
+    return 0;
 }
