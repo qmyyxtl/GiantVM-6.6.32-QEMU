@@ -3430,3 +3430,77 @@ sync_to_device_range重新读取同一CPU描述符的重复工作：
 仍需完成单卡非DSM成本优化、RX性能对照、长期映射增长及reset恢复验证。
 本轮所有探针、perf和接收任务正常退出、Jinx两个临时IP已移除，
 4个guest CPU在线、HPET不变；巨虚继续运行，Garen worker-g4未动，Lux未访问。
+
+### 2026-10-11：复用已验证的 physical data 描述符快照
+
+实现commit 5dac65683b（origin/device-aggregation），Ezreal修改并同步Garen，
+两台QEMU编译通过；不改guest #26或HPET，不改host kernel。
+新增loom_vfio_dma_submit_snapshot：BQL下完整覆盖与方向预检，
+device-write-only direction2在修改任何pool/baseline前拒绝；
+复用merge_buffer，仅合并CPU改变的字节，保留其他device更新及范围外baseline。
+CPU/device-read-only direction1可提交；最后保留device写屏障。
+调用者必须持有不可变私有快照，注册生命周期由BQL保护。
+
+physical data preparation此前先physical_read_ring读取、验证描述符，
+随后physical_stage又在sync_to_device_range中重新读取相同guest字节。
+现在TX/RX的新提交[old,tail)复用submit_desc中的已验证快照，
+包含ring回绕两段；RX exclusive NTU的+8状态复用已验证的8字节零快照。
+materialize仍先完成完整注册/权限预检；所有payload仍先于descriptor，
+真实tail写和成功后commit顺序不变。
+AdminQ、未知操作及完成同步的保守路径保持。
+
+验证不写实验文件，C harness与可执行文件使用memfd：
+actual submit_snapshot+merge_buffer+skip_matching_bytes（mock外部pool/地址空间），
+ASan/UBSan通过101466253断言：空/溢出/范围缺口、跨页、
+后续页direction2不能导致先前页变化、direction1、短段及保留无关DMA变化。
+actual AdminQ/data准备测试18417断言、actual gate/BAR适配器18552断言通过，
+均保留原ring回绕、失败、tail未commit等测试。
+新增读取后模拟guest描述符改变为非法类型的场景，
+确认实际data准备函数提交的是读取时已验证的原快照，没有再次读取该descriptor。
+硬件map/同步故障由harness注入；不能把这些mock断言当作所有硬件行为的证明。
+
+旧巨虚guest正常poweroff，两端QEMU EXIT0且VF恢复iavf后，
+用同配置启动新QEMU Garen4019166、Ezreal743223。
+guest正常启动/login，仍6.12.0-vanilla-vfio #26、HPET、0-3在线、4GiB两NUMA；
+每卡2queue RX512/TX128、RPS/XPS0，四个data vector精确绑定0/1/2/3。
+Garen无关worker-g4 PID6122保持，Lux未访问。
+
+新版本三轮6秒两worker/卡→Jinx，pattern/count/elapsed都通过：
+| TX MiB/s | round0 | round1 | round2 | median |
+| --- | ---: | ---: | ---: | ---: |
+| Garen单卡 | 881.250 | 715.157 | 885.486 | 881.250 |
+| Ezreal单卡 | 599.949 | 601.179 | 605.469 | 601.179 |
+| 双卡四worker总和 | 469.558 | 534.951 | 445.586 | 469.558 |
+
+与前一启动相比观测数字提高，但旧版本不同启动之间已经波动明显，
+且本轮重启了QEMU，尚没有相同二进制snapshot OFF/ON/OFF严格对照。
+不能把全部提升归因于此修改，也不宣称已线性扩展。
+Jinx两个IP仍共用一条物理10G；当前dual吞吐低于链路上限。
+
+并发RX每卡256MiB，CPU0/Garen耗时4.726859秒，
+CPU2/Ezreal5.768540秒，内容/计数正确；
+Jinx source对应4.719755/5.763526秒相符。
+这是功能验证，仍缺相同native RX性能对照。
+guest error级dmesg为空，两卡rx_errors/tx_errors均0。
+末尾Garen卡rx_dropped/tx_dropped均0，Ezreal卡rx_dropped31/tx_dropped0，
+未采每阶段前后差值，不能定位31个drop发生于配置、TX或RX，也不能宣称零丢包；
+TCP重传存在，按既定要求暂不以重传作为当前优化任务。
+
+新版本Garen24秒CPU采样（99Hz、DWARF8192、memfd、exclude_guest=1核实，
+live inode核实）：2594样本/26.202秒CPU权重，bad block0/script stderr空。
+DSM可见调用栈43.909%、VFIO不含上述DSM17.386%、RPC3.778%、OTHER34.927%。
+VFIO子类占全部host CPU：完成同步8.712%、提交准备5.359%、
+materialize0.925%、完整sync0.540%、其余1.850%。
+采样并发26秒双卡438.422MiB/s，与旧采样272.365不同，
+不能直接用前后占比变动声称性能收益/损失。
+本窗口unknown5.050%（VFIO叶unknown3.200%），仅QEMU线程host CPU，
+不包括guest CPU、阻塞等待及外部kernel worker，未独立核验零lost events。
+完成函数+0x3c5的热点由当前binary DWARF定位到loom-iavf.c:906，
+是每次同步检查所有TX描述符类型的循环。
+下一步先验证descriptor快照收益的严格对照，再设计减少重复完成检查，
+需要保证新提交验证、DMA写回、ring复用与失效的完整不变量；
+不能直接删除该检查或跳过完成发布。
+仍需解决单卡剩余成本、双卡非线性、RX性能及长期映射/reset验证。
+
+接收服务、RX source与perf任务已正常结束，memfd关闭，Jinx临时IP清理；
+新巨虚保持运行，未生成实验脚本、结果文件或新磁盘。
