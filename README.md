@@ -1615,3 +1615,52 @@ HPET 为 hpet；队列重配会重置设备统计，最终零 discard 不能证�
 buffer/staging 分配复用。临时探针、接收进程和 Jinx 地址均已清理。
 下一步继续查剩余 VT-d 页表元数据、队列同步和锁路径的关键成本，
 不因读取次数减少而将该试验默认开启。
+
+## host 执行位置与 RDMA 接收线程成本（2026-10-10）
+
+运行代码仍为 `6af87e7c27`，QI 成对读取关闭。24 秒 host-only CPU
+采样与 /proc 线程监测期间，Garen 单 VF→Jinx 三轮为
+141.01/140.39/136.13 MiB/s，内容/字节校验通过；采样窗口不作优化性能对照。
+
+线程 stat 扣除 guest_time 后，所监测线程累计 host 用户态 7.39 秒、
+内核态 19.78 秒，guest 执行另计约 8.01 秒，跨线程不能视为墙钟占比。
+本地 vCPU0/1 的 host CPU 分别 11.91/7.79 秒；主线程 1.46 秒，
+RDMA 接收辅助线程 4.96 秒。主要活跃线程 runqueue 等待约 0.75/11.50/
+3.69/0.66/7.03 ms，未发现秒级调度队列等待。wchan 是 20 Hz 近似快照，
+只能显示被采到的睡眠位置，不能据此计算完整等待时间。
+host-only cpu-clock:H 199 Hz/24 秒记录 35.382 MB memfd，Lost Samples=0；
+内核锁、syscall、DSM memcpy 等热点分散，未把锁函数采样等同于严重锁竞争。
+
+Garen/Ezreal 均为 192 个 host CPU、两物理 NUMA 节点：
+node0 为 0–47,96–143，node1 为 48–95,144–191。
+X710 0c:00.0 位于 node0，Garen DSM RDMA HCA ac:00.0 位于 node1。
+初始 QEMU 各线程 allowed mask 为 0–191，本地 vCPU 曾运行在 node1，
+因此 guest 的逻辑 owner-local 亲和性不保证 host 的物理设备局部性。
+
+同一次启动、无性能探针、每状态三个 6 秒样本，Garen 单卡两个 worker，
+guest CPU 0/1、guest IRQ、HPET、所有 QMP 开关不变：
+A 原 host mask 142.26/120.75/144.36，中位数 142.26；
+B vCPU0/1 固定 host CPU20/21、辅助线程22–27（node0），
+167.19/165.03/153.04，中位数 165.03；
+A2 恢复原 mask 157.58/144.23/156.47，中位数 156.47；
+C vCPU0/1 固定68/69、辅助70–75（node1），
+148.41/158.33/161.78，中位数 158.33。
+所有接收字节及内容校验通过。B 比 A/A2 观察约高 16.01%/5.47%，
+样本重叠、顺序与时间波动仍存在，不能宣称稳定 NUMA 因果收益。
+没有迁移已有内存或改 memory policy；结束时 numa_maps resident page
+统计 node1 1071560、node0 9700（4 KiB），设备与内存局部性存在权衡。
+全部 host 线程亲和性最终恢复 0–191，Garen libvirt VM 未改。
+
+进一步对 TID3415662 独立 12 秒、199 Hz host CPU/DWARF 采样，249 个样本、
+Lost Samples=0、memfd 1.160 MB，调用栈明确为 recv_thread_func。
+该线程运行样本约 75.10% 在 usleep 后的 nanosleep/定时器/调度调用链，
+并非说它睡眠占墙钟 75%。源码 migration/rdma-gvm.c 在空 CQ 时 usleep(10)，
+目前 ibv_create_cq 没有 completion channel。先前 24 秒该线程发生
+1848245 次 voluntary context switch。证据指向频繁空轮询的本地固定成本；
+尚未证明它造成主要单卡差距，也未用缺失 DSM fetch 认定无 DSM 成本。
+
+下一步检查事件驱动 CQ：arm 后再 drain 以免丢唤醒，区分发送/接收完成，
+保证 stop 可唤醒并先 join 后释放 CQ，提供旧轮询回退。先验证消息/停止语义，
+再比较 idle/active CPU 与同启动吞吐；不改 guest 或 HPET。
+最终 CPU 0–3 在线、hpet，两端 QMP pair=false，所检查 BUG/DMA/QI/TX timeout
+错误为空；采样进程、memfd、Jinx 接收端/临时地址已清理，host 未重启。
