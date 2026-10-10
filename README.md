@@ -2258,3 +2258,60 @@ Jinx 向两张 VF 各发送 256 MiB，guest owner 本地 CPU 接收，
 四条 128 MiB 连接的字节数与内容检查通过。
 已恢复原 iommu.strict=1 的启动配置，没有把该参数保留为优化，
 没有为了启用 lazy 关闭虚拟 IOMMU 的 caching-mode 或修改 guest。
+
+### 同一源码单机路径与巨虚的网卡对照（2026-10-11）
+
+当前内建 KVM 也保留不启用 DSM 的单机路径，不需要卸载模块或重启 host。
+QEMU system/vl.c 在没有 -local-cpu 时将 local_cpus 设为全部 smp.cpus；
+hw/i386/pc.c 仅在 local_cpus != smp.cpus 且无 shm_path 时启用 DSM。
+内存访问同样按该条件选择 DSM ioctl 或本地 memmove。
+单机实测可以正常启动并登录。这里是同一份修改版 QEMU/KVM 的单机对照，
+不是未经修改的 upstream KVM 基线；CONFIG_KVM=y 当前仍不能卸载。
+
+测试都使用 Garen 的同一个 X710 VF 0000:0c:02.0，QEMU 9.0.90、
+host 6.6.32-krdma+、同一个 guest #26、同一个已有根镜像、
+4 vCPU / 4 GiB / 两个 2 GiB NUMA node、HPET。
+保留 VFIO x-no-mmap、x-no-kvm-msi、x-no-kvm-msix、2 queues、
+RX512/TX128、RPS/XPS=0 和 IRQ0-1。
+两个 worker 固定 guest CPU0/1，通过 enp0s7 向 Jinx 198.18.10.3 发送；
+接收端固定 host CPU4-7，验证每条 TCP 连接的字节数和内容。
+每轮约 6 秒，六轮，吞吐是应用数据 MiB/s，不是线速字节计数。
+性能窗口无探针。host QEMU CPU/memory placement 没有额外 NUMA 绑定。
+
+| 模式 | 六轮中位数 MiB/s |
+| --- | ---: |
+| 巨虚：严格 owner vIOMMU，测试前 | 196.309 |
+| 同源码单机：严格普通 vIOMMU | 364.575 |
+| 同源码单机：不配置 vIOMMU | 1121.584 |
+| 恢复巨虚：严格 owner vIOMMU | 198.727 |
+
+原始六轮：
+GVM 前 [177.795,188.640,193.348,202.652,214.352,199.270]；
+单机 vIOMMU [367.952,370.440,366.287,362.654,362.863,315.376]；
+单机无 vIOMMU [1121.811,1121.526,1121.641,1121.368,1119.284,1122.100]；
+GVM 恢复 [207.373,192.249,205.204,221.839,185.862,187.963]。
+
+严格单机配置保留 intel-iommu,caching-mode=on,intremap=off 和
+intel_iommu=on iommu.strict=1。
+无 vIOMMU 参考只移除 intel-iommu 设备并用 intel_iommu=off；
+guest sysfs IOMMU groups 为空，HPET 和所有 4 CPU 保持。
+单机只有一张 VF/一块数据盘，巨虚仍呈现两端设备，但本轮只给 owner0 发流量。
+因此对照不能把全部差距归因于某一个模块或纯 DSM。
+
+独立的 20 秒计数窗口按单机 QEMU PID 过滤：
+kvm_vm_ioctl_dsm 0 次，VFIO MAP/UNMAP 各 1659539 次，证明收发走单机路径。
+计数窗口吞吐不纳入上表。所有无探针测试的接收字节和内容校验通过。
+两次单机 VM 均正常关机退出 0，VF 恢复到 iavf，模块引用归零；
+随后恢复两端巨虚，双卡 ping 3/3 通过，CPU0-3 在线、HPET、
+iommu.strict=1 保持，guest error 级 dmesg 为空。
+初始直接启动因关机 wrapper 已恢复 VF 驱动而缺少 /dev/vfio group；
+确认进程已退出后才按原 wrapper 的绑定/恢复流程启动，没有动 PF。
+Garen 的 libvirt worker-g4 PID6122 保持；Lux 未使用；
+临时 Jinx sink 和地址已清理，未产生实验脚本、日志、磁盘或 pcap 文件。
+
+结论：严格虚拟 IOMMU 的动态映射/失效在本机也有显著成本，
+但不是巨虚剩余差距的唯一来源；还需区分暂存缓冲区、同步、元数据与 DSM。
+不能直接给当前巨虚去掉 vIOMMU：当前暂存区注册依赖 IOMMU 通知。
+后续应检查是否能将 owner 本地 DMA 暂存和数据队列同步与虚拟 IOMMU 解耦，
+或建立不启用 DSM 的本地暂存对照，以定位暂存层的独立成本。
+尚未实现或验证这些替代路径，不关闭现有失效机制或把 DMA 直接指向 DSM 页。
