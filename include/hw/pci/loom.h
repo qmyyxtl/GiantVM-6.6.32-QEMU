@@ -55,6 +55,13 @@ bool loom_pci_config_will_reset(PCIDevice *dev, uint32_t addr,
                                 uint32_t value, unsigned len);
 
 #define LOOM_DIRECTORY_CHUNK 3000
+#define LOOM_DIRECTORY_UPDATE_SIZE 448
+int loom_pci_directory_push(unsigned peer, uint64_t serial, unsigned device_id,
+                            const void *data, unsigned size);
+int loom_pci_directory_update_dispatch(unsigned peer, unsigned device_id,
+                                       const void *data, unsigned size);
+void loom_pci_directory_ack_dispatch(unsigned peer, uint64_t serial,
+                                      int status);
 int loom_pci_directory_rpc(int owner, uint32_t offset, void *buffer, uint32_t size);
 void loom_pci_directory_dispatch(uint32_t offset, void *buffer, uint32_t size,
                                  int *status);

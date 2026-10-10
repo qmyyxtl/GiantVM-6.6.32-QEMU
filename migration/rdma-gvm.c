@@ -1,3 +1,5 @@
+#include "qemu/osdep.h"
+#include "qemu/rcu.h"
 #include "rdma-gvm.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +54,20 @@ typedef struct {
     pthread_mutex_t response_lock;
 } rdma_conn_t;
 
+typedef struct router_work {
+    rdma_msg_header_t hdr;
+    void *data;
+    struct router_work *next;
+} router_work_t;
+
+typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t ready;
+    router_work_t *head, *tail;
+    unsigned queued;
+    pthread_t thread;
+} router_worker_t;
+
 // 全局上下文
 static struct {
     int local_id;
@@ -64,12 +80,14 @@ static struct {
     rdma_conn_t **reply_for_recv_conns;    // 发送对请求的回复
     
     pthread_t *recv_threads;
+    router_worker_t *workers;
     bool running;
 } g_ctx;
 
 // 消息处理回调
 typedef int (*msg_handler_t)(int peer_id, rdma_msg_header_t *hdr, void *data);
 static msg_handler_t g_msg_handler = NULL;
+static msg_handler_t g_control_handler;
 
 // 前向声明
 static int create_connection(const char *host, int port, struct rdma_cm_id *server_cm_id, rdma_conn_t **out_conn);
@@ -77,6 +95,7 @@ static int post_all_recvs(rdma_conn_t *conn);
 static int rdma_send_msg(rdma_conn_t *conn, rdma_msg_header_t *hdr, const void *data);
 static int rdma_wait_completion(rdma_conn_t *conn, struct ibv_wc *wc);
 static void* recv_thread_func(void *arg);
+static void *request_worker_func(void *arg);
 
 // ============ 初始化 ============
 int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
@@ -92,6 +111,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
     g_ctx.recv_conns = calloc(total_nodes, sizeof(rdma_conn_t*));
     g_ctx.reply_for_recv_conns = calloc(total_nodes, sizeof(rdma_conn_t*));
     g_ctx.recv_threads = calloc(total_nodes, sizeof(pthread_t));
+    g_ctx.workers = calloc(total_nodes, sizeof(*g_ctx.workers));
     
     // ========== 创建所有 listener ==========
     struct rdma_cm_id ***listeners = calloc(total_nodes, sizeof(struct rdma_cm_id**));
@@ -432,9 +452,21 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
     for (int i = 0; i < total_nodes; i++) {
         if (i == local_id) continue;
         
+        router_worker_t *worker = &g_ctx.workers[i];
+        pthread_mutex_init(&worker->lock, NULL);
+        pthread_cond_init(&worker->ready, NULL);
+        int *work_peer = malloc(sizeof(int));
+        *work_peer = i;
+        if (pthread_create(&worker->thread, NULL, request_worker_func,
+                           work_peer)) {
+            return -1;
+        }
         int *peer_id = malloc(sizeof(int));
         *peer_id = i;
-        pthread_create(&g_ctx.recv_threads[i], NULL, recv_thread_func, peer_id);
+        if (pthread_create(&g_ctx.recv_threads[i], NULL, recv_thread_func,
+                           peer_id)) {
+            return -1;
+        }
     }
     
     debugf("[RDMA Router] Initialization complete\n");
@@ -669,6 +701,44 @@ static int rdma_wait_completion(rdma_conn_t *conn, struct ibv_wc *wc)
 
 // ============ 接收线程 ============
 
+/*
+ * Keep normal requests FIFO per peer, but never block control reception on
+ * a model callback, BQL acquisition, or a nested RPC in that callback.
+ */
+static void *request_worker_func(void *arg)
+{
+    int peer = *(int *)arg;
+    router_worker_t *worker = &g_ctx.workers[peer];
+
+    free(arg);
+    rcu_register_thread();
+    for (;;) {
+        router_work_t *work;
+        pthread_mutex_lock(&worker->lock);
+        while (g_ctx.running && !worker->head) {
+            pthread_cond_wait(&worker->ready, &worker->lock);
+        }
+        if (!g_ctx.running) {
+            pthread_mutex_unlock(&worker->lock);
+            break;
+        }
+        work = worker->head;
+        worker->head = work->next;
+        worker->queued--;
+        if (!worker->head) {
+            worker->tail = NULL;
+        }
+        pthread_mutex_unlock(&worker->lock);
+        if (g_msg_handler) {
+            g_msg_handler(peer, &work->hdr, work->data);
+        }
+        free(work->data);
+        free(work);
+    }
+    rcu_unregister_thread();
+    return NULL;
+}
+
 static void* recv_thread_func(void *arg)
 {
     int peer_id = *(int*)arg;
@@ -738,13 +808,32 @@ static void* recv_thread_func(void *arg)
             
             // 🔑 现在可以慢慢处理消息了（使用副本）
             debugf("[RDMA Router] Handling message from peer %d\n", peer_id);
-            if (g_msg_handler) {
-                g_msg_handler(peer_id, &hdr_copy, data_copy);
-            }
-            
-            // 释放临时缓冲区
-            if (data_copy) {
+            if (g_control_handler &&
+                g_control_handler(peer_id, &hdr_copy, data_copy)) {
                 free(data_copy);
+            } else {
+                router_worker_t *worker = &g_ctx.workers[peer_id];
+                router_work_t *work = calloc(1, sizeof(*work));
+                if (!work) {
+                    fprintf(stderr, "[RDMA] request queue allocation failed\n");
+                    abort();
+                }
+                work->hdr = hdr_copy;
+                work->data = data_copy;
+                pthread_mutex_lock(&worker->lock);
+                if (worker->queued == RDMA_BUFFER_COUNT) {
+                    fprintf(stderr, "[RDMA] request queue exhausted\n");
+                    abort();
+                }
+                worker->queued++;
+                if (worker->tail) {
+                    worker->tail->next = work;
+                } else {
+                    worker->head = work;
+                }
+                worker->tail = work;
+                pthread_cond_signal(&worker->ready);
+                pthread_mutex_unlock(&worker->lock);
             }
         }
     }
@@ -863,6 +952,27 @@ int rdma_router_send_request(int target_id, uint16_t msg_type,
                             resp_data, MAX_MSG_DATA_SIZE, resp_len, 30000);
 }
 
+int rdma_router_notify(int target_id, uint16_t type, const void *data,
+                       size_t len)
+{
+    rdma_conn_t *conn;
+    rdma_msg_header_t hdr;
+
+    if (target_id < 0 || target_id >= g_ctx.total_nodes ||
+        len > MAX_MSG_DATA_SIZE || (len && !data)) {
+        return -EINVAL;
+    }
+    conn = g_ctx.request_conns[target_id];
+    if (!conn) {
+        return -ENOTCONN;
+    }
+    hdr = (rdma_msg_header_t) {
+        .msg_type = type, .flags = 1, .data_len = len,
+        .sequence = __sync_fetch_and_add(&conn->next_seq, 1),
+    };
+    return rdma_send_msg(conn, &hdr, data) < 0 ? -EIO : 0;
+}
+
 int rdma_router_send_response(int peer_id, uint16_t msg_type, uint64_t sequence,
                                const void *data, size_t len)
 {
@@ -884,7 +994,20 @@ void rdma_router_cleanup(void)
     
     for (int i = 0; i < g_ctx.total_nodes; i++) {
         if (i != g_ctx.local_id) {
+            router_worker_t *worker = &g_ctx.workers[i];
+            pthread_mutex_lock(&worker->lock);
+            pthread_cond_broadcast(&worker->ready);
+            pthread_mutex_unlock(&worker->lock);
             pthread_join(g_ctx.recv_threads[i], NULL);
+            pthread_join(worker->thread, NULL);
+            while (worker->head) {
+                router_work_t *work = worker->head;
+                worker->head = work->next;
+                free(work->data);
+                free(work);
+            }
+            pthread_cond_destroy(&worker->ready);
+            pthread_mutex_destroy(&worker->lock);
         }
     }
     
@@ -895,4 +1018,8 @@ void rdma_router_cleanup(void)
 void rdma_router_set_handler(msg_handler_t handler)
 {
     g_msg_handler = handler;
+}
+void rdma_router_set_control_handler(msg_handler_t handler)
+{
+    g_control_handler = handler;
 }

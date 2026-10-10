@@ -53,6 +53,8 @@ enum forward_type {
     LOOM_DIRECTORY,
     LOOM_INTX,
     LOOM_MSI,
+    LOOM_DIRECTORY_UPDATE,
+    LOOM_DIRECTORY_ACK,
 };
 
 
@@ -64,6 +66,88 @@ typedef struct LoomDirectoryResponse {
     uint32_t size;
     uint8_t data[LOOM_DIRECTORY_CHUNK];
 } LoomDirectoryResponse;
+
+typedef struct LoomDirectoryUpdate {
+    uint64_t serial;
+    uint32_t device_id, size;
+    uint8_t data[LOOM_DIRECTORY_UPDATE_SIZE];
+} LoomDirectoryUpdate;
+
+typedef struct LoomDirectoryAck {
+    uint64_t serial;
+    int32_t status;
+    uint32_t reserved;
+} LoomDirectoryAck;
+
+static int loom_notify(unsigned peer, uint16_t type, const void *payload,
+                        size_t size)
+{
+    uint8_t data[MAX_MSG_DATA_SIZE];
+    int32_t cpu = CPU_INDEX_ANY;
+
+    if (size > sizeof(data) - sizeof(cpu)) {
+        return -EMSGSIZE;
+    }
+    memcpy(data, &cpu, sizeof(cpu));
+    memcpy(data + sizeof(cpu), payload, size);
+    return rdma_router_notify(peer, type, data, size + sizeof(cpu));
+}
+
+/* Runs directly in the CQ receive thread, never under the BQL. */
+static int handle_directory_control(int peer, rdma_msg_header_t *hdr,
+                                    void *data)
+{
+    uint8_t *payload = data;
+    if (hdr->msg_type != LOOM_DIRECTORY_UPDATE &&
+        hdr->msg_type != LOOM_DIRECTORY_ACK) {
+        return 0;
+    }
+    if (!loom_pci_enabled() || hdr->flags != 1 ||
+        hdr->data_len < sizeof(int32_t)) {
+        error_report("Loom PCI: malformed directory control message");
+        exit(EXIT_FAILURE);
+    }
+    payload += sizeof(int32_t);
+    if (hdr->msg_type == LOOM_DIRECTORY_UPDATE) {
+        LoomDirectoryUpdate update;
+        LoomDirectoryAck ack = { 0 };
+        if (hdr->data_len != sizeof(int32_t) + sizeof(update)) {
+            error_report("Loom PCI: malformed directory update");
+            exit(EXIT_FAILURE);
+        }
+        memcpy(&update, payload, sizeof(update));
+        ack.serial = update.serial;
+        ack.status = loom_pci_directory_update_dispatch(peer, update.device_id,
+                                                       update.data,
+                                                       update.size);
+        if (loom_notify(peer, LOOM_DIRECTORY_ACK, &ack, sizeof(ack)) < 0) {
+            error_report("Loom PCI: directory acknowledgement failed");
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        LoomDirectoryAck ack;
+        if (hdr->data_len != sizeof(int32_t) + sizeof(ack)) {
+            error_report("Loom PCI: malformed directory acknowledgement");
+            exit(EXIT_FAILURE);
+        }
+        memcpy(&ack, payload, sizeof(ack));
+        loom_pci_directory_ack_dispatch(peer, ack.serial, ack.status);
+    }
+    return 1;
+}
+
+int loom_pci_directory_push(unsigned peer, uint64_t serial, unsigned device_id,
+                            const void *data, unsigned size)
+{
+    LoomDirectoryUpdate update = {
+        .serial = serial, .device_id = device_id, .size = size,
+    };
+    if (size != sizeof(update.data)) {
+        return -EINVAL;
+    }
+    memcpy(update.data, data, size);
+    return loom_notify(peer, LOOM_DIRECTORY_UPDATE, &update, sizeof(update));
+}
 
 QemuMutex ipi_mutex;
 QemuMutex io_forwarding_mutex;
@@ -248,7 +332,10 @@ static int handle_incoming_message(int peer_id, rdma_msg_header_t *hdr, void *da
         void *mmio_data = ptr;
         
         /* 执行 MMIO */
-        address_space_rw(&address_space_memory, addr, attrs, mmio_data, len, is_write);
+        if (!loom_pci_handle_mmio(addr, attrs, mmio_data, len, is_write)) {
+            address_space_rw(&address_space_memory, addr, attrs,
+                             mmio_data, len, is_write);
+        }
         
         /* 如果是读操作，需要回复 */
         if (!is_write && hdr->flags == 0) {
@@ -463,6 +550,7 @@ void start_io_router(void)
     
     /* 设置消息处理回调 */
     rdma_router_set_handler(handle_incoming_message);
+    rdma_router_set_control_handler(handle_directory_control);
     
     /* 初始化 RDMA 路由器 */
     int ret = rdma_router_init(ms->local_cpu_start_index / ms->local_cpus,

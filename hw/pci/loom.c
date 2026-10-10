@@ -25,7 +25,7 @@
 #define LOOM_MAX_DEVICES 64
 #define LOOM_MAX_NODES 4
 #define LOOM_DIRECTORY_MAGIC 0x4c4f4f4d50434931ULL
-#define LOOM_DIRECTORY_VERSION 2
+#define LOOM_DIRECTORY_VERSION 3
 
 typedef struct LoomBAR {
     uint64_t address;
@@ -67,6 +67,19 @@ typedef struct LoomRemotePCI {
 } LoomRemotePCI;
 
 static LoomPCINode *directory;
+/* Incoming publication has its own lock: the CQ receiver never needs BQL. */
+static LoomPCINode *incoming_directory;
+static bool incoming_valid[LOOM_MAX_NODES][LOOM_MAX_DEVICES];
+static QemuMutex directory_lock;
+static QemuCond directory_changed;
+static uint64_t publication_serial;
+static uint64_t expected_ack[LOOM_MAX_NODES], received_ack[LOOM_MAX_NODES];
+static int ack_status[LOOM_MAX_NODES];
+static bool directory_control_active;
+static uint64_t directory_epoch, applied_directory_epoch;
+static void publish_directory_update(unsigned index);
+static void snapshot(LoomPCIDescriptor *src, LoomPCIDescriptor *dst);
+
 static PCIDevice *owned[LOOM_MAX_DEVICES];
 static uint32_t owned_generation[LOOM_MAX_DEVICES];
 static unsigned owned_reset_depth[LOOM_MAX_DEVICES];
@@ -78,6 +91,8 @@ G_STATIC_ASSERT(sizeof(LoomPCIDescriptor) == 4288);
 /* Only this prefix changes BAR mappings. Extended config reads use owner RPC. */
 #define LOOM_DESCRIPTOR_PREFIX \
     (offsetof(LoomPCIDescriptor, config) + PCI_CONFIG_SPACE_SIZE)
+
+G_STATIC_ASSERT(LOOM_DESCRIPTOR_PREFIX == LOOM_DIRECTORY_UPDATE_SIZE);
 
 bool loom_pci_enabled(void)
 {
@@ -152,6 +167,7 @@ void loom_pci_reset_begin(PCIDevice *dev)
      */
     qatomic_store_release(&directory[local_node].devices[i].sequence,
                           qatomic_read(&directory[local_node].devices[i].sequence) | 1);
+    publish_directory_update(i);
 }
 
 void loom_pci_reset_end(PCIDevice *dev)
@@ -217,8 +233,13 @@ void loom_pci_intx_dispatch(const LoomPCIRequest *req)
 {
     bool locked = bql_locked();
     LoomPCIDescriptor *d = descriptor(req->device_id);
+    LoomPCIDescriptor current;
     PCIDevice *dev;
 
+    if (d && req->device_id / LOOM_MAX_DEVICES != local_node) {
+        snapshot(d, &current);
+        d = &current;
+    }
     if (!d || local_node != 0 || req->operation != LOOM_PCI_INTX ||
         req->device_id / LOOM_MAX_DEVICES == local_node ||
         req->generation != d->generation || req->bar >= PCI_NUM_PINS ||
@@ -238,8 +259,10 @@ void loom_pci_intx_dispatch(const LoomPCIRequest *req)
     }
 }
 
-/* The owner serializes snapshots with its BQL. No shared host pointers or
- * remote atomics are assumed. Refresh the mapping prefix on each access.
+/*
+ * Startup pulls full descriptors. Runtime prefixes are published by the
+ * owner and acknowledged before its control operation completes. Neither
+ * shared host pointers nor cross-host atomic memory accesses are assumed.
  */
 static void directory_read(unsigned owner, unsigned offset,
                            void *buffer, unsigned length)
@@ -266,7 +289,28 @@ static void snapshot(LoomPCIDescriptor *src, LoomPCIDescriptor *dst)
     }
     *dst = *src;
     if (owner != local_node) {
-        directory_read(owner, offset, dst, LOOM_DESCRIPTOR_PREFIX);
+        if (qatomic_load_acquire(&directory_control_active)) {
+            unsigned index = (offset - offsetof(LoomPCINode, devices)) /
+                             sizeof(LoomPCIDescriptor);
+            int64_t deadline = g_get_monotonic_time() + 5000000;
+            qemu_mutex_lock(&directory_lock);
+            while (incoming_valid[owner][index] &&
+                   (incoming_directory[owner].devices[index].sequence & 1)) {
+                if (g_get_monotonic_time() >= deadline) {
+                    qemu_mutex_unlock(&directory_lock);
+                    fatal_error("owner reset publication timed out");
+                }
+                qemu_cond_timedwait(&directory_changed, &directory_lock, 100);
+            }
+            if (!incoming_valid[owner][index]) {
+                qemu_mutex_unlock(&directory_lock);
+                fatal_error("missing owner control snapshot");
+            }
+            *dst = incoming_directory[owner].devices[index];
+            qemu_mutex_unlock(&directory_lock);
+        } else {
+            directory_read(owner, offset, dst, LOOM_DESCRIPTOR_PREFIX);
+        }
         *src = *dst;
     }
     if (!locked) {
@@ -274,6 +318,98 @@ static void snapshot(LoomPCIDescriptor *src, LoomPCIDescriptor *dst)
     }
     if (dst->sequence & 1) {
         fatal_error("device reset snapshot unavailable; aggregate must stop");
+    }
+}
+
+/* These functions execute on the independent receive/control path. */
+int loom_pci_directory_update_dispatch(unsigned peer, unsigned device_id,
+                                       const void *data, unsigned size)
+{
+    unsigned index = device_id % LOOM_MAX_DEVICES;
+    LoomPCIDescriptor update = { 0 };
+    LoomPCIDescriptor *cached;
+
+    if (!directory || peer >= node_count || peer == local_node ||
+        device_id / LOOM_MAX_DEVICES != peer ||
+        size != LOOM_DESCRIPTOR_PREFIX) {
+        return -EINVAL;
+    }
+    memcpy(&update, data, size);
+    if ((update.config_size != PCI_CONFIG_SPACE_SIZE &&
+         update.config_size != PCIE_CONFIG_SPACE_SIZE) ||
+        update.bdf >= ARRAY_SIZE(root_bus->devices)) {
+        return -EINVAL;
+    }
+    qemu_mutex_lock(&directory_lock);
+    cached = &incoming_directory[peer].devices[index];
+    if (!incoming_valid[peer][index] || update.sequence >= cached->sequence) {
+        memcpy(cached, &update, size);
+        incoming_valid[peer][index] = true;
+        qatomic_inc(&directory_epoch);
+        qemu_cond_broadcast(&directory_changed);
+    }
+    qemu_mutex_unlock(&directory_lock);
+    return 0;
+}
+
+void loom_pci_directory_ack_dispatch(unsigned peer, uint64_t serial, int status)
+{
+    if (!directory || peer >= node_count || peer == local_node) {
+        return;
+    }
+    qemu_mutex_lock(&directory_lock);
+    if (serial == expected_ack[peer]) {
+        received_ack[peer] = serial;
+        ack_status[peer] = status;
+        qemu_cond_broadcast(&directory_changed);
+    }
+    qemu_mutex_unlock(&directory_lock);
+}
+
+static void publish_directory_update(unsigned index)
+{
+    LoomPCIDescriptor update;
+    uint64_t serial;
+
+    if (!qatomic_load_acquire(&directory_control_active)) {
+        return;
+    }
+    assert(bql_locked());
+    if (publication_serial == UINT64_MAX) {
+        fatal_error("directory publication serial exhausted");
+    }
+    serial = ++publication_serial;
+    memcpy(&update, &directory[local_node].devices[index],
+           LOOM_DESCRIPTOR_PREFIX);
+    for (unsigned peer = 0; peer < node_count; peer++) {
+        int64_t deadline;
+        int status;
+        if (peer == local_node) {
+            continue;
+        }
+        qemu_mutex_lock(&directory_lock);
+        expected_ack[peer] = serial;
+        received_ack[peer] = 0;
+        qemu_mutex_unlock(&directory_lock);
+        if (loom_pci_directory_push(peer, serial,
+                                    local_node * LOOM_MAX_DEVICES + index,
+                                    &update, LOOM_DESCRIPTOR_PREFIX) < 0) {
+            fatal_error("directory publication failed; aggregate must stop");
+        }
+        deadline = g_get_monotonic_time() + 5000000;
+        qemu_mutex_lock(&directory_lock);
+        while (received_ack[peer] != serial) {
+            if (g_get_monotonic_time() >= deadline) {
+                qemu_mutex_unlock(&directory_lock);
+                fatal_error("directory acknowledgement timed out");
+            }
+            qemu_cond_timedwait(&directory_changed, &directory_lock, 100);
+        }
+        status = ack_status[peer];
+        qemu_mutex_unlock(&directory_lock);
+        if (status) {
+            fatal_error("peer rejected directory publication");
+        }
     }
 }
 
@@ -338,6 +474,7 @@ void loom_pci_publish(PCIDevice *dev)
         d->bars[bar].type = dev->io_regions[bar].type;
     }
     qatomic_store_release(&d->sequence, sequence + 1);
+    publish_directory_update(i);
 }
 
 static void collect_device(PCIBus *bus, PCIDevice *dev, void *opaque)
@@ -379,7 +516,10 @@ void loom_pci_prepare(void)
         fatal_error("initial implementation requires one PCI root bus numbered zero");
     }
     root_bus = host->bus;
+    qemu_mutex_init(&directory_lock);
+    qemu_cond_init(&directory_changed);
     directory = g_new0(LoomPCINode, node_count);
+    incoming_directory = g_new0(LoomPCINode, node_count);
     directory[local_node].magic = LOOM_DIRECTORY_MAGIC;
     directory[local_node].version = LOOM_DIRECTORY_VERSION;
     pci_for_each_device_under_bus(root_bus, collect_device, NULL);
@@ -405,6 +545,12 @@ static void execute(unsigned owner, LoomPCIRequest *req, LoomPCIResponse *resp)
     }
     if (resp->status || (resp->generation != req->generation &&
                          req->operation != LOOM_PCI_CONFIG_WRITE)) {
+        error_report("Loom PCI: rejected owner=%u device=%u operation=%u "
+                     "bar=%u offset=0x%" PRIx64 " status=%d "
+                     "requested_generation=%u returned_generation=%u",
+                     owner, req->device_id, req->operation, req->bar,
+                     req->offset, resp->status, req->generation,
+                     resp->generation);
         fatal_error("owner rejected device access");
     }
 }
@@ -454,6 +600,11 @@ static uint64_t remote_bar_read(void *opaque, hwaddr offset, unsigned size)
     LoomRemotePCI *s = ctx->device;
     LoomPCIDescriptor current;
     snapshot(descriptor(s->device_id), &current);
+    if (current.bars[ctx->bar].address == PCI_BAR_UNMAPPED ||
+        current.bars[ctx->bar].address !=
+        s->parent_obj.io_regions[ctx->bar].addr) {
+        return UINT64_MAX;
+    }
     s->generation = current.generation;
     LoomPCIRequest req = {
         .operation = LOOM_PCI_BAR_READ,
@@ -472,6 +623,11 @@ static void remote_bar_write(void *opaque, hwaddr offset,
     LoomRemotePCI *s = ctx->device;
     LoomPCIDescriptor current;
     snapshot(descriptor(s->device_id), &current);
+    if (current.bars[ctx->bar].address == PCI_BAR_UNMAPPED ||
+        current.bars[ctx->bar].address !=
+        s->parent_obj.io_regions[ctx->bar].addr) {
+        return;
+    }
     s->generation = current.generation;
     LoomPCIRequest req = {
         .operation = LOOM_PCI_BAR_WRITE,
@@ -592,7 +748,30 @@ void loom_pci_bootstrap(void)
                 fatal_error("invalid PCI configuration size");
             }
             ids[bdf] = owner * LOOM_MAX_DEVICES + index;
+            if (owner != local_node) {
+                qemu_mutex_lock(&directory_lock);
+                LoomPCIDescriptor *cached =
+                    &incoming_directory[owner].devices[index];
+                if (!incoming_valid[owner][index] ||
+                    cached->sequence <= d->sequence) {
+                    *cached = *d;
+                } else {
+                    /*
+                     * Preserve a newer control prefix received during the
+                     * initial RPC, while filling immutable extended config.
+                     */
+                    memcpy(cached->config + PCI_CONFIG_SPACE_SIZE,
+                           d->config + PCI_CONFIG_SPACE_SIZE,
+                           PCIE_CONFIG_SPACE_SIZE - PCI_CONFIG_SPACE_SIZE);
+                }
+                incoming_valid[owner][index] = true;
+                qemu_mutex_unlock(&directory_lock);
+            }
         }
+    }
+    qatomic_store_release(&directory_control_active, true);
+    for (index = 0; index < owned_count; index++) {
+        publish_directory_update(index);
     }
     for (bdf = 0; bdf < ARRAY_SIZE(ids); bdf++) {
         unsigned id;
@@ -733,8 +912,17 @@ static void refresh_remote_mappings(void)
 {
     unsigned owner, index;
     bool locked = bql_locked();
+    uint64_t epoch;
     if (!locked) {
         bql_lock();
+    }
+    epoch = qatomic_read(&directory_epoch);
+    if (qatomic_load_acquire(&directory_control_active) &&
+        epoch == applied_directory_epoch) {
+        if (!locked) {
+            bql_unlock();
+        }
+        return;
     }
     for (owner = 0; owner < node_count; owner++) {
         if (owner == local_node) {
@@ -751,6 +939,7 @@ static void refresh_remote_mappings(void)
             }
         }
     }
+    applied_directory_epoch = epoch;
     if (!locked) {
         bql_unlock();
     }
@@ -814,8 +1003,9 @@ static bool bar_access(hwaddr addr, bool io, uint8_t *data,
         return true;
     }
 
-    /* Keep remote mapping/reset validation until control-plane invalidation
-     * replaces polling. Unknown addresses cannot safely use a stale proxy.
+    /*
+     * Owner control operations publish and acknowledge new prefixes.
+     * Apply changed proxy mappings locally; no directory RPC on data access.
      */
     refresh_remote_mappings();
     for (owner = 0; owner < node_count; owner++) {

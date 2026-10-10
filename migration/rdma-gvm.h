@@ -34,6 +34,10 @@ int rdma_router_call(int target_id, uint16_t msg_type,
                       void *resp_data, size_t resp_capacity, size_t *resp_len,
                       unsigned timeout_ms);
 
+/* One-way control messages bypass the ordinary response-CQ lock. */
+int rdma_router_notify(int target_id, uint16_t type, const void *data,
+                       size_t len);
+
 // 发送响应
 int rdma_router_send_response(int peer_id, uint16_t msg_type, uint64_t sequence,
                                const void *data, size_t len);
@@ -43,6 +47,8 @@ typedef int (*msg_handler_t)(int peer_id, rdma_msg_header_t *hdr, void *data);
 
 // 设置消息处理回调
 void rdma_router_set_handler(msg_handler_t handler);
+/* Return 1 for a consumed control message. Must not acquire the BQL or RPC. */
+void rdma_router_set_control_handler(msg_handler_t handler);
 
 // 清理
 void rdma_router_cleanup(void);

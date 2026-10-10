@@ -1,6 +1,6 @@
 # GiantVM 6.6.32 — RDMA QEMU
 
-本仓库保存与 [RDMA KVM](https://github.com/qmyyxtl/GiantVM-6.6.32-KVM)
+本仓库保存与 [RDMA KVM](https://github.com/xue-123-song/GVM-kernel/tree/device-aggregation)
 配套的 GiantVM QEMU，基于 **QEMU 9.0.90**。
 两台物理机上的 QEMU 协同运行一个 guest OS，guest 看到跨端 CPU，
 以及各有 owner 的独立 PCI 设备。两块盘仍是 disk1、disk2，不合并为逻辑卷。
@@ -31,8 +31,8 @@
 其余依赖依 configure 检查与启用功能补齐。
 
 ```bash
-git clone git@github.com:qmyyxtl/GiantVM-6.6.32-QEMU.git
-cd GiantVM-6.6.32-QEMU
+git clone -b device-aggregation git@github.com:xue-123-song/GVM-qemu.git
+cd GVM-qemu
 mkdir -p build
 cd build
 ../configure --target-list=x86_64-softmmu --enable-kvm --enable-vnc --disable-werror
@@ -40,7 +40,7 @@ ninja -j8 qemu-system-x86_64
 ./qemu-system-x86_64 --version
 ```
 
-本次整理只验证源码和文档状态，没有重新构建或重启现有实例。
+历史整理记录与后续原 origin 上的开发记录分别保留；当前构建和验证见末尾。
 
 ## 两端启动
 
@@ -184,3 +184,62 @@ worker 在对应 owner CPU 上固定后首触缓冲区；使用既有 1 GiB raw 
 Ezreal 盘，数据校验通过。Garen 盘 req.0/1 分别在远端 CPU2/3 增加
 902/857 次中断；Ezreal 盘 req.2/3 分别在远端 CPU0/1 增加 754/768 次中断。
 该短测用于验证路由正确性，缓冲区处于远端，不能作为本地吞吐对照。
+
+## 2026-10-10：将目录更新移到控制面
+
+运行时不再为每次 BAR/非 PCI 访问拉取远端设备目录。owner 在 PCI 配置写入、
+BAR 重配置和 reset 中发布 448 字节前缀，并在控制操作返回前等待所有 peer 确认。
+启动时仍用目录 RPC 拉取完整描述符；协议版本升为 3，所有节点必须一起更新。
+扩展配置读取仍使用 owner RPC，与原来的转发契约一致。
+
+- 目录更新和确认直接由 RDMA 接收线程处理，只获取目录缓存锁，不获取 BQL。
+  普通请求由每个 peer 的 FIFO 工作线程处理并注册 RCU；队列最多 1024 项。
+  控制通知绕开普通 response-CQ 锁，避免配置 RPC 中的反向确认互等。
+- reset 开始发布 odd sequence，结束发布新的 generation/even sequence；
+  快照等待稳定前缀。确认或 reset 发布超过 5 秒未完成时停止聚合，
+  不重试结果未知的 I/O；这不是节点故障后的持续可用机制。
+- 收到更新后增加本地 epoch，代理映射只在 epoch 改变时刷新。
+  普通跨端 MMIO 转发也先走聚合路由；代理回调拒绝失效的旧 BAR 地址，
+  INTx 使用已发布的 generation，避免接收新 generation 后仍检查旧描述符。
+- `86812dc787` 单独修正远端 vCPU 占位线程的 pause/resume 状态。
+  这类线程不执行 guest；本节点无需等待它消费 vCPU halt_cond。
+  普通 CPU 的处理保持原样。
+
+验证使用同一个 `6.12.0-vanilla-vfio #20` guest，没有修改 host/guest 内核、
+guest 驱动或 DSM 协议。已通过两端 CPU 对两端未绑定驱动的 EDU 做 BAR
+重定位、新地址寄存器读写、旧地址失效及恢复；两端并发各五次重配置通过。
+两端 stop/cont、整机 reset 后重新登录通过；普通四 vCPU TCG 配置的
+stop/cont/reset/退出也通过，后者仅验证通用控制逻辑，不是普通 KVM 性能对照。
+
+包含重配置和双盘读的 15 秒探针窗口中，两端各发布 51 次控制更新，
+处理 3029/2959 次磁盘队列通知；HPET 访问合计 135089 次，另有串口访问。
+两端目录 RPC 均为 0。PCI 设备的实际远端访问和 slave 的 HPET owner 转发
+仍按原契约执行，不能将目录 RPC 归零解释为所有跨端 I/O RPC 归零。
+
+沿用前节 1 MiB 顺序读、单盘两 worker QD8/双盘四 worker QD16，
+首触缓冲区在设备 owner 的 CPU 上，每阶段 8 秒，三轮，无性能探针。
+代码通过串口在内存中执行，不创建脚本、日志或结果文件；本轮不做预写，
+读结果校验既有两盘的数据模式。这里是两 worker 的内存测试程序，
+不应将上面默认单 worker 的旧脚本直接视为相同测试。
+
+| 配置 | Garen 单盘 | Ezreal 单盘 | 双盘合计 |
+| --- | ---: | ---: | ---: |
+| 本地 BAR 快路径 + IOThread，仍轮询目录 | 1562.0 | 1712.8 | 2303.0 |
+| 控制面目录推送 + IOThread | 1823.8 | 1732.4 | 2935.0 |
+
+单位 MiB/s，三轮中位数。双盘增加约 27%，达到两端单盘吞吐之和的约 83%；
+Garen 单盘增加约 17%，Ezreal 约 1%。不同阶段间重启过 guest，DSM 页状态
+以及小容量循环读/RAID 缓存会影响结果，不能把全部差值归因于目录优化。
+
+使用远端 CPU 读 owner 盘的功能检查也通过：Garen 盘 req.0/1 在 CPU2/3
+增加 785/695 次中断；Ezreal 盘 req.2/3 在 CPU0/1 增加 752/826 次中断，
+数据校验成功。该检查的缓冲区在远端，不能拿其吞吐替代本地性测试。
+
+host 线程固定到 RDMA 卡所在 NUMA node 1 的不同物理核，只使双盘中位数
+约提高 4%，同时使 Ezreal 单盘下降约 15%；已恢复原亲和性，没有保留为推荐配置。
+完成路径分段探针显示映射/解除映射及 ring 更新包含大量 DSM pin/unpin；
+高频探针显著影响吞吐，不能据此把剩余性能损失全部归为 DSM。
+
+当前仍需处理或测量：非 PCI 实际设备转发、本地目录扫描/队列成本、
+无需 guest DMA bridge 的真实网卡 DMA 路径及双网卡并行吞吐。
+本轮仍未挂网卡，尚未完成“除 DSM 外尽可能降低开销”的整体目标。
