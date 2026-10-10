@@ -8,6 +8,8 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qemu/atomic.h"
+#include "qemu/cutils.h"
+#include "qemu/error-report.h"
 #include "exec/address-spaces.h"
 #include "hw/boards.h"
 #include "hw/vfio/loom-dma.h"
@@ -44,7 +46,8 @@ struct LoomVFIODMA {
     GList *large_maps;
     bool recycle_pages;
     unsigned free_page_count;
-    uint8_t *free_pages[64];
+    unsigned free_page_limit;
+    uint8_t *free_pages[4096];
     bool recycle_buffers;
     unsigned free_buffer_count;
     LoomDMABuffer *free_buffers[64];
@@ -84,7 +87,8 @@ static bool map_is_page(const LoomDMAMap *m)
  * Reuse only owner-local staging pages, after the caller has removed the
  * hardware IOMMU mapping and invalidation has retired buffer/queue state.
  * Hardware mappings and registration generations are never cached. Bound the
- * idle storage to 64 pages (256 KiB) per container; larger/partial unmaps retain
+ * idle storage defaults to 64 pages (256 KiB) per container and has a
+ * configurable limit of at most 4096 pages; larger/partial unmaps retain
  * their existing mmap lifetime. Clear every reused page before registration.
  */
 static uint8_t *pool_alloc(LoomVFIODMA *ctx, uint64_t size)
@@ -103,7 +107,7 @@ static uint8_t *pool_alloc(LoomVFIODMA *ctx, uint64_t size)
 static void pool_retire_page(LoomVFIODMA *ctx, LoomDMAMap *m)
 {
     if (ctx->recycle_pages && map_is_page(m) &&
-        ctx->free_page_count < G_N_ELEMENTS(ctx->free_pages)) {
+        ctx->free_page_count < ctx->free_page_limit) {
         ctx->free_pages[ctx->free_page_count++] = m->pool;
     } else {
         munmap(m->pool, m->size);
@@ -235,6 +239,19 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
     }
     if (!bc->loom_dma) {
         bc->loom_dma = g_new0(LoomVFIODMA, 1);
+        const char *cache_pages = getenv("LOOM_VFIO_POOL_CACHE_PAGES");
+        unsigned long cache_limit;
+
+        bc->loom_dma->free_page_limit = 64;
+        if (cache_pages) {
+            if (qemu_strtoul(cache_pages, NULL, 10, &cache_limit) ||
+                cache_limit > G_N_ELEMENTS(bc->loom_dma->free_pages)) {
+                error_report("Invalid LOOM_VFIO_POOL_CACHE_PAGES; "
+                             "expected 0..4096, using 64");
+            } else {
+                bc->loom_dma->free_page_limit = cache_limit;
+            }
+        }
         const char *recycle = getenv("LOOM_VFIO_POOL_RECYCLE");
         bc->loom_dma->recycle_pages = qemu_real_host_page_size() == 4096 &&
                                      (!recycle || strcmp(recycle, "0"));
