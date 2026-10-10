@@ -221,14 +221,17 @@ void vfio_region_write(void *opaque, hwaddr addr,
         break;
     }
 
+    /* Record submitted control data before hardware can reply to its tail. */
+    if (region->nr == 0 && size == 4) {
+        loom_iavf_observe_write(vbasedev, addr, data);
+    }
+
     if (pwrite(vbasedev->fd, &buf, size, region->fd_offset + addr) != size) {
         error_report("%s(%s:region%d+0x%"HWADDR_PRIx", 0x%"PRIx64
                      ",%d) failed: %m",
                      __func__, vbasedev->name, region->nr,
                      addr, data, size);
         loom_iavf_reset(vbasedev);
-    } else if (region->nr == 0 && size == 4) {
-        loom_iavf_observe_write(vbasedev, addr, data);
     }
 
     trace_vfio_region_write(vbasedev->name, region->nr, addr, data, size);

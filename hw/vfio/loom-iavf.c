@@ -133,8 +133,8 @@ static void observe_request(VFIODevice *dev, LoomIAVFQueues *s,
     }
     if (op == 6) {
         unsigned len = lduw_le_p(desc + 4);
-        uint64_t addr = (uint64_t)ldl_le_p(desc + 24) << 32 |
-                        ldl_le_p(desc + 28);
+        uint64_t addr = (uint64_t)(uint32_t)ldl_le_p(desc + 24) << 32 |
+                        (uint32_t)ldl_le_p(desc + 28);
         uint8_t msg[72 + VF_QUEUE_COUNT * 64];
 
         if (s->pending || s->ambiguous) {
@@ -268,8 +268,8 @@ void loom_iavf_observe_completion(VFIODevice *dev)
             s->pending_mask = 0;
         } else if (op == 17) {
             uint8_t event[4];
-            uint64_t addr = (uint64_t)ldl_le_p(desc + 24) << 32 |
-                            ldl_le_p(desc + 28);
+            uint64_t addr = (uint64_t)(uint32_t)ldl_le_p(desc + 24) << 32 |
+                            (uint32_t)ldl_le_p(desc + 28);
 
             if (lduw_le_p(desc + 4) < sizeof(event) ||
                 loom_vfio_dma_read_baseline(dev->bcontainer, addr,
