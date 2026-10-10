@@ -1335,3 +1335,33 @@ Jinx 同时向两张 guest VF 各发送 4 MiB，内容校验通过，driver RX d
 这只是短收包回归，不代表长期 TCP 重传/丢包问题已解决。两端 watchdog/GET_STATS
 各 5 次完成，未发现所检查的 BUG、DMA fault、TX timeout 类错误，HPET 仍为 hpet。
 既有 FAT 未正常卸载和偶发 printk 时钟下溢未在本次工作中修复。
+
+## 2026-10-10：单 VF 发送的小内存访问来源
+
+继续保留 guest #26、HPET 和当前磁盘配置，Ezreal 单 VF、2 worker 向第三方
+Jinx 发送，发送/接收字节和内容检查通过。以下是诊断计数，不是吞吐基准：
+
+- 12 秒探针窗口内包含一次约 6 秒发送。8 字节 DSM memcpy 读请求 482324 次；
+  `vtd_get_slpte` 入口 481158 次。该函数每次恰好读取一个 8 字节页表项，
+  两者数量对应约 99.76%，说明这一窗口的 8 字节读主要来自 VT-d 页表遍历。
+- `vtd_dev_to_context_entry` 和 `vtd_fetch_inv_desc` 各 71026 次；
+  16 字节 DSM memcpy 读请求 284419 次。前者在当前 legacy 模式读 root/context，
+  后者处理 queued invalidation；调用栈确认二者产生小读，但入口次数不能直接
+  换算每个函数内部的完整读请求数量。
+- 暂存 DMA map/unmap 入口各 155961 次；TX submission 9065 次，
+  data completion 25797 次。暂存页复用减少 mmap，不消除硬件 IOMMU 生命周期。
+- 更早的独立 24 秒 syscall enter/exit 配对窗口共 4529485 次 memcpy ioctl，
+  3346871 次长度不超过 32 字节；只有 347 次 ioctl 内部观察到远端 fetch 请求。
+  “没有 fetch”不表示没有 DSM 成本：内核复制路径仍检查页状态、获取全局与页面锁。
+
+DWARF 调用栈记录明确出现 IOTLB invalidate → shadow page walk → slpte read，
+以及 VFIO TX payload 同步、初始 DMA 注册和 completion changed-byte publication。
+记录使用约 64 MiB 的上限，数据只放 memfd，结束即释放；该短窗口丢样 26.60%，
+因此不使用其调用栈百分比估计总开销或性能收益。更早的无上限采样过大，已停止并释放，
+同样不用于性能归因。函数入口计数与 syscall 计数另行完成，无返回探针配对依赖。
+
+当前证据把排查重点移到频繁 DMA 生命周期引发的 VT-d 元数据访问，以及本地复制
+ioctl 的固定成本。它尚未证明这些成本足以解释普通 VM 与巨虚的全部吞吐差距。
+后续需分别检查缓存的失效语义、可合并的访问、锁等待和 owner 本地执行路径；
+不能绕过 DSM 直接读取 guest RAM，也不能删除实际硬件 DMA 解除映射。
+诊断接收端和所有探针已退出，Jinx 临时地址已删除。guest/host 内核代码未修改。
