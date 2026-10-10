@@ -2623,3 +2623,75 @@ HPET设备、guest时钟和guest OS保持。
 本轮没有实施轮询优化，没有宣称提升性能。
 原运行配置保留，host/guest内核及模块参数未变；
 Garen worker-g4保持、Lux未用，没有产生实验脚本/日志/pcap/磁盘。
+
+### 2026-10-11：MMIO 地址归因与有界 CQ 短轮询
+
+在旧运行版本 PID687902 上，另开22秒 BCC 窗口观测实际 mmio_forwarding
+入口地址和返回耗时，Garen 单卡3轮6秒到Jinx，数据全部校验通过。
+探针在统计前卸载，无同线程嵌套冲突。
+本窗口只见0xfed000f0：vCPU2完成15811次/累计1854.942毫秒，
+vCPU3完成10149次/777.377毫秒。源码HPET_BASE=0xfed00000、
+HPET_COUNTER=0xf0，确认这些是远端HPET主计数器读取。
+该窗口不能证明所有负载的所有MMIO都属于HPET，也不能与前窗口次数直接相除。
+它解释了一个待验证的机制：远端CPU即使不跑本地网卡worker，
+时钟读取仍会给master带来同步MMIO请求；不是直接观测的DSM页请求。
+
+代码提交8b5ccca0d2新增运行时属性：
+`qom-set path=/machine property=loom-rdma-rpc-spin-ns value=5000`，
+两端分别设置，单位ns，范围0..20000，默认0。恢复用value=0。
+仅改变rdma_wait_completion的SEND CQ和rdma_router_call的回复CQ等待策略；
+第一次空poll开始计时，每次wait只有一个总预算，耗尽后一直usleep(1)；
+不是每次sleep后重置预算，不是无限忙等。活动wait保留自己的快照。
+使用host CLOCK_MONOTONIC，不改变HPET设备、guest clocksource或guest OS。
+发送完成、缓冲复用、原5秒/调用超时、WC/回复序号/类型/长度检查、
+回复CQ单consumer和FIFO/IO顺序保持。默认0不额外读取ns时钟。
+属性越界拒绝且保留原值，0/20000/20001/UINT64_MAX两端QMP验证通过。
+
+从实际源码提取等待helper和旧/新SEND完成循环，外部CQ、时钟、sleep stub，
+memfd编译ASan/UBSan，48案例通过：默认0逐步等同旧循环、
+即时/延迟完成、CQ错误、WC失败、超时、活动预算不可延长、
+预算耗尽不继续读ns时钟、无符号时钟绕回、非法配置不变。
+这是有界策略/完成语义测试，不是实际网络延迟或完整RDMA容错验证。
+两端ninja与git diff --check通过，经正常guest poweroff两端QEMU_EXIT0、
+VF恢复iavf且模块refcnt0后，新版本两端编译启动，guest原#26/4CPU/HPET。
+
+同一次新启动六组交替0/5000ns，两个owner各2个本地CPU worker，
+每卡6秒向Jinx，先Garen后Ezreal，每条件两卡分开测，不是并行聚合。
+24次卡测试/48条TCP连接内容和字节数全部PASS，性能窗口无BCC/perf。
+
+| 指标 | 0ns中位数 | 5000ns中位数 | 变化 | 5000ns胜出组数 |
+|---|---:|---:|---:|---:|
+| Garen卡 MiB/s | 205.206 | 197.623 | -3.70% | 1/6 |
+| Ezreal卡 MiB/s | 186.923 | 183.752 | -1.70% | 3/6 |
+
+配对原始值（pair/budget_ns/G/E）：
+```
+0 0 197.194 186.941
+0 5000 224.826 189.029
+1 5000 198.971 199.495
+1 0 217.265 154.912
+2 0 208.476 184.210
+2 5000 185.672 170.393
+3 5000 210.974 172.705
+3 0 222.112 186.906
+4 0 200.807 196.011
+4 5000 196.276 207.213
+5 5000 189.777 178.474
+5 0 201.936 196.808
+```
+
+每条件外部/proc各线程schedstat CPU总和窗口约13.05..13.62秒：
+Garen CPU累计中位数0/5000ns=13.370/13.225秒，
+Ezreal=11.878/11.670秒。
+包含guest执行和短暂控制/间隔，不能当纯host开销或固定工作量CPU效率。
+没有证明5us稳定提升，不启用该候选；两端已读回恢复0。
+guest错误级dmesg为空，CPU0-3和HPET保留，Jinx临时IP/收发进程清理。
+不重跑磁盘性能，不使用Lux，不产生实验脚本/日志/磁盘文件，
+Garen worker-g4 PID6122保留，host/guest内核和模块参数保持。
+
+下一步须分别测量master侧HPET请求等待BQL、实际MMIO处理和回复发送耗时。
+源码address_space_rw通过prepare_mmio_access持BQL调设备，
+完成后释放，之后才发送回复；不能误称其一直持BQL等待SEND CQ。
+同一master的本地网卡和远端MMIO可能竞争BQL，需要实际等待证据。
+先区分服务端排队/执行与传输/唤醒，再选择可保持HPET的通用路由优化，
+不以本次睡眠比例推断带宽损失，也不把架构RPC开销全归因DSM。
