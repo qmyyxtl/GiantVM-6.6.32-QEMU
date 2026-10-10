@@ -171,6 +171,17 @@ static int sync_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
         }
     } else {
         smp_rmb();
+        /*
+         * Unchanged device buffers need no scratch copy. If DMA changes the
+         * pool after this comparison, the next exchange observes it, just as
+         * with the existing memcpy snapshot. Changed buffers still use a
+         * scratch snapshot before publishing to guest memory.
+         */
+        if (b->pool && !memcmp(b->pool, b->baseline, b->size)) {
+            /* Keep completed DMA reads ordered before IRQ publication. */
+            smp_rmb();
+            return 0;
+        }
         ret = buffer_pool_copy(bc->loom_dma, b, 0,
                                 b->scratch, b->size, false);
         if (ret) {

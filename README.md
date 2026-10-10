@@ -473,3 +473,37 @@ Garen VF 25.061 -> 8.536 ms，Ezreal VF 22.324 -> 7.523 ms。
 计时结束后只读检查：两端各 1114 个 buffer、4562944 字节，全部有缓存 pool 地址。
 仍会扫描所有注册 buffer 并进行比较/复制、访问 guest RAM；剩余非 DSM 成本
 需要继续测量，当前不能宣称路径已经最优。HPET 保持 hpet。
+
+### 未变化 DMA buffer 的复制与真实 TCP 诊断（2026-10-10）
+
+from-device 同步直接比较缓存 pool 与 baseline；无变化时不复制到 scratch。
+有变化时仍取 scratch 快照再按改变的字节合并。保留 DMA 读屏障、方向过滤，
+跨映射旧 buffer 继续走原路径。设备在比较后产生的修改由后续 exchange 观察，
+与原 memcpy 快照具有相同的并发修改边界。
+
+1178 个 4 KiB buffer 的隔离测试，固定 Ezreal CPU0、每轮 200 次同步：
+修改前每次约 551-557 us；修改后约 363-370 us。
+实际源码测试确认无变化时 scratch 不写入，最后一个字节的 DMA 修改、
+CPU 更新、失效最终写回、部分拆分和旧跨 map 路径均通过。
+该数据隔离 DSM/硬件，不代表实际 TCP 已达到低开销或线性扩展。
+
+为定位真实性能，额外使用 Python stdin TCP sink/worker，无脚本、日志、pcap
+或结果文件。每 worker owner CPU first-touch 1 MiB 固定字节 buffer，
+单卡两 worker、双卡四 worker；每 worker 至少发送 6 秒，包含尾部排空与
+receiver 确认时间，吞吐为确认的总字节数 / 最慢 worker 的完成时间。
+接收端逐字节验证固定模式和总长度。这是诊断工具，不是 iperf3 标准基线。
+
+在此前仅地址缓存的版本、四队列/512 RX/TX ring 下，三轮中位数：
+Garen 单卡 3.297 MiB/s、Ezreal 单卡 0.499 MiB/s、双卡 0.663 MiB/s。
+各轮差异很大，双卡未达到线性扩展；不能依据 ping 成功认定网络吞吐正常。
+guest Tcp RetransSegs=1、TCPTimeouts=1 且对应 SYN；
+两条额外数据连接的 TCP_INFO total_retrans=0，未发现大量数据重传。
+在一次带探针的诊断中，Garen from-device 同步 4420 次、平均 641 us，
+to-device 同步 2742 次、平均 1317 us（10 秒窗口，时长含 DSM，不能全归因于复制）。
+采样不用于正式吞吐值。整批 buffer 反复同步仍有显著成本。
+
+两张 VF 均可通过标准 ethtool -L combined 2 重配为两个队列，
+匹配每端两 CPU；重配后 ping 通过。单轮诊断 Garen/Ezreal/双卡分别为
+6.113/0.516/0.527 MiB/s，连接差异仍大，因此不能称为解决瓶颈。
+下一步需继续检查 ring/有效 DMA 范围，避免每次数据路径访问都同步所有 pool；
+guest 驱动与 HPET 不修改，真实双卡吞吐目标仍未完成。
