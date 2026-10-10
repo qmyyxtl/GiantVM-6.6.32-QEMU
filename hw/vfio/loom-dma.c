@@ -30,6 +30,7 @@ typedef struct LoomDMABuffer {
 
 struct LoomVFIODMA {
     GList *maps, *buffers;
+    uint8_t *read_buffer;
 };
 
 /* Linux enum dma_data_direction: bidirectional=0, to-device=1, from-device=2. */
@@ -147,6 +148,7 @@ void loom_vfio_dma_free(VFIOContainerBase *bc)
     }
     g_list_free(bc->loom_dma->maps);
     g_list_free_full(bc->loom_dma->buffers, buffer_free);
+    g_free(bc->loom_dma->read_buffer);
     g_free(bc->loom_dma);
     bc->loom_dma = NULL;
 }
@@ -156,20 +158,21 @@ void loom_vfio_dma_free(VFIOContainerBase *bc)
  * Copying a whole coherent buffer back would overwrite CPU updates to other
  * fields in a descriptor while the device updates its completion flags.
  */
-static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
+static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b,
+                         uint8_t *snapshot, bool to_device)
 {
     uint64_t pos = 0;
     int ret;
-    if (!memcmp(b->scratch, b->baseline, b->size)) {
+    if (!memcmp(snapshot, b->baseline, b->size)) {
         return 0;
     }
     while (pos < b->size) {
         uint64_t start;
-        while (pos < b->size && b->scratch[pos] == b->baseline[pos]) {
+        while (pos < b->size && snapshot[pos] == b->baseline[pos]) {
             pos++;
         }
         start = pos;
-        while (pos < b->size && b->scratch[pos] != b->baseline[pos]) {
+        while (pos < b->size && snapshot[pos] != b->baseline[pos]) {
             pos++;
         }
         if (pos == start) {
@@ -177,17 +180,17 @@ static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
         }
         if (to_device) {
             ret = buffer_pool_copy(bc->loom_dma, b, start,
-                                    b->scratch + start, pos - start, true);
+                                    snapshot + start, pos - start, true);
         } else {
             ret = address_space_write(&address_space_memory, b->gpa + start,
                                        MEMTXATTRS_UNSPECIFIED,
-                                       b->scratch + start, pos - start)
+                                       snapshot + start, pos - start)
                   == MEMTX_OK ? 0 : -EIO;
         }
         if (ret) {
             return ret;
         }
-        memcpy(b->baseline + start, b->scratch + start, pos - start);
+        memcpy(b->baseline + start, snapshot + start, pos - start);
     }
     if (to_device) {
         smp_wmb();
@@ -238,7 +241,7 @@ static int sync_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
         }
         b->snapshot_ready = false;
     }
-    return merge_buffer(bc, b, to_device);
+    return merge_buffer(bc, b, b->scratch, to_device);
 }
 
 static LoomDMABuffer *buffer_slice(LoomDMABuffer *b, uint64_t offset,
@@ -372,10 +375,60 @@ int loom_vfio_dma_sync(VFIOContainerBase *bc, bool to_device)
         return 0;
     }
     if (to_device) {
-        for (GList *p = bc->loom_dma->buffers; p; p = p->next) {
-            ret = sync_buffer(bc, p->data, true);
-            if (ret) {
-                return ret;
+        /*
+         * Merge adjacent registered GPAs into reads of at most 64 KiB.
+         * Keep registration order, read every buffer, and never include gaps.
+         * One staging allocation serves all batches without a scatter copy.
+         */
+        for (GList *p = bc->loom_dma->buffers; p; ) {
+            LoomDMABuffer *b = p->data;
+            hwaddr lower = b->gpa, upper = b->gpa + b->size;
+            GList *end = p->next;
+
+            if (b->direction == 2) {
+                p = end;
+                continue;
+            }
+            while (end) {
+                LoomDMABuffer *next = end->data;
+                hwaddr next_upper = next->gpa + next->size;
+                hwaddr new_lower = MIN(lower, next->gpa);
+                hwaddr new_upper = MAX(upper, next_upper);
+
+                if (next->direction == 2 ||
+                    (next->gpa != upper && next_upper != lower) ||
+                    new_upper - new_lower > 64 * KiB) {
+                    break;
+                }
+                lower = new_lower;
+                upper = new_upper;
+                end = end->next;
+            }
+            if (p->next == end) {
+                ret = sync_buffer(bc, b, true);
+                if (ret) {
+                    return ret;
+                }
+                p = end;
+                continue;
+            }
+            if (!bc->loom_dma->read_buffer) {
+                bc->loom_dma->read_buffer = g_malloc(64 * KiB);
+            }
+            if (address_space_read(&address_space_memory, lower,
+                                   MEMTXATTRS_UNSPECIFIED,
+                                   bc->loom_dma->read_buffer, upper - lower)
+                != MEMTX_OK) {
+                return -EIO;
+            }
+            for (; p != end; p = p->next) {
+                b = p->data;
+                ret = merge_buffer(bc, b,
+                                    bc->loom_dma->read_buffer + b->gpa - lower,
+                                    true);
+                if (ret) {
+                    return ret;
+                }
             }
         }
         return 0;
@@ -401,7 +454,7 @@ int loom_vfio_dma_sync(VFIOContainerBase *bc, bool to_device)
             continue;
         }
         b->snapshot_ready = false;
-        ret = merge_buffer(bc, b, false);
+        ret = merge_buffer(bc, b, b->scratch, false);
         if (ret) {
             return ret;
         }
