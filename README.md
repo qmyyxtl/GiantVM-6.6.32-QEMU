@@ -1130,3 +1130,28 @@ TSO/context 不查伪地址、非恒等 IOVA/GPA、普通/回绕 tail、
 CPU 读取错误及部分 payload 已提交后的错误、ring unmap 失效。
 RX 范围/复用、原队列 enable/失效及实际 BAR 顺序/错误检查通过。
 真实设备命中率与内容校验结果另行记录，不提前宣称吞吐提升。
+
+4417bfac06 两端构建并部署后的真实 TCP 检查：20 秒只读 BPF
+窗口（包含双网卡四 worker 的6秒发送及后续双盘只读回归）内，
+Garen/Ezreal 的 TX tail 分别 2473/2486 次，全部范围同步，
+没有 TX fallback 或 error；warmup 已建立初次 tail。
+同窗口 RX 为 298/359 次，范围同步 297/358 次，首次回退各1、
+error均0。完整提交只剩31/30次，完成同步仍11679/12061次，
+因此下一主要候选是完成方向扫描，而非继续全量提交。
+
+范围调用/请求字节为 Garen 19658/99089950、
+Ezreal 24691/138421016；CPU 描述符读取 2897/381360、
+3002/474016。累计请求字节不等于改变/复制的字节数。
+带探针的短回归发送约34.34 MiB/s，四流内容校验通过，
+TCP total_retrans 按 cpu0..3 为4/0/0/0；双 raw 数据盘四
+worker、每 worker QD8 的 O_RDONLY/O_DIRECT 读取3224.25 MiB/s。
+不是关闭快路径的同条件交替对照，不能据此宣称吞吐提升幅度。
+
+之后无探针双网卡各接收4 MiB、内容校验通过，owner0/owner1
+RX discards为3/0，host TCP total_retrans为3/0。10秒AdminQ
+两卡各4次成功GET_STATS、watchdog各4次，未发现定义的
+WARNING/BUG/DMA fault/QI error/TX timeout；HPET=hpet。
+临时probes、TCP sinks、sender/receiver/serial observer已退出，
+guest #26、host内核和HPET未改，无新增实验文件。
+后续仍需削减完成方向扫描和范围查找成本，并进行受控性能对照；
+提交快路径命中不能证明总体目标完成或线性扩展。
