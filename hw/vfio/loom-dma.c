@@ -53,6 +53,7 @@ struct LoomVFIODMA {
     unsigned free_buffer_count;
     LoomDMABuffer *free_buffers[64];
     bool skip_redundant_zero;
+    bool cache_publication;
 };
 
 static void loom_vfio_ram_free(VFIOContainerBase *bc);
@@ -280,6 +281,9 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
         const char *recycle = getenv("LOOM_VFIO_POOL_RECYCLE");
         bc->loom_dma->recycle_pages = qemu_real_host_page_size() == 4096 &&
                                      (!recycle || strcmp(recycle, "0"));
+        const char *publication = getenv("LOOM_VFIO_PUBLICATION_CACHE");
+        bc->loom_dma->cache_publication =
+            !publication || strcmp(publication, "0");
         const char *buffers = getenv("LOOM_VFIO_BUFFER_RECYCLE");
         bc->loom_dma->recycle_buffers =
             !buffers || strcmp(buffers, "0");
@@ -472,13 +476,18 @@ static uint64_t skip_matching_bytes(const uint8_t *a, const uint8_t *b,
 static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b,
                          uint8_t *snapshot, bool to_device)
 {
+    MemoryRegionCache cache = { 0 };
     uint64_t pos = 0;
-    int ret;
+    unsigned runs = 0;
+    bool cached = false, locked = false;
+    int ret = 0;
+
     if (!memcmp(snapshot, b->baseline, b->size)) {
         return 0;
     }
     while (pos < b->size) {
         uint64_t start;
+
         pos = skip_matching_bytes(snapshot, b->baseline, pos, b->size, true);
         start = pos;
         pos = skip_matching_bytes(snapshot, b->baseline, pos, b->size, false);
@@ -489,20 +498,56 @@ static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b,
             ret = buffer_pool_copy(bc->loom_dma, b, start,
                                     snapshot + start, pos - start, true);
         } else {
-            ret = address_space_write(&address_space_memory, b->gpa + start,
-                                       MEMTXATTRS_UNSPECIFIED,
-                                       snapshot + start, pos - start)
-                  == MEMTX_OK ? 0 : -EIO;
+            /*
+             * The first run pays no cache setup cost. For fragmented physical
+             * RAM publication, translate once from the second run onward.
+             * This cache lives only for this merge, under BQL and RCU: no RAM
+             * topology or DMA registration can outlive its invocation.
+             * DSM caches have a NULL direct pointer and use the existing
+             * KVM_DSM_MEMCPY slow path; never bypass replica ownership.
+             */
+            if (++runs == 2 && bc->loom_physical &&
+                bc->loom_dma->cache_publication && bql_locked()) {
+                rcu_read_lock();
+                locked = true;
+                cached = address_space_cache_init(&cache,
+                            &address_space_memory, b->gpa, b->size, true)
+                            == b->size &&
+                         memory_access_is_direct(cache.mrs.mr, true);
+                if (!cached) {
+                    address_space_cache_destroy(&cache);
+                    rcu_read_unlock();
+                    locked = false;
+                }
+            }
+            if (cached) {
+                ret = address_space_write_cached(&cache, start,
+                                snapshot + start, pos - start)
+                      == MEMTX_OK ? 0 : -EIO;
+                /* Direct RAM writes need normal dirty/TB accounting. */
+                if (!ret) {
+                    address_space_cache_invalidate(&cache, start, pos - start);
+                }
+            } else {
+                ret = address_space_write(&address_space_memory, b->gpa + start,
+                                         MEMTXATTRS_UNSPECIFIED,
+                                         snapshot + start, pos - start)
+                      == MEMTX_OK ? 0 : -EIO;
+            }
         }
         if (ret) {
-            return ret;
+            break;
         }
         memcpy(b->baseline + start, snapshot + start, pos - start);
     }
-    if (to_device) {
+    if (locked) {
+        address_space_cache_destroy(&cache);
+        rcu_read_unlock();
+    }
+    if (to_device && !ret) {
         smp_wmb();
     }
-    return 0;
+    return ret;
 }
 
 static int snapshot_from_device(VFIOContainerBase *bc, LoomDMABuffer *b)
