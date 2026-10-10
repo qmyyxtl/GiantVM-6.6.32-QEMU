@@ -976,3 +976,24 @@ legacy 槽位。两种格式的 ACK/失败/歧义/代际检查均通过。
 控制写观察移到现有完整 DMA 同步之后、物理 BAR pwrite 之前，
 先记录提交再通知硬件；写失败仍清空状态。仍未启用队列范围
 快速路径，也不把此修复称为此前吞吐损失的原因。
+
+94483dd19e 两端构建并部署后的真实 VF 检查：Garen/Ezreal
+均先观察到默认四队列配置 mask=0xf，改为两队列及 RX/TX128 后
+各观察到成功回复 mask=0x3。双网卡 ping 均 3/3，通过原生
+iavf 分别接收 4 MiB，逐字节内容校验通过；这一轮 RX 丢包及
+host TCP 重传分别为 owner0 271、owner1 185，瓶颈仍存在。
+
+10 秒 AdminQ 检查两卡各 5 次成功 GET_STATS，未发现
+WARNING/BUG/DMA fault/QI error/TX timeout；HPET 仍为 hpet。
+guest 启动仍出现既有 hrtimer interrupt took 提示，以及
+sda15 FAT 非正常卸载提示，未在此阶段调整时钟或文件系统。
+
+短回归双网卡四 worker 发送约 21.80 MiB/s，四条流内容校验
+均通过，TCP total_retrans 均 0；双 raw 数据盘四 worker、
+每 worker QD8 的 O_RDONLY/O_DIRECT 读取约 3274.90 MiB/s。
+这些为一次功能回归，不能与此前不同轮次值直接推导性能变化，
+也没有证明线性扩展。两端仍执行完整 DMA 同步，后续需确认
+enable 状态、精确 buffer 覆盖/生命周期、tail 回绕及 payload
+复用后，才能把范围提交接口接入原生 VF 的稳态路径。
+临时探针、接收/发送进程均已退出，无新增实验文件；
+guest #26、host 内核、HPET 不改。
