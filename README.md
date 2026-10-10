@@ -750,3 +750,44 @@ TCP 重传 12/65，仍需定位 RX 队列处理延迟。最终短时 TX 25.48 Mi
 四个连接重传 0/0/0/1；只读双盘 3222 MiB/s。两者仅为功能回归观测，
 未运行同条件多轮单卡/双卡或单盘/双盘正式对照，不能声称性能提升或
 线性扩展。所有 receiver/sink/observer 已退出，自己的 QEMU 保留运行。
+
+### 完成发布遍历优化与 AdminQ 新现场（2026-10-10）
+
+QEMU 0545661c37 保持旧→新快照、新→旧发布的两阶段顺序，
+缓存 buffers 链表尾部，只串联本轮已有快照的待发布 buffer。
+每轮不分配新对象；注册、解除注册及部分解除映射维护尾指针，
+失败重试重新建立快照链。CPU→设备的完整扫描和 GPA 合并读取不变。
+
+同一 Ezreal 上提取实际源码到 memfd，普通 RAM mock、不含 DSM：
+1178 个未变化的 4 KiB buffer、每轮 200 次完成同步，旧源码三个样本
+401.3/398.1/398.2 us，新源码 366.9/365.5/365.6 us，下降约 8.2%。
+旧版分阶段 warm 样本为找尾 8.9 us、快照 356.0 us、
+发布遍历 30.6 us。只覆盖这类缓冲区的本地开销，不能推算真实 NIC 带宽。
+实际源码 map/unmap/partial unmap/最后发布/失败重试、64 KiB GPA 批次、
+24 种完成交错，以及最旧 buffer 切分/删除、唯一 buffer 删除后重注册、
+写回失败重试均通过；两端实际构建、Git 同步、正常重启自己的 QEMU。
+
+guest 仍 #26，HPET/guest 源码/host 内核均不改。两 VF 重配至两队列、
+128 RX/TX ring 及 ping 通过。双端各 4 MiB 接收内容/长度正确，
+host 重传 4/19；双卡四 worker 发送内容/长度正确、重传全 0，
+短时 18.80 MiB/s；双盘四 worker O_RDONLY/O_DIRECT 回归通过、
+短时 3197 MiB/s。这些仅是回归观测，未证明真实吞吐提升或线性扩展。
+
+发现 owner0 的硬件统计未刷新：软件 Tx/Rx 队列计数增长，但 hardware
+rx_bytes/tx_bytes/rx_discards 全为 0，继续等待 10 秒仍未更新。
+owner1 rx_discards 为 17；不能把 owner0 的 0 当作零丢包。
+10 秒 host PF i40e_vc_process_vf_msg 探针中，Ezreal 收到 5 次
+GET_STATS(opcode15)，Garen 无新请求。guest 的可回收 tracefs 临时
+kprobe 显示两个 adapter 都在 RUNNING(state13)：owner0 watchdog
+约 432 次/10秒，current_op=GET_STATS(15)、aq_required=0x20000000
+(REQUEST_STATS) 一直未清除；owner1 watchdog 5 次、op0/aq0，
+相应 request_stats 5 次。源码对 pending current_op+asq_done 不重发，
+aq_required 非零时以 20 ms 重排，因此 owner0 等待统计回复并频繁唤醒。
+这是具体的控制路径异常/额外开销；仍需沿 AQ 完成/邮箱 IRQ/消息解析
+定位丢失的位置，尚未证明与新优化有关，不能只归因 DSM 或时钟。
+未修改/关闭 HPET，未绕过响应检查或强行清除 current_op。
+
+最终 guest 无 WARNING/BUG/DMA fault/QI error/TX timeout；
+临时 guest kprobe 全部移除、tracing_on 恢复，host BPF 已结束，
+receiver/sink/serial observer 已退出，无新增实验文件。
+两端自己的 QEMU 保持运行，Lux 和 Garen 原有 libvirt VM 未动。
