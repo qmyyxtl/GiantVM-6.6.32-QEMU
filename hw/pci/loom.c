@@ -88,6 +88,7 @@ static unsigned local_node, node_count, owned_count;
 static uint32_t config_address;
 static bool owner_iommu_present;
 static bool local_bar_lock_batch;
+static bool bar_negative_filter;
 
 G_STATIC_ASSERT(sizeof(LoomPCIDescriptor) == 4288);
 /* Only this prefix changes BAR mappings. Extended config reads use owner RPC. */
@@ -544,6 +545,16 @@ static void collect_device(PCIBus *bus, PCIDevice *dev, void *opaque)
     loom_pci_publish(dev);
 }
 
+static bool get_bar_negative_filter(Object *obj, Error **errp)
+{
+    return qatomic_read(&bar_negative_filter);
+}
+
+static void set_bar_negative_filter(Object *obj, bool enabled, Error **errp)
+{
+    qatomic_set(&bar_negative_filter, enabled);
+}
+
 static bool get_local_bar_lock_batch(Object *obj, Error **errp)
 {
     return qatomic_read(&local_bar_lock_batch);
@@ -571,6 +582,8 @@ void loom_pci_prepare(void)
     }
     local_bar_lock_batch =
         g_strcmp0(getenv("LOOM_PCI_LOCAL_BAR_LOCK_BATCH"), "1") == 0;
+    object_property_add_bool(OBJECT(ms), "loom-bar-negative-filter",
+                             get_bar_negative_filter, set_bar_negative_filter);
     object_property_add_bool(OBJECT(ms), "loom-local-bar-lock-batch",
                              get_local_bar_lock_batch,
                              set_local_bar_lock_batch);
@@ -1119,6 +1132,63 @@ static bool bar_access_owner(unsigned owner, hwaddr addr, bool io,
     return handled;
 }
 
+/*
+ * Reject only stable misses. Local prefixes and applied mappings need BQL;
+ * remote published prefixes need directory_lock, in the established order.
+ * No new routing cache: BAR changes/reset retain their publication protocol.
+ * A pending mapping update, missing prefix or odd reset sequence falls back
+ * to the original snapshot/refresh/validation path.
+ */
+static bool bar_access_may_match(hwaddr addr, bool io)
+{
+    bool locked = bql_locked();
+    bool possible = true;
+
+    if (!qatomic_load_acquire(&directory_control_active)) {
+        return true;
+    }
+    if (!locked) {
+        bql_lock();
+    }
+    qemu_mutex_lock(&directory_lock);
+    if (qatomic_read(&directory_epoch) != applied_directory_epoch) {
+        goto out;
+    }
+    for (unsigned owner = 0; owner < node_count; owner++) {
+        for (unsigned index = 0; index < directory[owner].count; index++) {
+            LoomPCIDescriptor *d;
+
+            if (owner == local_node) {
+                d = &directory[owner].devices[index];
+            } else {
+                if (!incoming_valid[owner][index]) {
+                    goto out;
+                }
+                d = &incoming_directory[owner].devices[index];
+            }
+            if (d->sequence & 1) {
+                goto out;
+            }
+            for (unsigned bar = 0; bar < PCI_NUM_REGIONS; bar++) {
+                LoomBAR *b = &d->bars[bar];
+
+                if (b->size && b->address != PCI_BAR_UNMAPPED &&
+                    !!(b->type & PCI_BASE_ADDRESS_SPACE_IO) == io &&
+                    addr >= b->address && addr - b->address < b->size) {
+                    goto out;
+                }
+            }
+        }
+    }
+    possible = false;
+out:
+    qemu_mutex_unlock(&directory_lock);
+    if (!locked) {
+        bql_unlock();
+    }
+    return possible;
+}
+
 static bool bar_access(hwaddr addr, bool io, uint8_t *data,
                         unsigned size, bool write)
 {
@@ -1129,6 +1199,9 @@ static bool bar_access(hwaddr addr, bool io, uint8_t *data,
     }
     if (!(size == 1 || size == 2 || size == 4 || size == 8)) {
         fatal_error("unsupported BAR access width");
+    }
+    if (qatomic_read(&bar_negative_filter) && !bar_access_may_match(addr, io)) {
+        return false;
     }
     /*
      * Owner-local descriptors are authoritative and published under the BQL.
