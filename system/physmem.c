@@ -2834,27 +2834,29 @@ static MemTxResult flatview_write_continue_step(MemTxAttrs attrs,
         return result;
     } else {
         /* RAM case */
-        int ret;
+        int ret = 0;
         uint8_t *ram_ptr = qemu_ram_ptr_length(mr->ram_block, mr_addr, l,
                                                false, true);
-
         MachineState *ms = MACHINE(qdev_get_machine());
+
         if (kvm_enabled() && ms->local_cpus != ms->smp.cpus && !ms->shm_path) {
-                struct kvm_dsm_memcpy cpy = {
-                    .write = true,
-                    .host_virt_addr = (__u64)ram_ptr,
-                    .userspace_addr = (__u64)buf,
-                    .length = *l,
-                };
-                ret = kvm_vm_ioctl(kvm_state, KVM_DSM_MEMCPY, &cpy);
-                if (ret < 0) {
-                    fprintf(stderr, "KVM_DSM_MEMCPY failed %d\n", ret);
-                }
-            }
-            else {
-                memmove(ram_ptr, buf, *l);
-            }
+            struct kvm_dsm_memcpy cpy = {
+                .write = true,
+                .host_virt_addr = (__u64)ram_ptr,
+                .userspace_addr = (__u64)buf,
+                .length = *l,
+            };
+
+            ret = kvm_vm_ioctl(kvm_state, KVM_DSM_MEMCPY, &cpy);
+        } else {
+            memmove(ram_ptr, buf, *l);
+        }
         invalidate_and_set_dirty(mr, mr_addr, *l);
+        if (ret) {
+            error_report("DSM RAM write failed: %s",
+                         strerror(ret < 0 ? -ret : EFAULT));
+            return MEMTX_ERROR;
+        }
 
         return MEMTX_OK;
     }
@@ -2943,26 +2945,29 @@ static MemTxResult flatview_read_continue_step(MemTxAttrs attrs, uint8_t *buf,
         return result;
     } else {
         /* RAM case */
+        int ret = 0;
         uint8_t *ram_ptr = qemu_ram_ptr_length(mr->ram_block, mr_addr, l,
                                                false, false);
+        MachineState *ms = MACHINE(qdev_get_machine());
 
-        MachineState *ms = MACHINE(qdev_get_machine());                                       
         if (kvm_enabled() && ms->local_cpus != ms->smp.cpus && !ms->shm_path) {
-                int ret;
-                struct kvm_dsm_memcpy cpy = {
-                    .write = false,
-                    .host_virt_addr = (__u64)ram_ptr,
-                    .userspace_addr = (__u64)buf,
-                    .length = *l,
-                };
-                ret = kvm_vm_ioctl(kvm_state, KVM_DSM_MEMCPY, &cpy);
-                if (ret < 0) {
-                    fprintf(stderr, "KVM_DSM_MEMCPY failed %d\n", ret);
-                }
-            }
-            else {
-                memcpy(buf, ram_ptr, *l);
-            }
+            struct kvm_dsm_memcpy cpy = {
+                .write = false,
+                .host_virt_addr = (__u64)ram_ptr,
+                .userspace_addr = (__u64)buf,
+                .length = *l,
+            };
+
+            ret = kvm_vm_ioctl(kvm_state, KVM_DSM_MEMCPY, &cpy);
+        } else {
+            memcpy(buf, ram_ptr, *l);
+        }
+        if (ret) {
+            memset(buf, 0, *l);
+            error_report("DSM RAM read failed: %s",
+                         strerror(ret < 0 ? -ret : EFAULT));
+            return MEMTX_ERROR;
+        }
 
         return MEMTX_OK;
     }
@@ -3441,11 +3446,12 @@ static MemTxResult dsm_ram_copy(void *host, void *buffer, size_t length,
         .userspace_addr = (uintptr_t)buffer, .length = length,
     };
     int ret = kvm_vm_ioctl(kvm_state, KVM_DSM_MEMCPY, &copy);
-    if (ret < 0) {
+    if (ret) {
         if (!write) {
             memset(buffer, 0, length);
         }
-        error_report("DSM scalar RAM copy failed: %s", strerror(-ret));
+        error_report("DSM scalar RAM copy failed: %s",
+                     strerror(ret < 0 ? -ret : EFAULT));
         return MEMTX_ERROR;
     }
     return MEMTX_OK;
