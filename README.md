@@ -997,3 +997,31 @@ enable 状态、精确 buffer 覆盖/生命周期、tail 回绕及 payload
 复用后，才能把范围提交接口接入原生 VF 的稳态路径。
 临时探针、接收/发送进程均已退出，无新增实验文件；
 guest #26、host 内核、HPET 不改。
+
+### 队列配置的范围失效与 enable 回复（2026-10-10）
+
+用控制路径的范围通知替代整个 DMA epoch 改变就清除配置：
+unmap 成功发布后、最终 unregister 或新注册对象插入前，对
+该 container 中设备观察器通知变化的 IOVA 范围。涉及 ASQ/ARQ
+ring 时清空观察状态；涉及已确认或待确认的 RX/TX ring 时
+清除队列配置和 enable 状态；未涉及这些 ring 的数据缓冲区
+变化保留配置。未确认请求被 ring 失效中断时保留歧义标记，
+不把旧 ACK 关联到新配置；container 销毁亦清空状态。
+
+增加无 DMA 复制的完整注册覆盖检查，CONFIG 请求及成功 ACK
+时必须具备完整 TX/RX ring 覆盖。仍执行完整 DMA 同步，没有
+直接访问未同步的硬件 pool，也没有启用稳态范围快速路径。
+
+分别记录配置成功与 ENABLE_QUEUES 成功：解析精确 12 字节
+queue_select，校验 VSI 及 RX/TX 掩码是已配置队列的子集，
+请求只进入 pending；发布后的 PF 成功 ACK 才确认 enable。
+失败、重复请求歧义、disable、VF reset 等仍采用保守失效。
+
+实际源码 memfd 检查通过：有符号 accessor/高地址、配置 ACK
+发布顺序、完整覆盖及空洞、无关映射注册/释放保持配置、
+失败发布保留原登记、引用递减及最终 unregister、ring unmap、
+相同 IOVA 重新映射不恢复旧配置、AdminQ ring 失效；
+enable ACK 发布顺序、RX/TX 不同掩码、失败回复、未知队列、
+重复请求及 disable。原有范围提交、生命周期/错误重试、
+64 KiB GPA 批次和 24 种完成交错检查也通过。
+真实设备的状态保留验证与吞吐验证另行记录，不提前宣称提升。

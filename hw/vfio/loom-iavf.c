@@ -26,6 +26,8 @@ struct LoomIAVFQueues {
     bool asq_enabled, arq_enabled, pending, ambiguous;
     uint16_t pending_mask, valid_mask;
     LoomIAVFQueue candidate[VF_QUEUE_COUNT], queue[VF_QUEUE_COUNT];
+    uint16_t vsi, enabled_rx, enabled_tx, pending_rx, pending_tx;
+    bool enable_pending;
 };
 
 static void queues_invalidate(LoomIAVFQueues *s)
@@ -33,6 +35,9 @@ static void queues_invalidate(LoomIAVFQueues *s)
     s->pending = false;
     s->pending_mask = 0;
     s->valid_mask = 0;
+    s->enabled_rx = s->enabled_tx = 0;
+    s->pending_rx = s->pending_tx = 0;
+    s->enable_pending = false;
 }
 
 void loom_iavf_reset(VFIODevice *dev)
@@ -51,7 +56,6 @@ void loom_iavf_free(VFIODevice *dev)
 static LoomIAVFQueues *queues_get(VFIODevice *dev)
 {
     LoomIAVFQueues *s;
-    uint64_t epoch;
 
     if (!dev->loom_iavf_irq_control ||
         !dev->bcontainer || !dev->bcontainer->loom_dma) {
@@ -61,12 +65,66 @@ static LoomIAVFQueues *queues_get(VFIODevice *dev)
         dev->loom_iavf_queues = g_new0(LoomIAVFQueues, 1);
     }
     s = dev->loom_iavf_queues;
-    epoch = loom_vfio_dma_epoch(dev->bcontainer);
-    if (s->epoch != epoch) {
-        queues_invalidate(s);
-        s->epoch = epoch;
-    }
+    s->epoch = loom_vfio_dma_epoch(dev->bcontainer);
     return s;
+}
+
+static bool range_intersects(hwaddr iova, uint64_t size,
+                             hwaddr base, uint64_t len)
+{
+    return len && (iova >= base ? iova - base < len : base - iova < size);
+}
+
+void loom_iavf_dma_invalidate_container(VFIOContainerBase *bc,
+                                       hwaddr iova, uint64_t size)
+{
+    VFIODevice *dev;
+
+    QLIST_FOREACH(dev, &bc->device_list, container_next) {
+        LoomIAVFQueues *s = dev->loom_iavf_queues;
+
+        if (!s) {
+            continue;
+        }
+        if (!size ||
+            range_intersects(iova, size, s->asq_base,
+                             s->asq_count * AQ_DESC_SIZE) ||
+            range_intersects(iova, size, s->arq_base,
+                             s->arq_count * AQ_DESC_SIZE)) {
+            loom_iavf_reset(dev);
+            continue;
+        }
+        for (unsigned i = 0; i < VF_QUEUE_COUNT; i++) {
+            const LoomIAVFQueue *q = s->pending ? &s->candidate[i] :
+                                                &s->queue[i];
+            unsigned mask = s->pending ? s->pending_mask : s->valid_mask;
+
+            if ((mask & (1U << i)) &&
+                (range_intersects(iova, size, q->tx_iova, q->tx_count * 16ULL) ||
+                 range_intersects(iova, size, q->rx_iova, q->rx_count * 32ULL))) {
+                /* Do not associate an old ACK with a later candidate. */
+                s->ambiguous |= s->pending || s->enable_pending;
+                queues_invalidate(s);
+                break;
+            }
+        }
+    }
+}
+
+static bool queues_covered(VFIODevice *dev, LoomIAVFQueues *s)
+{
+    for (unsigned i = 0; i < VF_QUEUE_COUNT; i++) {
+        LoomIAVFQueue *q = &s->candidate[i];
+
+        if ((s->pending_mask & (1U << i)) &&
+            (!loom_vfio_dma_range_covered(dev->bcontainer, q->tx_iova,
+                                          q->tx_count * 16ULL) ||
+             !loom_vfio_dma_range_covered(dev->bcontainer, q->rx_iova,
+                                          q->rx_count * 32ULL))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* virtchnl v1 also retains a legacy extra queue-pair-sized trailing slot. */
@@ -80,7 +138,8 @@ static bool queues_parse(LoomIAVFQueues *s, const uint8_t *msg, size_t len)
     }
     vsi = lduw_le_p(msg);
     pairs = lduw_le_p(msg + 2);
-    if (!pairs || pairs > VF_QUEUE_COUNT || (len != 8 + pairs * 64 && len != 72 + pairs * 64)) {
+    if (!pairs || pairs > VF_QUEUE_COUNT ||
+        (len != 8 + pairs * 64 && len != 72 + pairs * 64)) {
         return false;
     }
     for (unsigned i = 0; i < pairs; i++) {
@@ -113,6 +172,7 @@ static bool queues_parse(LoomIAVFQueues *s, const uint8_t *msg, size_t len)
         mask |= 1U << id;
     }
     s->pending_mask = mask;
+    s->vsi = vsi;
     return true;
 }
 
@@ -131,13 +191,41 @@ static void observe_request(VFIODevice *dev, LoomIAVFQueues *s,
     if (op == 2) {
         s->ambiguous = false;
     }
+    if (op == 8) {
+        uint8_t msg[12];
+        uint64_t addr = (uint64_t)(uint32_t)ldl_le_p(desc + 24) << 32 |
+                        (uint32_t)ldl_le_p(desc + 28);
+        uint32_t rx, tx;
+
+        if (s->pending || s->enable_pending || s->ambiguous) {
+            queues_invalidate(s);
+            s->ambiguous = true;
+            return;
+        }
+        if (!s->valid_mask || lduw_le_p(desc + 4) != sizeof(msg) ||
+            !(lduw_le_p(desc) & 0x1000) ||
+            loom_vfio_dma_read_baseline(dev->bcontainer, addr, msg, sizeof(msg)) ||
+            lduw_le_p(msg) != s->vsi || lduw_le_p(msg + 2)) {
+            queues_invalidate(s);
+            return;
+        }
+        rx = (uint32_t)ldl_le_p(msg + 4);
+        tx = (uint32_t)ldl_le_p(msg + 8);
+        if (!(rx | tx) || ((rx | tx) & ~s->valid_mask)) {
+            queues_invalidate(s);
+            return;
+        }
+        s->pending_rx = rx;
+        s->pending_tx = tx;
+        s->enable_pending = true;
+    }
     if (op == 6) {
         unsigned len = lduw_le_p(desc + 4);
         uint64_t addr = (uint64_t)(uint32_t)ldl_le_p(desc + 24) << 32 |
                         (uint32_t)ldl_le_p(desc + 28);
         uint8_t msg[72 + VF_QUEUE_COUNT * 64];
 
-        if (s->pending || s->ambiguous) {
+        if (s->pending || s->enable_pending || s->ambiguous) {
             queues_invalidate(s);
             s->ambiguous = true;
             return;
@@ -145,7 +233,7 @@ static void observe_request(VFIODevice *dev, LoomIAVFQueues *s,
         queues_invalidate(s);
         if (!(lduw_le_p(desc) & 0x1000) || len > sizeof(msg) ||
             loom_vfio_dma_read_baseline(dev->bcontainer, addr, msg, len) ||
-            !queues_parse(s, msg, len)) {
+            !queues_parse(s, msg, len) || !queues_covered(dev, s)) {
             return;
         }
         s->pending = true;
@@ -256,7 +344,7 @@ void loom_iavf_observe_completion(VFIODevice *dev)
         } else if (op == 6) {
             if (s->pending && !s->ambiguous &&
                 !(lduw_le_p(desc) & 4) && !lduw_le_p(desc + 6) &&
-                !ldl_le_p(desc + 12)) {
+                !ldl_le_p(desc + 12) && queues_covered(dev, s)) {
                 memcpy(s->queue, s->candidate, sizeof(s->queue));
                 s->valid_mask = s->pending_mask;
                 error_report("Loom iavf %s queue config observed mask=0x%x",
@@ -266,6 +354,17 @@ void loom_iavf_observe_completion(VFIODevice *dev)
             }
             s->pending = false;
             s->pending_mask = 0;
+        } else if (op == 8) {
+            if (s->enable_pending && !s->ambiguous && s->valid_mask &&
+                !(lduw_le_p(desc) & 4) && !lduw_le_p(desc + 6) &&
+                !ldl_le_p(desc + 12)) {
+                s->enabled_rx |= s->pending_rx;
+                s->enabled_tx |= s->pending_tx;
+            } else {
+                queues_invalidate(s);
+            }
+            s->enable_pending = false;
+            s->pending_rx = s->pending_tx = 0;
         } else if (op == 17) {
             uint8_t event[4];
             uint64_t addr = (uint64_t)(uint32_t)ldl_le_p(desc + 24) << 32 |

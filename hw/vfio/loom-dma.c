@@ -11,6 +11,7 @@
 #include "exec/address-spaces.h"
 #include "hw/boards.h"
 #include "hw/vfio/loom-dma.h"
+#include "hw/vfio/loom-iavf.h"
 #include "sysemu/kvm.h"
 
 typedef struct LoomDMAMap {
@@ -143,6 +144,7 @@ void loom_vfio_dma_free(VFIOContainerBase *bc)
     if (!bc->loom_dma) {
         return;
     }
+    loom_iavf_dma_invalidate_container(bc, 0, 0);
     for (GList *p = bc->loom_dma->maps; p; p = p->next) {
         LoomDMAMap *m = p->data;
 
@@ -303,11 +305,39 @@ static LoomDMABuffer buffer_view(LoomDMABuffer *b, uint64_t offset,
  * The caller must first publish device completions and supply all descriptor
  * and payload ranges transferred back to the device before ringing its tail.
  */
+bool loom_vfio_dma_range_covered(VFIOContainerBase *bc, hwaddr iova,
+                                 uint64_t size)
+{
+    hwaddr pos, end;
+
+    if (!bc || !bc->loom_dma || !size || size > 64 * MiB ||
+        iova + size < iova) {
+        return false;
+    }
+    end = iova + size;
+    for (pos = iova; pos < end; ) {
+        hwaddr covered = pos;
+
+        for (GList *p = bc->loom_dma->buffers; p; p = p->next) {
+            LoomDMABuffer *b = p->data;
+
+            if (b->iova <= pos && pos - b->iova < b->size) {
+                covered = MAX(covered, MIN(end, b->iova + b->size));
+            }
+        }
+        if (covered == pos) {
+            return false;
+        }
+        pos = covered;
+    }
+    return true;
+}
+
 int loom_vfio_dma_sync_to_device_range(VFIOContainerBase *bc, hwaddr iova,
                                        uint64_t size)
 {
     LoomVFIODMA *ctx;
-    hwaddr end, pos;
+    hwaddr end;
     int ret;
 
     if (!bc || !bc->loom_dma) {
@@ -318,20 +348,8 @@ int loom_vfio_dma_sync_to_device_range(VFIOContainerBase *bc, hwaddr iova,
     }
     ctx = bc->loom_dma;
     end = iova + size;
-    for (pos = iova; pos < end; ) {
-        hwaddr covered = pos;
-
-        for (GList *p = ctx->buffers; p; p = p->next) {
-            LoomDMABuffer *b = p->data;
-
-            if (b->iova <= pos && pos - b->iova < b->size) {
-                covered = MAX(covered, MIN(end, b->iova + b->size));
-            }
-        }
-        if (covered == pos) {
-            return -ENOENT;
-        }
-        pos = covered;
+    if (!loom_vfio_dma_range_covered(bc, iova, size)) {
+        return -ENOENT;
     }
     for (GList *p = ctx->buffers; p; p = p->next) {
         LoomDMABuffer *b = p->data;
@@ -427,6 +445,7 @@ int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
             return ret;
         }
     }
+    loom_iavf_dma_invalidate_container(bc, iova, size);
     for (p = ctx->buffers; p; p = next) {
         LoomDMABuffer *b = p->data;
         hwaddr start = MAX(iova, b->iova);
@@ -647,6 +666,7 @@ int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
         buffer_free(b);
         return ret;
     }
+    loom_iavf_dma_invalidate_container(bc, iova, size);
     ctx->epoch++;
     ctx->buffers = g_list_prepend(ctx->buffers, b);
     if (!ctx->buffers_tail) {
@@ -702,6 +722,7 @@ int loom_vfio_dma_command(VFIOContainerBase *bc, unsigned command,
             return ret;
         }
         if (!--b->references) {
+            loom_iavf_dma_invalidate_container(bc, iova, size);
             ctx->epoch++;
             if (ctx->buffers_tail == entry) {
                 ctx->buffers_tail = entry->prev;
