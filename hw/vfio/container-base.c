@@ -20,7 +20,7 @@
 static int vfio_container_dma_map_full(VFIOContainerBase *bcontainer,
                                        hwaddr iova, ram_addr_t size,
                                        void *vaddr, bool readonly,
-                                       const hwaddr *gpa, unsigned direction)
+                                       const hwaddr *gpa)
 {
     VFIOIOMMUClass *vioc = VFIO_IOMMU_GET_CLASS(bcontainer);
     int ret = loom_vfio_dma_map(bcontainer, iova, size, &vaddr, readonly);
@@ -43,7 +43,7 @@ static int vfio_container_dma_map_full(VFIOContainerBase *bcontainer,
             uint64_t len = MIN(size - offset, 64 * MiB);
 
             ret = loom_vfio_dma_register(bcontainer, iova + offset,
-                                         *gpa + offset, len, direction);
+                                         *gpa + offset, len, readonly ? 1 : 0);
             if (ret) {
                 goto rollback;
             }
@@ -65,18 +65,15 @@ int vfio_container_dma_map(VFIOContainerBase *bcontainer,
                            void *vaddr, bool readonly)
 {
     return vfio_container_dma_map_full(bcontainer, iova, size,
-                                       vaddr, readonly, NULL, readonly ? 1 : 0);
+                                       vaddr, readonly, NULL);
 }
 
 int vfio_container_dma_map_iommu(VFIOContainerBase *bcontainer,
                                  hwaddr iova, hwaddr gpa, ram_addr_t size,
-                                 void *vaddr, bool readonly, IOMMUAccessFlags perm)
+                                 void *vaddr, bool readonly)
 {
-    /* Standard DMA_FROM_DEVICE mappings need no recurring CPU publication. */
-    unsigned direction = readonly ? 1 : perm == IOMMU_WO ? 2 : 0;
-
     return vfio_container_dma_map_full(bcontainer, iova, size,
-                                       vaddr, readonly, &gpa, direction);
+                                       vaddr, readonly, &gpa);
 }
 
 int vfio_container_dma_unmap(VFIOContainerBase *bcontainer,

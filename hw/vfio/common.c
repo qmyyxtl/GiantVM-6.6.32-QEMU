@@ -323,7 +323,7 @@ static void vfio_iommu_map_notify(IOMMUNotifier *n, IOMMUTLBEntry *iotlb)
         ret = vfio_container_dma_map_iommu(bcontainer, iova,
                                            iotlb->translated_addr,
                                            iotlb->addr_mask + 1, vaddr,
-                                           read_only, iotlb->perm);
+                                           read_only);
         if (ret) {
             error_report("vfio_container_dma_map(%p, 0x%"HWADDR_PRIx", "
                          "0x%"HWADDR_PRIx", %p) = %d (%s)",

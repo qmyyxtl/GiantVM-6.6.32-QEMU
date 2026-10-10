@@ -76,7 +76,7 @@ int vfio_container_dma_map(VFIOContainerBase *bcontainer,
                            void *vaddr, bool readonly);
 int vfio_container_dma_map_iommu(VFIOContainerBase *bcontainer,
                                  hwaddr iova, hwaddr gpa, ram_addr_t size,
-                                 void *vaddr, bool readonly, IOMMUAccessFlags perm);
+                                 void *vaddr, bool readonly);
 int vfio_container_dma_unmap(VFIOContainerBase *bcontainer,
                              hwaddr iova, ram_addr_t size,
                              IOMMUTLBEntry *iotlb);
