@@ -2774,3 +2774,47 @@ Jinx临时IP和收发进程正常清理，没有实验脚本/日志/新磁盘文
 当前巨虚正常运行，Garen另一个worker-g4保持，不使用Lux。
 下一步仍需区分剩余BQL排队、设备DMA/vIOMMU处理及DSM，
 不能由本次减少操作推断全部竞争已消失。
+
+### 2026-10-11：用低频 DWARF 采样定位本地数据路径
+
+本轮不改实现：运行9cfe76fc2c/PID3850850 Garen，guest原#26/CPU0-3/HPET，
+BAR负向检查OFF、CQ短轮询0。仅测Garen卡2个本地CPU worker向Jinx，
+每窗口3轮6秒，所有字节/内容验证PASS，采样吞吐不作对照基线。
+使用已安装/usr/lib/linux-tools/6.8.0-146-generic/perf（6.8.12）；
+/usr/bin/perf包装器找不到6.6.32专用路径，不安装工具/改内核。
+记录cpu-clock:H/99Hz，evlist实际读回exclude_guest=1，
+perf数据只在memfd，--no-buildid --no-buildid-cache，不产生实验文件/缓存。
+
+初始frame-pointer回溯出现0xa8、0xc0、ASCII数据式伪地址和不合理g_free祖先，
+废弃fp Children归因，不能称g_free消耗约21%。改用dwarf,8192，
+report/script显式--kallsyms /proc/kallsyms，DWARF窗口lost samples=0。
+当前vfio_iommu_type1的srcversion与源码ko同为05DDC81760CD1558FACF0C1。
+用户态少量未知libc地址保留，不擅自归因。
+22秒DWARF report的inclusive（嵌套不能相加）：vtd_process_inv_desc28.00%、
+vtd_sync_shadow_page_table_range23.98%、vfio_container_dma_map_full11.12%、
+vfio_legacy_dma_map4.57%、vfio_legacy_dma_unmap4.06%、master handler1.74%。
+vtd_fetch_inv_desc两处内联路径15.93/12.14%，不能直接相加去重。
+这些路径也包含DSM，所以不能把vIOMMU inclusive全部称非DSM。
+
+再开22秒DWARF窗口，用perf script --inline导出内存文本；
+按样本period加权、每类每样本只记一次：2010样本/20303030100ns权重，
+解析失败块0。分类标识DSM=kvm_dsm/ivy_kvm_dsm/krdma_/dsm_；
+VFIO=vfio_/loom_vfio_（含QEMU回调与同步，不仅kernel map）；
+vIOMMU=vtd_/iommu_dispatch；RPC=handler/router_call/send_msg。
+按DSM→VFIO→vIOMMU→RPC→OTHER优先级互斥分类：
+18.756/34.527/12.537/2.637/31.542%，VFIO+vIOMMU互斥部分47.065%。
+不去重的inclusive：vIOMMU41.841%、VFIO40.398%、RPC2.985%；
+vIOMMU且无已识别DSM帧35.423%，VFIO且无已识别DSM帧34.527%。
+“不含已识别DSM帧”不证明完全独立于DSM（缺帧、DSM调用前后、通用syscall等）。
+CPU采样不含阻塞/等待时间，18.756%不是DSM总带宽损失，
+也不能排除DSM等待仍是关键瓶颈；仅Garen此负载，未观测Ezreal或双卡并行。
+
+下一步检查本地高频DMA/vIOMMU映射重建及QI处理。
+container-base.c普通vfio_container_dma_map传gpa=NULL，
+translated map才在硬件dma_map前注册/初始化外部pool。
+不能直接从巨虚参数删vIOMMU当作方案：普通staging尚无同样的GPA初始化契约。
+减少重建必须保留硬件IOMMU隔离、正确GPA/pool初始化、DMA发布与完成同步、
+失效/解除映射/释放顺序；新方案需匹配配置对照。
+本轮无新优化或吞吐提升声明。guest代码和HPET保持，
+CPU0-3/HPET及错误级dmesg为空已确认；巨虚与Garen worker-g4保持，
+Jinx正常STOPLOOM并删除临时IP，没有使用Lux或实验文件。
