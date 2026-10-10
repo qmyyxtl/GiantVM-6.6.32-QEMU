@@ -2767,13 +2767,64 @@ done:
     return true;
 }
 
-static bool vtd_process_inv_desc(IntelIOMMUState *s)
+/*
+ * Fetch two already-published descriptors together, without coalescing their
+ * execution. Keep the snapshot local to this fetch invocation. Ring/page
+ * boundaries and read failures retain the original single-descriptor path.
+ */
+static bool vtd_get_inv_desc_pair(IntelIOMMUState *s, VTDInvDesc pair[2])
+{
+    uint32_t dw = s->iq_dw ? 32 : 16;
+    uint32_t pending;
+    dma_addr_t addr;
+    hwaddr xlat, len = 2 * dw;
+    MemoryRegion *mr;
+    uint8_t raw[64];
+
+    if (!s->loom_qi_pair_read || s->root_scalable ||
+        !s->iq_size || s->iq_head >= s->iq_size ||
+        s->iq_tail >= s->iq_size || s->iq_head + 1 >= s->iq_size) {
+        return false;
+    }
+    pending = (s->iq_tail + s->iq_size - s->iq_head) % s->iq_size;
+    if (pending < 2 || s->iq > UINT64_MAX - s->iq_head * (uint64_t)dw) {
+        return false;
+    }
+    addr = s->iq + s->iq_head * (uint64_t)dw;
+    if (addr > UINT64_MAX - 2 * dw ||
+        (addr & 4095) > 4096 - 2 * dw) {
+        return false;
+    }
+    /* Prefetch only ordinary RAM, never speculative MMIO reads. */
+    mr = address_space_translate(&address_space_memory, addr, &xlat, &len,
+                                 false, MEMTXATTRS_UNSPECIFIED);
+    if (!memory_region_is_ram(mr) || len < 2 * dw ||
+        dma_memory_read(&address_space_memory, addr, raw, 2 * dw,
+                        MEMTXATTRS_UNSPECIFIED)) {
+        return false;
+    }
+    memset(pair, 0, 2 * sizeof(*pair));
+    for (unsigned i = 0; i < 2; i++) {
+        pair[i].lo = ldq_le_p(raw + i * dw);
+        pair[i].hi = ldq_le_p(raw + i * dw + 8);
+        if (dw == 32) {
+            pair[i].val[2] = ldq_le_p(raw + i * dw + 16);
+            pair[i].val[3] = ldq_le_p(raw + i * dw + 24);
+        }
+    }
+    return true;
+}
+
+static bool vtd_process_inv_desc(IntelIOMMUState *s,
+                                  const VTDInvDesc *prefetched)
 {
     VTDInvDesc inv_desc;
     uint8_t desc_type;
 
     trace_vtd_inv_qi_head(s->iq_head);
-    if (!vtd_get_inv_desc(s, &inv_desc)) {
+    if (prefetched) {
+        inv_desc = *prefetched;
+    } else if (!vtd_get_inv_desc(s, &inv_desc)) {
         s->iq_last_desc_type = VTD_INV_DESC_NONE;
         return false;
     }
@@ -2846,6 +2897,8 @@ static bool vtd_process_inv_desc(IntelIOMMUState *s)
 static void vtd_fetch_inv_desc(IntelIOMMUState *s)
 {
     int qi_shift;
+    VTDInvDesc pair[2];
+    unsigned paired = 0;
 
     /* Refer to 10.4.23 of VT-d spec 3.0 */
     qi_shift = s->iq_dw ? VTD_IQH_QH_SHIFT_5 : VTD_IQH_QH_SHIFT_4;
@@ -2861,7 +2914,15 @@ static void vtd_fetch_inv_desc(IntelIOMMUState *s)
         return;
     }
     while (s->iq_head != s->iq_tail) {
-        if (!vtd_process_inv_desc(s)) {
+        const VTDInvDesc *prefetched = NULL;
+
+        if (!paired && vtd_get_inv_desc_pair(s, pair)) {
+            paired = 2;
+        }
+        if (paired) {
+            prefetched = &pair[2 - paired--];
+        }
+        if (!vtd_process_inv_desc(s, prefetched)) {
             /* Invalidation Queue Errors */
             vtd_handle_inv_queue_error(s);
             break;
@@ -4366,6 +4427,23 @@ static void vtd_set_notify_context_cache(Object *obj, bool enabled,
     vtd_iommu_unlock(s);
 }
 
+static bool vtd_get_qi_pair_read(Object *obj, Error **errp)
+{
+    IntelIOMMUState *s = INTEL_IOMMU_DEVICE(obj);
+    return s->loom_qi_pair_read;
+}
+
+static void vtd_set_qi_pair_read(Object *obj, bool enabled, Error **errp)
+{
+    IntelIOMMUState *s = INTEL_IOMMU_DEVICE(obj);
+
+    if (enabled && !loom_iommu_enabled()) {
+        error_setg(errp, "QI pair reads require owner IOMMU");
+        return;
+    }
+    s->loom_qi_pair_read = enabled;
+}
+
 static void vtd_realize(DeviceState *dev, Error **errp)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
@@ -4401,6 +4479,9 @@ static void vtd_realize(DeviceState *dev, Error **errp)
 
     s->loom_notify_context_cache = loom_iommu_enabled() &&
         g_strcmp0(getenv("LOOM_VTD_NOTIFY_CONTEXT_CACHE"), "0") != 0;
+
+    s->loom_qi_pair_read = loom_iommu_enabled() &&
+        g_strcmp0(getenv("LOOM_VTD_QI_PAIR_READ"), "1") == 0;
 
     QLIST_INIT(&s->vtd_as_with_notifiers);
     qemu_mutex_init(&s->iommu_lock);
@@ -4440,6 +4521,8 @@ static void vtd_realize(DeviceState *dev, Error **errp)
     /* Pseudo address space under root PCI bus. */
     x86ms->ioapic_as = vtd_host_dma_iommu(bus, s, Q35_PSEUDO_DEVFN_IOAPIC);
     qemu_add_machine_init_done_notifier(&vtd_machine_done_notify);
+    object_property_add_bool(OBJECT(s), "loom-qi-pair-read",
+                             vtd_get_qi_pair_read, vtd_set_qi_pair_read);
     object_property_add_bool(OBJECT(s), "loom-notify-context-cache",
                              vtd_get_notify_context_cache,
                              vtd_set_notify_context_cache);

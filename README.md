@@ -1550,3 +1550,33 @@ VT-d 小块元数据访问以及必须保留的硬件映射操作。
 最终 10 秒两端 watchdog/GET_STATS 各完成 5 次，所检查 BUG、DMA fault、
 TX timeout 类错误为空，HPET 为 hpet。短窗口不能证明长期无丢包/重传。
 所有探针/辅助接收端与 Jinx 临时地址已清理，源码已同步两端 origin 分支。
+
+## owner QI 成对读取（默认关闭，待真实 VF 开关对照）
+
+当前 Garen 运行代码 `3f18950b0c` 的 24 秒入口计数窗口观察到 125450 次
+QI fetch，head/tail 距离均为 2。首个 BPF 程序因有符号取模编译失败，
+修正后才附加；该窗口只覆盖部分发送过程，不用于估计完整流量或吞吐收益。
+发送三轮 147.93/150.77/139.54 MiB/s，字节及内容校验通过。
+没有将带探针数字作为优化性能结果。
+
+依据 [Intel VT-d Rev.5.0](https://cdrdv2-public.intel.com/831418/vt-directed-io-spec.pdf)
+6.5.2（PDF 第 112 页），硬件允许一起获取多个已提交描述符，但必须逐条
+验证后推进 head；6.5.2.11/12（第 128/129 页）规定错误 head 与完成顺序。
+实现只将两个已发布描述符合并为一次内存读取，原失效 handler、WAIT、
+逐条 IQH 写回与错误停止位置不变。快照是 fetch 调用的栈局部值，
+不跨 doorbell、reset 或迁移保留，不缓存 PTE 或 hardware DMA mappings。
+
+仅 owner legacy 模式可启用，且不得跨环回绕或 4 KiB 页；单条、scalable、
+非 RAM/不足连续长度、地址溢出及批量读取失败均回退原单条读取。
+设置 `LOOM_VTD_QI_PAIR_READ=1` 启用；默认关闭。
+设备 realize 后可用 QMP `loom-qi-pair-read` bool 属性做同启动切换，
+普通非 owner 模式拒绝开启。QI MMIO 和 QMP 配置都由 BQL 串行执行，
+不会在同一次 fetch 中途切换。
+
+实际源码提取的 ASan/UBSan 测试通过：128/256-bit 解码、顺序 handler、
+每条 head 更新、环回绕、跨页回退、第一/第二条非法描述符停止位置、
+批量读失败回退、后续单条读失败、关闭/scalable/MMIO 回退和非法 tail。
+这些测试使用隔离的内存/handler stub，不能替代真实 WAIT/DMA 硬件验证。
+Ezreal 源码构建通过；两端当前运行仍是旧版本，未启用这项优化。
+下一步部署并核验两端 QMP 状态，做同启动开关交替的无探针性能对照，
+另测元数据读取计数及队列重配置/管理队列健康。
