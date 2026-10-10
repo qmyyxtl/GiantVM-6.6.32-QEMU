@@ -19,4 +19,12 @@ void loom_iavf_reset(VFIODevice *);
 void loom_iavf_free(VFIODevice *);
 /* size == 0 invalidates all state before container destruction. */
 void loom_iavf_dma_invalidate_container(VFIOContainerBase *, hwaddr, uint64_t);
+/*
+ * Physical AdminQ gate callback: zero prepared, negative error; no BAR write.
+ * Caller publishes prior completions, then authorizes/maps/synchronizes all
+ * submitted dependencies before hardware enable/tail. Requires sparse RAM.
+ */
+int loom_iavf_prepare_physical_admin(VFIODevice *, bool arq, bool enabling,
+                                    uint64_t base, unsigned count,
+                                    unsigned next, unsigned tail);
 #endif

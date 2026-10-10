@@ -3036,3 +3036,64 @@ QEMU 编译与 git diff --check 通过；未生成实验文件，不改 guest/HP
 运行巨虚仍保持原 vIOMMU 路径，Garen worker-g4 未动，不使用 Lux。
 下一步实现真实 queue dependency prepare 和 BAR adapter，再接 RAM listener，
 先做匹配配置的单机无 DSM 功能对照，再验证 Garen/Ezreal 巨虚。
+
+
+### 2026-10-11：实现物理 AdminQ 的 DMA 依赖准备函数
+
+新增 loom_iavf_prepare_physical_admin：需要已识别 X710 VF、合法稀疏 RAM
+授权和已记录的相同 AdminQ base/count；否则 ENOTSUP/ESTALE，不猜地址。
+此函数不写任何 BAR；未来 gate 的 prepare callback 可在返回0后启用/提交，
+caller 必须先完成旧 device completion 的 publication/reconcile。
+当前尚无 production caller/BAR adapter/RAM listener/启动开关，
+运行巨虚仍使用原 vIOMMU 路径，不能据此声称物理模式已可启动或提升带宽。
+
+ASQ enable 只初始化/同步整个 ring，不从未提交 descriptor 猜 payload。
+ARQ enable 从授权 CPU GPA 读取全部 descriptor，处理 BUF/datalen/high-low 地址，
+初始化/同步 payload 后再同步 ring。
+ASQ tail 处理 [next,tail)，ARQ tail 处理 [next,tail]，均支持回绕与拆成两个范围。
+使用有界 CPU read，ring 最多1023×32B；没有“全4GiB注册/扫描”替代依赖发现。
+AdminQ payload 用普通 RAM 双向权限，即使该命令带 AQ_FLAG_RD，
+也不能因上一次 TX 用途给设备保留不正确的只读 domain。
+
+支持 VF 常用 direct AQ 版本/驱动版本/shutdown，及已明确无额外 DMA 地址的
+virtchnl 基础 inline 控制消息；未知/高级协议、CONFIG_TX/RX 单队列格式等拒绝。
+CONFIG_VSI_QUEUES 共用原 queue-layout parser，检查数量/对齐/溢出、
+禁用 head writeback/header-split 等不支持格式，初始化/同步 TX/RX ring；
+另拒绝 child ring 与 AdminQ、同一配置中任一其他 ring 的字节重叠。
+此 prepare 不伪造 PF ACK 或修改 valid/pending；仍由实际 ACK 观察器确认。
+ENABLE_QUEUES 要求已 ACK 的 valid mask、正确 VSI、无未完成状态，
+拒绝重复 enable 已活跃的方向；先处理所有被启用 RX queue 的 payload，
+再同步 RX/TX ring，最后同步 enable-message 和引用它的 ASQ descriptor。
+RX buffer目前限定非 header-split、每 buffer≤4096B的原 native/scoped布局；
+最多4096 RX slot 的读取分成≤64KiB片段，不超出 authorized CPU read 契约。
+payload 不能覆盖已知 AdminQ/data descriptor；RAM hole/readonly/map/sync 错误
+返回 gate，不能继续写 tail。
+queue-transition op2/6/8/9/29 必须单 descriptor 提交，拒绝与其他命令混批，
+保持原 ACK 观察器“一次一个状态转移”的关联约束。
+
+单个 materialize 范围沿用已验证的失败回滚。
+多依赖准备若后面的范围失败，前面已准备的授权页可能保留至失败模式退出；
+不能宣称整个 callback 已全回滚，也不能释放可能被硬件访问的旧页。
+gate 会停止后续提交、尽力关闭 AdminQ；真实 adapter/退出回收仍需验证
+硬件停止与 snapshot/payload-before-completion 的完整顺序。
+准备时 payload-before-descriptor 的同步不等于完整 device completion 实现。
+
+memfd GCC ASan/UBSan 抽取当前实际 prepare/helpers、queue parser、
+queues_get/observe_write/queues_invalidate、完整 gate 源码：
+11923 次断言 PASS。RAM/授权/materialize/sync、BAR IO及部分 observer 外部回调模拟。
+覆盖所有 count1..16 的 ASQ/ARQ next/tail组合（独立逐 slot walk oracle）、
+空区间/回绕、4GiB以上 GPA、读取/map/readonly/sync失败、未知命令、
+legacy额外 queue-pair slot、child ring重叠/非法布局、ACK/enable条件、
+RX header-split/payload alias、4096 RX slot两次64KiB读取、
+错误转换及真实 gate+observer+prepare 的 native enable-before-base组合。
+组合 adapter 记录 original guest register 一次、内部 LEN gate 写入不覆盖请求，
+确认第一个 pool 出现前记录配置、准备后才启用、tail推进双方 next，
+以及 map失败不会硬件enable/后续提交。
+另原 bootstrap 14项检查仍 PASS；QEMU 编译与 git diff --check 通过。
+不是实际硬件 DMA、完整 guest boot 或性能测试；没有生成实验文件。
+guest、HPET、现有巨虚和 Garen worker-g4保持，不使用 Lux。
+
+下一步绑定真实 BAR adapter，并处理数据 doorbell 的新增 TX/RX payload 页。
+只接 AdminQ 然后启用物理模式不够：后续 TX 新分配 buffer 仍可能尚无硬件映射；
+因此必须在每次 data tail 前补齐授权/映射/同步，未知状态阻止转发。
+全部接通后才加入 RAM listener/opt-in 开关并验证匹配配置单机与真实巨虚。

@@ -333,7 +333,9 @@ static bool queues_covered(VFIODevice *dev, LoomIAVFQueues *s)
 }
 
 /* virtchnl v1 also retains a legacy extra queue-pair-sized trailing slot. */
-static bool queues_parse(LoomIAVFQueues *s, const uint8_t *msg, size_t len)
+static bool queue_config_parse(LoomIAVFQueue *candidate, uint16_t *out_mask,
+                                uint16_t *out_vsi, const uint8_t *msg,
+                                size_t len)
 {
     unsigned pairs;
     uint16_t mask = 0, vsi;
@@ -373,12 +375,17 @@ static bool queues_parse(LoomIAVFQueues *s, const uint8_t *msg, size_t len)
             !q.rx_buffer_size || q.rx_buffer_size > 65536) {
             return false;
         }
-        s->candidate[id] = q;
+        candidate[id] = q;
         mask |= 1U << id;
     }
-    s->pending_mask = mask;
-    s->vsi = vsi;
+    *out_mask = mask;
+    *out_vsi = vsi;
     return true;
+}
+
+static bool queues_parse(LoomIAVFQueues *s, const uint8_t *msg, size_t len)
+{
+    return queue_config_parse(s->candidate, &s->pending_mask, &s->vsi, msg, len);
 }
 
 static void observe_request(VFIODevice *dev, LoomIAVFQueues *s,
@@ -1002,4 +1009,296 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
         }
     }
     return 1;
+}
+
+/*
+ * Physical AdminQ dependency preparation. These functions never write a BAR;
+ * the enable/tail gate may proceed only after this callback returns zero.
+ */
+static int physical_stage(VFIODevice *dev, uint64_t addr, uint64_t size)
+{
+    int ret = loom_vfio_ram_materialize(dev->bcontainer, addr, size, true);
+
+    return ret ? ret :
+        loom_vfio_dma_sync_to_device_range(dev->bcontainer, addr, size);
+}
+
+static bool physical_inline_op(unsigned op)
+{
+    switch (op) {
+    case 1: case 2: case 3: case 7: case 9:
+    case 10: case 11: case 12: case 13: case 14: case 15: case 18:
+    case 23: case 24: case 25: case 26: case 27: case 28: case 29:
+    case 44: case 51: case 52: case 53: case 54: case 55: case 56: case 57:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static int physical_prepare_rx_queue(VFIODevice *dev, LoomIAVFQueues *s,
+                                      const LoomIAVFQueue *q)
+{
+    g_autofree uint8_t *desc = NULL;
+    int ret;
+
+    /* Match the native non-header-split completion path's supported layout. */
+    if (!q->rx_buffer_size || q->rx_buffer_size > 4096) {
+        return -ENOTSUP;
+    }
+    desc = g_malloc(q->rx_count * 32ULL);
+    /* Authorized CPU reads are bounded to 64 KiB each, including 4096 slots. */
+    for (unsigned n = 0; n < q->rx_count; n += 2048) {
+        unsigned count = MIN(q->rx_count - n, 2048);
+
+        ret = loom_vfio_ram_read_cpu(dev->bcontainer, q->rx_iova + n * 32ULL,
+                                     desc + n * 32, count * 32ULL);
+        if (ret) {
+            return ret;
+        }
+    }
+    for (unsigned n = 0; n < q->rx_count; n++) {
+        uint64_t address = ldq_le_p(desc + n * 32);
+
+        if (!address || ldq_le_p(desc + n * 32 + 8) ||
+            address > UINT64_MAX - q->rx_buffer_size ||
+            payload_intersects_descriptors(s, address, q->rx_buffer_size)) {
+            return -ENOTSUP;
+        }
+    }
+    for (unsigned n = 0; n < q->rx_count; n++) {
+        ret = physical_stage(dev, ldq_le_p(desc + n * 32), q->rx_buffer_size);
+        if (ret) {
+            return ret;
+        }
+    }
+    /* All RX payloads precede the descriptors that expose them to hardware. */
+    return physical_stage(dev, q->rx_iova, q->rx_count * 32ULL);
+}
+
+static bool physical_queue_layout(LoomIAVFQueues *s,
+                                   const LoomIAVFQueue *candidate, uint16_t mask)
+{
+    for (unsigned id = 0; id < VF_QUEUE_COUNT; id++) {
+        const LoomIAVFQueue *q = &candidate[id];
+        uint64_t address[2] = { q->tx_iova, q->rx_iova };
+        uint64_t size[2] = { q->tx_count * 16ULL, q->rx_count * 32ULL };
+
+        if (!(mask & (1U << id))) {
+            continue;
+        }
+        for (unsigned r = 0; r < 2; r++) {
+            if (range_intersects(address[r], size[r], s->asq_base,
+                                  s->asq_count * AQ_DESC_SIZE) ||
+                range_intersects(address[r], size[r], s->arq_base,
+                                  s->arq_count * AQ_DESC_SIZE)) {
+                return false;
+            }
+            for (unsigned other = id; other < VF_QUEUE_COUNT; other++) {
+                const LoomIAVFQueue *o = &candidate[other];
+
+                if (!(mask & (1U << other))) {
+                    continue;
+                }
+                if ((other != id || r != 0) &&
+                    range_intersects(address[r], size[r], o->tx_iova,
+                                      o->tx_count * 16ULL)) {
+                    return false;
+                }
+                if ((other != id || r != 1) &&
+                    range_intersects(address[r], size[r], o->rx_iova,
+                                      o->rx_count * 32ULL)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static int physical_prepare_request(VFIODevice *dev, LoomIAVFQueues *s,
+                                     const uint8_t *desc)
+{
+    unsigned opcode = lduw_le_p(desc + 2), op = ldl_le_p(desc + 8);
+    unsigned flags = lduw_le_p(desc), len = lduw_le_p(desc + 4);
+    uint64_t address = (uint64_t)ldl_le_p(desc + 24) << 32 |
+                       ldl_le_p(desc + 28);
+    uint8_t msg[72 + VF_QUEUE_COUNT * 64];
+    int ret;
+
+    if ((flags & 7) || (len && !(flags & 0x1000)) ||
+        ((flags & 0x1000) && (!len || !address)) ||
+        (len && address > UINT64_MAX - len)) {
+        return -EINVAL;
+    }
+    if (opcode != 0x0801 && opcode != 1 && opcode != 2 && opcode != 3) {
+        return -ENOTSUP;
+    }
+    if (opcode == 0x0801 &&
+        op != 6 && op != 8 && !physical_inline_op(op)) {
+        return -ENOTSUP;
+    }
+    if (len && payload_intersects_descriptors(s, address, len)) {
+        return -ENOTSUP;
+    }
+    if (opcode == 0x0801 && (op == 6 || op == 8)) {
+        if (!(flags & 0x1000) || !(flags & 0x400) ||
+            len > sizeof(msg)) {
+            return -EINVAL;
+        }
+        ret = loom_vfio_ram_read_cpu(dev->bcontainer, address, msg, len);
+        if (ret) {
+            return ret;
+        }
+        if (op == 6) {
+            LoomIAVFQueue candidate[VF_QUEUE_COUNT] = { 0 };
+            uint16_t mask, vsi;
+
+            if (s->pending || s->enable_pending || s->ambiguous ||
+                s->enabled_rx || s->enabled_tx ||
+                !queue_config_parse(candidate, &mask, &vsi, msg, len) ||
+                !physical_queue_layout(s, candidate, mask)) {
+                return -ENOTSUP;
+            }
+            for (unsigned id = 0; id < VF_QUEUE_COUNT; id++) {
+                const LoomIAVFQueue *q = &candidate[id];
+
+                if (!(mask & (1U << id))) {
+                    continue;
+                }
+                ret = physical_stage(dev, q->tx_iova, q->tx_count * 16ULL);
+                if (!ret) {
+                    ret = physical_stage(dev, q->rx_iova, q->rx_count * 32ULL);
+                }
+                if (ret) {
+                    return ret;
+                }
+            }
+        } else {
+            uint32_t rx, tx;
+
+            if (len != 12 || lduw_le_p(msg) != s->vsi ||
+                lduw_le_p(msg + 2) || !s->valid_mask || s->pending ||
+                s->enable_pending || s->ambiguous) {
+                return -ENOTSUP;
+            }
+            rx = ldl_le_p(msg + 4);
+            tx = ldl_le_p(msg + 8);
+            if (!(rx | tx) || ((rx | tx) & ~s->valid_mask)) {
+                return -EINVAL;
+            }
+            if ((rx & s->enabled_rx) || (tx & s->enabled_tx)) {
+                return -ENOTSUP;
+            }
+            for (unsigned id = 0; id < VF_QUEUE_COUNT; id++) {
+                if (rx & (1U << id)) {
+                    ret = physical_prepare_rx_queue(dev, s, &s->queue[id]);
+                    if (ret) {
+                        return ret;
+                    }
+                }
+                if (tx & (1U << id)) {
+                    ret = physical_stage(dev, s->queue[id].tx_iova,
+                                           s->queue[id].tx_count * 16ULL);
+                    if (ret) {
+                        return ret;
+                    }
+                }
+            }
+        }
+    }
+    /* RAM authority is bidirectional even when this command uses AQ_FLAG_RD. */
+    return len ? physical_stage(dev, address, len) : 0;
+}
+
+int loom_iavf_prepare_physical_admin(VFIODevice *dev, bool arq, bool enabling,
+                                    uint64_t base, unsigned count,
+                                    unsigned next, unsigned tail)
+{
+    LoomIAVFQueues *s;
+    unsigned span, first;
+    uint8_t *desc;
+    int ret;
+
+    if (!dev || !dev->bcontainer || !dev->bcontainer->loom_ram ||
+        !dev->loom_iavf_irq_control) {
+        return -ENOTSUP;
+    }
+    if (!count || count >= AQ_MAX_COUNT || !base || (base & 63) ||
+        base > UINT64_MAX - count * AQ_DESC_SIZE ||
+        next >= count || tail >= count) {
+        return -EINVAL;
+    }
+    s = queues_get(dev);
+    if (!s) {
+        return -ENOTSUP;
+    }
+    if (base != (arq ? s->arq_base : s->asq_base) ||
+        count != (arq ? s->arq_count : s->asq_count)) {
+        return -ESTALE;
+    }
+    if (enabling && !arq) {
+        /* Unsubmitted ASQ entries have no external payload dependency. */
+        return physical_stage(dev, base, count * AQ_DESC_SIZE);
+    }
+    span = enabling ? count :
+           (tail + count - next) % count + (arq ? 1 : 0);
+    if (!span) {
+        return 0;
+    }
+    if (enabling) {
+        next = 0;
+    }
+    first = MIN(span, count - next);
+    desc = s->submit_desc;
+    ret = loom_vfio_ram_read_cpu(dev->bcontainer, base + next * AQ_DESC_SIZE,
+                                 desc, first * AQ_DESC_SIZE);
+    if (!ret && first < span) {
+        ret = loom_vfio_ram_read_cpu(dev->bcontainer, base,
+                                     desc + first * AQ_DESC_SIZE,
+                                     (span - first) * AQ_DESC_SIZE);
+    }
+    if (ret) {
+        return ret;
+    }
+    if (!arq && span > 1) {
+        /* The observer correlates one outstanding queue transition at a time. */
+        for (unsigned n = 0; n < span; n++) {
+            const uint8_t *d = desc + n * AQ_DESC_SIZE;
+            unsigned op = ldl_le_p(d + 8);
+
+            if (lduw_le_p(d + 2) == 0x0801 &&
+                (op == 2 || op == 6 || op == 8 || op == 9 || op == 29)) {
+                return -ENOTSUP;
+            }
+        }
+    }
+    for (unsigned n = 0; n < span; n++) {
+        const uint8_t *d = desc + n * AQ_DESC_SIZE;
+
+        if (arq) {
+            unsigned len = lduw_le_p(d + 4);
+            uint64_t address = (uint64_t)ldl_le_p(d + 24) << 32 |
+                               ldl_le_p(d + 28);
+
+            if (!(lduw_le_p(d) & 0x1000) || !len || !address ||
+                address > UINT64_MAX - len ||
+                range_intersects(address, len, base, count * AQ_DESC_SIZE) ||
+                payload_intersects_descriptors(s, address, len)) {
+                return -ENOTSUP;
+            }
+            ret = physical_stage(dev, address, len);
+        } else {
+            ret = physical_prepare_request(dev, s, d);
+        }
+        if (ret) {
+            return ret;
+        }
+    }
+    ret = physical_stage(dev, base + next * AQ_DESC_SIZE,
+                           first * AQ_DESC_SIZE);
+    if (!ret && first < span) {
+        ret = physical_stage(dev, base, (span - first) * AQ_DESC_SIZE);
+    }
+    return ret;
 }
