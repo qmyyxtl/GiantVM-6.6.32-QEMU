@@ -3548,3 +3548,79 @@ Garen无关worker-g4保持，Lux未访问，没有host reboot。
 下一步仍需严格验证descriptor snapshot与本批量检查的端到端收益，
 并继续检查其他完成处理/复制/ioctl成本、RX原生对照、
 长期physical映射增长及reset恢复。目标保持未完成。
+
+### 2026-10-11：接收路径普通 VM 暂存/直接 DMA/恢复暂存对照
+
+本轮代码仍88d6c47ce9，没有改guest、HPET或host kernel，也没有访问Lux。
+先测当前巨虚Garen本地单卡，再正常poweroff两端，Garen用同一QEMU的普通
+4本地CPU模式启动（无-local-cpu，无跨节点RDMA连接），不切换host KVM模块。
+这不是upstream QEMU/KVM基线，是同代码移除跨节点因素的控制。
+同一VF0c:02.0、同guest #26、4CPU/4GiB两NUMA、同kernel append、
+无guest vIOMMU、两queue RX512/TX128/RPS/XPS0、data IRQ精确guest CPU0/1。
+native与giant启动参数不完全相同：native显式禁两个ioeventfd属性，
+giant保持既有aggregate设备配置；没有据此精确分解DSM代价。
+
+负载为Jinx198.18.10.3→guest enp0s7，单连接/接收CPU0，
+parent固定CPU0/1，每轮256MiB，3轮，pattern/字节数/source elapsed均正确。
+TCP source每块8MiB，共32块，guest每次recv最多64KiB并检查字节模式。
+不是长时间饱和线速或标准benchmark；固定字节模式也可能使baseline合并受益。
+普通VM A→B→A，只改下面三个DMA开关，不改软件版本/IRQ模式：
+A: LOOM_VFIO_PHYSICAL_DMA=1、LOOM_VFIO_DSM_DMA=1、LOOM_VFIO_LOCAL_STAGE=1，
+保留软件DMA staging/完成发布，但所有CPU都在同一主机。
+B: 上述三个开关均0，直接映射guest RAM作VFIO DMA。
+每次切换均正常guest poweroff、QEMU EXIT0、VF恢复iavf后再新启动。
+host线程未固定相同CPU，host RAM落点、guest启动状态也没有严格控制；
+所以不能把A/B/A作为无混杂的固定损失比例证明。
+
+| 单卡RX MiB/s | round0 | round1 | round2 | median |
+| --- | ---: | ---: | ---: | ---: |
+| 巨虚本地Garen单卡 | 119.390 | 126.448 | 122.167 | 122.167 |
+| 普通VM，staging A | 323.289 | 265.443 | 265.333 | 265.443 |
+| 普通VM，直接DMA B | 637.772 | 640.610 | 464.406 | 637.772 |
+| 普通VM，恢复staging A | 352.532 | 360.552 | 275.502 | 352.532 |
+
+直接DMA高于前后两次staging，虽然staging重启前后波动明显。
+这改变优化优先级：RX不仅有跨节点开销，软件DMA暂存/完成发布在普通VM里
+也有可观成本。不能用638-265简单归因于memcpy，或用265-122归因于DSM。
+native阶段guest error级dmesg检查为空；A中出现hrtimer耗时warning，
+没有调整HPET。现有FAT未正常卸载warning在各次启动仍出现，本轮未做fsck。
+
+恢复staging后做12秒主机CPU采样：
+perf6.8.12、cpu-clock:H 99Hz、DWARF8192、memfd、禁止buildid缓存，
+实时binary inode匹配、evlist exclude_guest=1核实。
+首次record失败且未给出错误字符串，任务已结束/memfd关闭；不使用该次证据。
+同一VM重试成功，939样本/9.484848秒CPU权重，bad block0/script stderr空。
+原打印limits继承旧24秒字样，实际record子命令sleep12，按12秒解释。
+939样本的互斥分类：VFIO53.887%、OTHER46.006%、DSM名称栈0.106%。
+唯一DSM名称样本是本地instruction-fetch经过kvm_dsm_release_page，
+不表示有跨节点RDMA传输；不要宣称所有DSM命名函数都不存在。
+VFIO分项（全部被采主机CPU的比例）：
+完成同步34.611%、提交准备10.543%、materialize5.005%、完整sync0.852%。
+unknown叶14.590%（VFIO内unknown13.206%），精度有限，
+不含guest CPU/阻塞等待/外部kernel worker，也未独立检查零lost events。
+采样流量与三轮性能数字分开，不拿采样期间吞吐作干净性能对照。
+
+实际热点链：
+flatview_translate → address_space_write → merge_buffer →
+loom_vfio_dma_publish_snapshot → loom_iavf_sync_data_completion。
+当前binary DWARF将+0x3f5/+0x41d定位loom-iavf.c:1032/1035，
+对应RX descriptor metadata[0..7]与[9..31]发布；
+每次按baseline差异拆成多个changed-byte run，每段重新做地址翻译/查表。
+这是具体优化线索，不是证明整个34.6%都来自地址翻译或这些两处调用。
+
+下一步优先研究减少RX完成发布的零碎写调用：
+只能在证明active RX descriptor所有权、DD之前CPU不能复用该项、
+queue/ring alias和generation失效检查成立后，合并owned metadata范围；
+仍须保留payload与metadata先于最后DD发布、范围外CPU数据与baseline、
+错误情况下不提前宣布完成。不能直接复制整页或取消DD顺序。
+RX payload按已捕获packet length而非capacity复制也是候选，
+但尚未核实完整硬件/driver所有权契约，当前没有实现或收益声明。
+这比继续围绕完整DMA扫描微调更值得优先验证；整体目标仍未完成。
+
+三次普通VM PID4033938/4036103/4038670均正常退出/VF恢复，
+最后恢复巨虚：Garen4044085（session18296）、Ezreal748351（session57301）。
+guest正常启动/login、两卡UP、两盘枚举配置保留、#26/HPET/4CPU在线；
+data vectors按名称绑定0/1/2/3，error级guest dmesg为空。
+Jinx source正常STOP退出、两个临时IP已删除、49162无监听，
+perf/所有流量任务已结束、memfd关闭；没有实验文件或新磁盘。
+Garen无关worker-g4 PID6122保持，没有host reboot。
