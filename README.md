@@ -1419,3 +1419,49 @@ TX timeout 类错误未出现，HPET 为 hpet。短测试不能证明长期无�
 当前保留缓存开启；各探针、发送/接收辅助进程和 Jinx 临时地址已清理。
 host 内核及 guest 代码不变，磁盘不重测，Garen 既有 libvirt VM 未停止。
 下一步继续区分剩余 DMA 生命周期、队列处理与锁等待成本。
+
+## 远端 guest CPU offline 隔离对照（2026-10-10）
+
+按用户建议，在同一次巨虚启动内比较全部 CPU 在线、远端 CPU offline、
+恢复在线三种状态。未改 guest/host/QEMU 源码，未重启 host；QEMU 运行代码
+`93412ed86f`，context 通知缓存开启，guest #26、HPET、4 GiB、两 NUMA 节点
+保持不变。测试 Garen owner0 的单 VF 和 1 GiB raw 单盘，两个 worker 始终
+固定 CPU 0/1；offline 的是 Ezreal owner1 的 guest CPU 2/3。
+
+| 项目（MiB/s，中位数） | 全部在线 A | CPU 2/3 offline B | 恢复在线 A2 |
+| --- | ---: | ---: | ---: |
+| 单 VF → 第三方 Jinx | 144.74 | 178.52 | 155.87 |
+| 单盘读 | 1750.68 | 1925.77 | 1898.16 |
+| 单盘写（含 fsync） | 974.17 | 971.43 | 956.73 |
+
+NIC 每状态三轮、每轮 6 秒，两个发送 worker，接收端字节与内容校验通过。
+三轮分别为 A 144.74/143.62/155.88，B 200.13/169.55/178.52，
+A2 155.87/158.14/144.58。offline 中位数比 A 高 23.34%、比 A2 高 14.53%，
+是减少远端 CPU 活动值得继续调查的信号，三轮短窗口尚不能证明稳定因果关系。
+当前 Garen NIC 数值不能当作与之前 Ezreal 普通 VM 的严格同 host 对照，
+单卡与普通 VM 的主要差距仍未解决。
+
+磁盘使用原生 Linux AIO、O_DIRECT、1 MiB、每 worker QD4，三轮各 8 秒，
+另有 2 秒预热；写包含 fsync，完成后 direct readback 首/中/尾位置校验通过。
+读三轮 A 1804.59/1705.75/1750.68，B 1930.55/1764.56/1925.77，
+A2 1898.16/1699.30/1899.72；写三轮 A 928.16/976.63/974.17，
+B 994.00/971.43/949.91，A2 942.01/956.73/957.04。
+恢复后读带宽也接近 offline 状态，B 比 A2 仅高 1.45%，不能将读提升
+直接归因于 offline；写没有显著改善。循环读取小 raw 后端的结果不能代表
+大数据集持续介质吞吐。
+
+CPU offline 会将远端 NIC 的有效 IRQ 目标移到 CPU 0/1。恢复在线后，
+请求亲和性仍为 2–3，但有效目标曾仍在 0/1；Linux IRQ 代码允许延迟迁移，
+重新写 mask 不能保证立即完成，实际中断到达后才迁移。因此先在 CPU 2/3
+各发送三次远端 NIC ping，确认远端 NIC IRQ 40/41/42 有效目标分别为 2/3/2，
+本地 NIC IRQ 37/38/39 为 0/1/0，再进行表中的 A2 回测。
+恢复确认前另一次 NIC 回测未用于表中的 A2。磁盘使用 managed MSI-X，
+未强改其 mask；CPU 0/1 对应 worker 的本地队列 IRQ 保持本地。
+
+最终 guest CPU 0–3 全部在线，owner-local NIC 请求与有效亲和性已核实。
+10 秒健康窗口两端 watchdog 和 GET_STATS 各完成 5 次，所检查 BUG、
+DMA fault、TX timeout 类错误为空，HPET 为 hpet。所有临时探针、
+Jinx 接收进程及 198.18.10.3 地址已清理；Garen 原有 libvirt VM 保持运行。
+本次没有计数 DSM page fault，不能由吞吐变化直接认定 DSM 为原因。
+下一步优先区分远端 CPU 后台活动引起的页面迁移/共享竞争，与剩余本地
+VT-d、VFIO DMA map/unmap 和队列处理固定成本。
