@@ -1,6 +1,7 @@
 #include "qemu/osdep.h"
 #include "qemu/rcu.h"
 #include "qemu/atomic.h"
+#include "qemu/processor.h"
 #include <poll.h>
 #include <sys/eventfd.h>
 #include "rdma-gvm.h"
@@ -90,6 +91,7 @@ static struct {
     bool recv_cq_events; /* Immutable: channels created at initialization. */
     bool recv_cq_event_wait; /* Runtime receive policy, atomic access. */
     int stop_fd;
+    uint32_t rpc_spin_ns; /* Atomic; snapshot once per completion wait. */
 } g_ctx = { .stop_fd = -1 };
 
 // 消息处理回调
@@ -153,6 +155,21 @@ int rdma_router_set_recv_cq_events(bool enabled)
      * acknowledged on resuming event mode or during shutdown.
      */
     qatomic_set(&g_ctx.recv_cq_event_wait, enabled);
+    return 0;
+}
+
+/* A live policy change affects new waits, never CQ ownership or DMA state. */
+uint64_t rdma_router_get_rpc_spin_ns(void)
+{
+    return qatomic_read(&g_ctx.rpc_spin_ns);
+}
+
+int rdma_router_set_rpc_spin_ns(uint64_t budget)
+{
+    if (budget > 20000) {
+        return -EINVAL;
+    }
+    qatomic_set(&g_ctx.rpc_spin_ns, (uint32_t)budget);
     return 0;
 }
 
@@ -710,6 +727,50 @@ static int post_all_recvs(rdma_conn_t *conn)
     return 0;
 }
 
+/*
+ * Spend at most budget nanoseconds spinning per wait, starting on its first
+ * empty poll. Once exhausted, retain the original sleep policy for this wait.
+ * Snapshotting the atomic policy avoids extending an active wait on QMP changes.
+ */
+typedef struct RdmaRpcWait {
+    uint64_t start_ns;
+    uint32_t budget_ns;
+    bool started;
+} RdmaRpcWait;
+
+static RdmaRpcWait rdma_rpc_wait_init(void)
+{
+    return (RdmaRpcWait) {
+        .budget_ns = qatomic_read(&g_ctx.rpc_spin_ns),
+    };
+}
+
+static uint64_t rdma_monotonic_ns(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static void rdma_rpc_wait_pause(RdmaRpcWait *wait)
+{
+    if (wait->budget_ns) {
+        uint64_t now = rdma_monotonic_ns();
+
+        if (!wait->started) {
+            wait->start_ns = now;
+            wait->started = true;
+        }
+        if (now - wait->start_ns < wait->budget_ns) {
+            cpu_relax();
+            return;
+        }
+        wait->budget_ns = 0;
+    }
+    usleep(1);
+}
+
 static uint64_t rdma_monotonic_ms(void);
 
 static int rdma_send_msg(rdma_conn_t *conn, rdma_msg_header_t *hdr, const void *data)
@@ -773,6 +834,7 @@ static int rdma_send_msg(rdma_conn_t *conn, rdma_msg_header_t *hdr, const void *
 
 static int rdma_wait_completion(rdma_conn_t *conn, struct ibv_wc *wc)
 {
+    RdmaRpcWait wait = rdma_rpc_wait_init();
     uint64_t deadline = rdma_monotonic_ms() + 5000;
     while (rdma_monotonic_ms() < deadline) {
         int n = ibv_poll_cq(conn->cq, 1, wc);
@@ -787,7 +849,7 @@ static int rdma_wait_completion(rdma_conn_t *conn, struct ibv_wc *wc)
             }
             return 0;
         }
-        usleep(1);
+        rdma_rpc_wait_pause(&wait);
     }
     return -ETIMEDOUT;
 }
@@ -1037,6 +1099,7 @@ int rdma_router_call(int target_id, uint16_t msg_type,
     rdma_conn_t *req, *resp;
     rdma_msg_header_t hdr;
     uint64_t deadline;
+    RdmaRpcWait wait;
     int result = -EIO;
 
     if (target_id < 0 || target_id >= g_ctx.total_nodes ||
@@ -1063,6 +1126,7 @@ int rdma_router_call(int target_id, uint16_t msg_type,
         result = 0;
         goto out;
     }
+    wait = rdma_rpc_wait_init();
     while (rdma_monotonic_ms() < deadline) {
         struct ibv_wc wc;
         int n = ibv_poll_cq(resp->cq, 1, &wc);
@@ -1070,7 +1134,7 @@ int rdma_router_call(int target_id, uint16_t msg_type,
             goto out;
         }
         if (!n) {
-            usleep(1);
+            rdma_rpc_wait_pause(&wait);
             continue;
         }
         if (wc.status != IBV_WC_SUCCESS || wc.opcode != IBV_WC_RECV ||

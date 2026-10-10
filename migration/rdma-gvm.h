@@ -55,6 +55,10 @@ void rdma_router_set_control_handler(msg_handler_t handler);
 bool rdma_router_get_recv_cq_events(void);
 int rdma_router_set_recv_cq_events(bool enabled);
 
+/* Bounded synchronous CQ polling policy, 0..20000 ns, default zero. */
+uint64_t rdma_router_get_rpc_spin_ns(void);
+int rdma_router_set_rpc_spin_ns(uint64_t budget);
+
 // 清理
 void rdma_router_cleanup(void);
 

@@ -3,6 +3,7 @@
 #include "sysemu/sysemu.h"
 #include "sysemu/runstate.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qemu/error-report.h"
 #include "hw/i386/apic.h"
 #include "hw/intc/ioapic.h"
@@ -544,6 +545,27 @@ static void router_set_recv_cq_events(Object *obj, bool enabled, Error **errp)
     }
 }
 
+static void router_get_rpc_spin_ns(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    uint64_t budget = rdma_router_get_rpc_spin_ns();
+
+    visit_type_uint64(v, name, &budget, errp);
+}
+
+static void router_set_rpc_spin_ns(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    uint64_t budget;
+
+    if (!visit_type_uint64(v, name, &budget, errp)) {
+        return;
+    }
+    if (rdma_router_set_rpc_spin_ns(budget) < 0) {
+        error_setg(errp, "RDMA RPC spin budget must be in 0..20000 ns");
+    }
+}
+
 void start_io_router(void)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
@@ -582,6 +604,9 @@ void start_io_router(void)
     object_property_add_bool(OBJECT(ms), "loom-rdma-recv-cq-events",
                              router_get_recv_cq_events,
                              router_set_recv_cq_events);
+    object_property_add(OBJECT(ms), "loom-rdma-rpc-spin-ns", "uint64",
+                        router_get_rpc_spin_ns, router_set_rpc_spin_ns,
+                        NULL, NULL);
     printf("RDMA router started successfully\n");
 }
 
