@@ -75,6 +75,14 @@ int iova_tree_insert(IOVATree *tree, const DMAMap *map);
  */
 void iova_tree_remove(IOVATree *tree, DMAMap map);
 
+/*
+ * Remove a range already known by the caller to equal one complete mapping.
+ * The caller must retain the tree's usual serialization between that lookup
+ * and this call. Partial or multi-mapping ranges require iova_tree_remove().
+ * The supplied key may be a copy; no borrowed tree node survives deletion.
+ */
+void iova_tree_remove_exact(IOVATree *tree, const DMAMap *map);
+
 /**
  * iova_tree_find:
  *

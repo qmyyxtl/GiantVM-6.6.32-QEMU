@@ -284,6 +284,7 @@ struct IntelIOMMUState {
     uint64_t cap;                   /* The value of capability reg */
     uint64_t ecap;                  /* The value of extended capability reg */
 
+    bool loom_exact_unmap_remove; /* Reuse exact shadow UNMAP range match */
     bool loom_leaf_batch_read; /* One-frame legacy shadow leaf snapshots */
     bool loom_unmap_coalesce; /* Owner shadow-walk unmap batching */
     bool loom_qi_pair_read; /* Batch fetching, preserve QI execution order */

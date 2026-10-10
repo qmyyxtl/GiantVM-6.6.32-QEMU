@@ -1216,6 +1216,7 @@ typedef struct {
     void *private;
     bool notify_unmap;
     bool batch_leaf_reads;
+    bool exact_unmap_remove;
     uint8_t aw;
     uint16_t domain_id;
 } vtd_page_walk_info;
@@ -1293,7 +1294,20 @@ static int vtd_page_walk_one(IOMMUTLBEvent *event, vtd_page_walk_info *info)
             trace_vtd_page_walk_one_skip_unmap(entry->iova, entry->addr_mask);
             return 0;
         }
-        iova_tree_remove(as->iova_tree, target);
+        /*
+         * The lookup above is still valid: no notifier callback runs before
+         * this UNMAP deletion. An exact range can remove only this one node;
+         * avoid the range helper's repeated lookup and terminating lookup.
+         * Pass our stack key, not the borrowed node being freed. Changed MAP
+         * translations keep the old path because their hook runs first.
+         */
+        if (event->type == IOMMU_NOTIFIER_UNMAP &&
+            info->exact_unmap_remove && mapped->iova == target.iova &&
+            mapped->size == target.size) {
+            iova_tree_remove_exact(as->iova_tree, &target);
+        } else {
+            iova_tree_remove(as->iova_tree, target);
+        }
     }
 
     trace_vtd_page_walk_one(info->domain_id, entry->iova,
@@ -1717,6 +1731,8 @@ static int vtd_sync_shadow_page_table_range(VTDAddressSpace *vtd_as,
         .hook_fn = vtd_sync_shadow_page_hook,
         .private = &notify,
         .notify_unmap = true,
+        .exact_unmap_remove = s->loom_exact_unmap_remove &&
+                              migration_is_idle(),
         .batch_leaf_reads = s->loom_leaf_batch_read && s->caching_mode &&
                             !s->root_scalable && migration_is_idle(),
         .aw = s->aw_bits,
@@ -4591,6 +4607,20 @@ static void vtd_set_unmap_coalesce(Object *obj, bool enabled, Error **errp)
     INTEL_IOMMU_DEVICE(obj)->loom_unmap_coalesce = enabled;
 }
 
+static bool vtd_get_exact_unmap_remove(Object *obj, Error **errp)
+{
+    return INTEL_IOMMU_DEVICE(obj)->loom_exact_unmap_remove;
+}
+
+static void vtd_set_exact_unmap_remove(Object *obj, bool enabled, Error **errp)
+{
+    if (enabled && !loom_iommu_enabled()) {
+        error_setg(errp, "exact shadow unmap requires owner IOMMU");
+        return;
+    }
+    INTEL_IOMMU_DEVICE(obj)->loom_exact_unmap_remove = enabled;
+}
+
 static bool vtd_get_leaf_batch_read(Object *obj, Error **errp)
 {
     return INTEL_IOMMU_DEVICE(obj)->loom_leaf_batch_read;
@@ -4644,6 +4674,8 @@ static void vtd_realize(DeviceState *dev, Error **errp)
     s->loom_unmap_coalesce = loom_iommu_enabled() &&
         g_strcmp0(getenv("LOOM_VTD_UNMAP_COALESCE"), "1") == 0;
 
+    s->loom_exact_unmap_remove = loom_iommu_enabled() &&
+        g_strcmp0(getenv("LOOM_VTD_EXACT_UNMAP_REMOVE"), "1") == 0;
     s->loom_leaf_batch_read = loom_iommu_enabled() &&
         g_strcmp0(getenv("LOOM_VTD_LEAF_BATCH_READ"), "1") == 0;
 
@@ -4688,6 +4720,9 @@ static void vtd_realize(DeviceState *dev, Error **errp)
     /* Pseudo address space under root PCI bus. */
     x86ms->ioapic_as = vtd_host_dma_iommu(bus, s, Q35_PSEUDO_DEVFN_IOAPIC);
     qemu_add_machine_init_done_notifier(&vtd_machine_done_notify);
+    object_property_add_bool(OBJECT(s), "loom-exact-unmap-remove",
+                             vtd_get_exact_unmap_remove,
+                             vtd_set_exact_unmap_remove);
     object_property_add_bool(OBJECT(s), "loom-leaf-batch-read",
                              vtd_get_leaf_batch_read, vtd_set_leaf_batch_read);
     object_property_add_bool(OBJECT(s), "loom-unmap-coalesce",
