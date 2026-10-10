@@ -2981,3 +2981,58 @@ ARQ 最后再写 tail=count-1，ASQ 日后提交时写 tail。
 这仍是启动接入前的修正，没有 MemoryListener 授权入口、
 没有物理 DMA 启动开关，运行巨虚仍是原 vIOMMU 路径；
 不宣称当前带宽改善或原型已能启动，不改 guest 或 HPET。
+
+
+### 2026-10-11：AdminQ 配置与硬件 enable 的独立门控组件
+
+新增 hw/vfio/loom-iavf-admin.c 和 include/hw/vfio/loom-iavf-admin.h，
+编入 VFIO。组件维护 ASQ/ARQ 各自的 LEN/BAL/BAH、完整配置位、
+下一提交位置、实际 hardware-enabled 状态及不可恢复的 failed 状态。
+当前仍没有 production caller、真实 prepare callback 或物理模式启动开关，
+因此不是已接通的 VFIO 网卡路径，也不能据此宣称无 vIOMMU 模式能启动。
+
+与未改动 iavf 驱动的 enable-before-base 顺序兼容：
+LEN 写入先向真实硬件清除 enable；记录 guest 请求值；
+只有 LEN/BAL/BAH 都到齐才调用 prepare(enabling=true)，
+要求完成整个 ring、ARQ 全部接收缓冲的发现/授权/映射/同步，
+随后写真实 enable，并读回核对 count/enable。
+LEN/BAL/BAH 的六种顺序均可；活跃期间再次写任一配置寄存器，
+即使该半地址值没有改变，也先 disable/读回并开始一轮完整配置，
+避免把前一轮的高地址或 count 混入新地址。
+此原型要求重配置提供完整 LEN/BAL/BAH，未实现单寄存器局部重配置。
+
+head 目前只支持 native driver 的 clear0，会先关闭活跃队列再清 head；
+初始/关闭时 tail0 不会重新 enable 未准备好的队列。
+活跃 tail 先调用 prepare(enabling=false)：
+ASQ [next,tail)；ARQ [next,tail]，均按 count 回绕；
+所有依赖准备成功后才能写 tail，再更新 next。
+prepare callback 的后续真实实现必须识别 ASQ 内嵌的 data queue 配置/
+ENABLE_QUEUES 等进一步 ring/payload 地址，并拒绝未知协议，
+不能把此 gate 当作已实现授权、CPU/pool 同步或 data queue 操作。
+
+pending 配置的 LEN 读合并 guest 请求 count/enable 与硬件状态位；
+运行中和 failed 时不合成 enable/count，保留实际硬件关闭/reset 的可见性，
+避免 iavf_check_asq_alive 被虚构的 enable 欺骗。
+write/read/prepare 任一步失败会标记 failed，尽力 disable 两个 AdminQ，
+后续受管寄存器写入一律 EIO，不转发 tail 或新地址。
+即使 enable write 已部分到达硬件但返回错误，也执行关闭。
+callback 必须返回0或负errno，非零正返回也转换成错误，不能误当 handled 成功。
+如果停止/读回失败，不能声称硬件已静止，caller 必须保留 DMA pool，
+直至实际硬件访问停止或 backend close。
+enable-bit readback 是 posted-write/config 校验，不证明所有在途 DMA 已 drain；
+真实接入还需遵守旧请求完成/快照发布/重配置/回收的完整顺序。
+state 只允许在确认 hardware reset/quiescence 后清零初始化。
+
+memfd 编译当前实际 header 与完整 gate 源文件，外部 write/read/prepare 为模型；
+GCC ASan/UBSan 41571 次断言 PASS，覆盖：
+- ASQ/ARQ 六种 LEN/BAL/BAH 顺序，enable 前 prepare、读回、状态位；
+- 4GiB以上地址、低/高地址半值重复、shutdown head/tail clear、回绕；
+- 4096 次双队列配置事务和16384次 tail 提交的 hardware/prepare 模型核对；
+- config各 write/prepare/read 失败、tail准备/写入失败、非法范围/协议；
+- enable 部分写入错误、读回 count/enable 不符、无法关闭、两队列关闭；
+- failed 不可恢复、运行中 hardware-reset 可见、callback错误正返回拒绝。
+不是实际 DMA、真实 VFIO、完整 guest boot 或性能测试。
+QEMU 编译与 git diff --check 通过；未生成实验文件，不改 guest/HPET，
+运行巨虚仍保持原 vIOMMU 路径，Garen worker-g4 未动，不使用 Lux。
+下一步实现真实 queue dependency prepare 和 BAR adapter，再接 RAM listener，
+先做匹配配置的单机无 DSM 功能对照，再验证 Garen/Ezreal 巨虚。
