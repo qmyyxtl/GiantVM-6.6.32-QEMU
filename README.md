@@ -2494,3 +2494,62 @@ host KSM run=1、merge_across_nodes=1。
 下一步在巨虚做原配置/near/原配置对照；
 NIC在N0、RDMA HCA在N1，应同时核实RDMA线程与缓冲位置的取舍。
 HPET、guest、host内核和模块参数保持，worker-g4保留，Lux未使用。
+
+### 巨虚全进程近端放置对照与线程角色（2026-10-11）
+
+本轮性能代码仍是7e03f0d475；guest#26、HPET、4CPU、
+严格owner vIOMMU、两个owner真实VF、两队列RX512/TX128、
+RPS/XPS0及guest IRQ0-1/2-3保持。
+两卡分别发送到Jinx10.3/11.3，每卡两个本地guest CPU worker、
+每轮6秒、各6轮；Garen卡先测、Ezreal卡后测，并非双卡并发。
+接收端按字节数及内容核对。本轮无BCC/perf探针，清零候选仍OFF。
+
+原配置A：host线程允许0-191、内存policy default。
+近端B：仅在原启动env变量之后、python wrapper之前插入
+numactl --cpunodebind=0 --membind=0，两端相同；NIC NUMA0，HCA NUMA1。
+恢复C：去掉numactl，恢复原配置。
+逐线程mask与numa_maps核验，B所有线程都在0-47,96-143，
+G/E非file匿名驻留页分别1072634/1070756全部在N0，policy bind:0。
+A两端主要驻留页已经在N0，但线程可跨socket。
+C的Garen驻留2个2GiB大VMA转到N1，Ezreal仍在N0；
+原配置的first-touch不固定，不能把整个差距归因到某个线程或RDMA。
+
+六轮原始总吞吐MiB/s：
+A G=[215.107,186.982,209.871,195.276,201.384,163.282]；
+A E=[181.131,167.431,181.472,176.950,159.209,174.348]；
+B G=[208.596,212.975,235.813,213.826,226.939,200.854]；
+B E=[173.574,163.618,148.092,159.765,176.840,181.078]；
+C G=[215.552,223.292,194.854,208.839,191.776,209.295]；
+C E=[187.947,194.151,188.198,162.530,182.861,190.491]。
+
+中位数：
+| 单卡 | 原A | 全进程近端B | 恢复C |
+| --- | ---: | ---: | ---: |
+| Garen | 198.330 | 213.401 | 209.067 |
+| Ezreal | 175.649 | 168.596 | 188.073 |
+
+Garen的B比A/C高7.60%/2.07%，Ezreal低4.02%/10.36%。
+样本明显重叠、原配置放置也随启动变化，没有证据证明全进程近端同时改善两卡。
+保持原启动配置；不能将两卡分开测的结果相加声称并发聚合性能。
+单机无DSM下的近端收益仍不能直接迁移为巨虚收益。
+本轮没有按流量归一化DSM故障/远端页计数，所以不能声称已经证明RDMA导致下降。
+
+代码检查确认 migration/rdma-gvm.c：
+recv_thread_func负责CQ接收与消息分发，request_worker_func每peer
+FIFO执行模型回调/BQL/可能嵌套RPC，接收不能被请求处理阻塞。
+它们是QEMU设备RPC路由线程，区别于host内核DSM/RDMA线程。
+
+为下一步按角色亲和性实验，代码3d1fcd14c7仅在这两个线程入口设置Linux名字：
+gvm-rdma-rx、gvm-rdma-req。启动各调用一次pthread_setname_np，
+没有改CPU/memory affinity、队列、协议、DMA、锁或失效机制。
+两端编译通过；新启动各核实一个rx/一个req名字。
+这是定位改动，不是性能优化，性能表采集在此改动之前。
+下一步先核实这些线程的CPU/等待/BQL成本，
+再在同次启动中比较NIC处理留N0、RDMA接收靠近HCA的角色分配。
+不通过全进程绑定推断某一角色的因果。
+
+A/B/C均正常关机两端EXIT0、refs0，VF恢复iavf后才再次启动。
+新版本恢复原unbound配置，root登录、双卡owner ping均3/3通过，
+新代码双卡发送内容校验通过，guest error级dmesg为空。
+原Garen libvirt worker-g4保持，host和guest内核、HPET、模块参数保持，
+Lux未使用，没有产生实验脚本、日志、pcap或新磁盘。
