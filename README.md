@@ -1051,3 +1051,31 @@ host 6.6.32-krdma+ 保持，未生成实验文件。
 下一步仍是 RX/TX tail 的精确 descriptor/payload 范围，
 需正确处理首次 tail、回绕、RX buffer 复用和完成发布顺序；
 目前 BAR/IRQ 路径仍执行完整 DMA 同步。
+
+### 原生 RX tail 范围提交（2026-10-10）
+
+BAR 写路径仍先完整发布 device→CPU 完成数据；对于已确认配置、
+已成功 enable 且已观察前一次 tail 的 X710 RX 队列，CPU→device
+提交改为原生 iavf 的 [old next_to_use,new next_to_use) 描述符区间。
+该驱动还清除下一条描述符的 status qword，因此同时提交新 tail
+指向条目的 offset8、8字节。回绕分成两个区间；首次/相同/越界
+tail、未知队列、未启用、失效/歧义状态、非原生布局和覆盖缺失
+均回退到原有完整提交。TX/AdminQ/其他设备路径不变。
+
+在已有 IOVA→GPA 注册上读取 CPU 描述符，预检全部 RX payload
+及 ring 覆盖后才发布。先逐范围合并 payload，再合并描述符和
+下一状态字，最后写物理 BAR。不能省略 RX payload：同一地址
+复用时 CPU 可能改写内容，权限标志不足以证明没有 CPU 修改。
+中途 DSM 读取失败返回错误并停止 VM，不尝试全量回退或 doorbell。
+描述符临时空间缓存在观察器内，稳态不做 malloc 或大块栈分配。
+LOOM_IAVF_RX_SCOPED=0 可在 QEMU 启动时强制原有完整提交，用于对照。
+
+实际源码 memfd 检查通过：首次回退、普通前进/回绕、下一状态字、
+未涉及描述符/缓冲区字节保留、原地址 payload 复用的 CPU canary、
+先完成发布的硬件字节保留、非恒等 IOVA/GPA、跨登记 CPU 读取、
+未知/越界/相同 tail、header/映射空洞预检回退、读取失败及部分
+发布后的错误返回、ring unmap 失效。实际 helpers.c BAR 检查验证
+完成→范围/全量提交→控制观察→物理写顺序，以及同步错误阻止物理写。
+既有队列 enable/失效、范围提交、生命周期、64 KiB GPA 批次和
+24种完成交错检查均通过。真实设备命中率、健康及性能另行记录，
+不能将普通 RAM 检查当作真实吞吐提升证明。

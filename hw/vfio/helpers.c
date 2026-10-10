@@ -183,6 +183,34 @@ static bool vfio_loom_write_submits_dma(VFIORegion *region,
              addr == 0x5c00);
 }
 
+static bool vfio_loom_sync_write(VFIORegion *region, hwaddr addr,
+                                  uint64_t data, unsigned size)
+{
+    VFIODevice *dev = region->vbasedev;
+    int ret = 0;
+
+    if (!vfio_loom_sync(dev, false)) {
+        return false;
+    }
+    if (!vfio_loom_write_submits_dma(region, addr, size)) {
+        return true;
+    }
+    if (region->nr == 0 && size == 4) {
+        ret = loom_iavf_submit_rx(dev, addr, data);
+    }
+    if (!ret) {
+        ret = loom_vfio_dma_sync(dev->bcontainer, true);
+    } else if (ret > 0) {
+        ret = 0;
+    }
+    if (ret) {
+        error_report("VFIO DSM DMA submission failed for %s: %s",
+                     dev->name, strerror(-ret));
+        vm_stop(RUN_STATE_INTERNAL_ERROR);
+    }
+    return !ret;
+}
+
 /*
  * IO Port/MMIO - Beware of the endians, VFIO is always little endian
  */
@@ -198,8 +226,7 @@ void vfio_region_write(void *opaque, hwaddr addr,
         uint64_t qword;
     } buf;
 
-    if (!vfio_loom_sync(vbasedev,
-                        vfio_loom_write_submits_dma(region, addr, size))) {
+    if (!vfio_loom_sync_write(region, addr, data, size)) {
         return;
     }
 

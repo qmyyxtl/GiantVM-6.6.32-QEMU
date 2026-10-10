@@ -5,7 +5,9 @@
 typedef struct VFIODevice VFIODevice;
 typedef struct VFIOContainerBase VFIOContainerBase;
 typedef struct LoomIAVFQueues LoomIAVFQueues;
-/* Observer only: these hooks never replace DMA synchronization. */
+/* Control hooks observe already-published DMA baselines. */
+/* Caller first publishes completions: 1 scoped, 0 full fallback, <0 error. */
+int loom_iavf_submit_rx(VFIODevice *, hwaddr, uint32_t);
 void loom_iavf_observe_write(VFIODevice *, hwaddr, uint32_t);
 void loom_iavf_observe_completion(VFIODevice *);
 void loom_iavf_reset(VFIODevice *);

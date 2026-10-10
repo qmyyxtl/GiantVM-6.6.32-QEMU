@@ -2,7 +2,7 @@
 /*
  * Observe native X710 VF AdminQ queue configuration. Read only the baseline
  * already published by loom-dma, never resample live hardware DMA. This stage
- * does not enable queue-scoped submission or change the full-sync fallback.
+ * uses acknowledged queue state for scoped RX submissions, with full fallback.
  */
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
@@ -28,6 +28,9 @@ struct LoomIAVFQueues {
     LoomIAVFQueue candidate[VF_QUEUE_COUNT], queue[VF_QUEUE_COUNT];
     uint16_t vsi, enabled_rx, enabled_tx, pending_rx, pending_tx;
     bool enable_pending;
+    uint16_t rx_tail[VF_QUEUE_COUNT], rx_tail_known;
+    uint8_t rx_desc[4096 * 32];
+    uint64_t rx_payload[4096];
 };
 
 static void queues_invalidate(LoomIAVFQueues *s)
@@ -38,6 +41,7 @@ static void queues_invalidate(LoomIAVFQueues *s)
     s->enabled_rx = s->enabled_tx = 0;
     s->pending_rx = s->pending_tx = 0;
     s->enable_pending = false;
+    s->rx_tail_known = 0;
 }
 
 void loom_iavf_reset(VFIODevice *dev)
@@ -244,6 +248,19 @@ void loom_iavf_observe_write(VFIODevice *dev, hwaddr addr, uint32_t value)
 {
     LoomIAVFQueues *s;
 
+    if (addr >= 0x2000 && addr <= 0x203c && !(addr & 3)) {
+        unsigned id = (addr - 0x2000) / 4;
+        s = dev->loom_iavf_queues;
+        if (s && (s->valid_mask & s->enabled_rx & (1U << id))) {
+            if (value < s->queue[id].rx_count) {
+                s->rx_tail[id] = value;
+                s->rx_tail_known |= 1U << id;
+            } else {
+                s->rx_tail_known &= ~(1U << id);
+            }
+        }
+        return;
+    }
     if (addr != 0x7c00 && addr != 0x7800 && addr != 0x6800 &&
         addr != 0x6c00 && addr != 0x6000 && addr != 0x8000 &&
         addr != 0x8400) {
@@ -383,4 +400,90 @@ void loom_iavf_observe_completion(VFIODevice *dev)
         queues_invalidate(s);
         s->ambiguous = true;
     }
+}
+
+
+/*
+ * Native iavf replenishes [old next_to_use, new next_to_use), and clears the
+ * next descriptor's status qword. Stage all payload coverage before publishing
+ * any bytes; preserve RX page reuse by merging payloads as well as descriptors.
+ * The caller has already published device completions, including late DMA.
+ */
+int loom_iavf_submit_rx(VFIODevice *dev, hwaddr addr, uint32_t value)
+{
+    static int scoped = -1;
+    LoomIAVFQueues *s;
+    LoomIAVFQueue *q;
+    unsigned id, count, old, first;
+    uint8_t *desc;
+    uint64_t *payload;
+    int ret;
+
+    if (addr < 0x2000 || addr > 0x203c || (addr & 3) ||
+        !dev->loom_iavf_irq_control) {
+        return 0;
+    }
+    if (scoped < 0) {
+        const char *mode = getenv("LOOM_IAVF_RX_SCOPED");
+        scoped = !mode || strcmp(mode, "0");
+    }
+    if (!scoped) {
+        return 0;
+    }
+    s = dev->loom_iavf_queues;
+    id = (addr - 0x2000) / 4;
+    if (!s || !(s->valid_mask & s->enabled_rx & s->rx_tail_known &
+                (1U << id)) || s->pending || s->enable_pending || s->ambiguous) {
+        return 0;
+    }
+    q = &s->queue[id];
+    desc = s->rx_desc;
+    payload = s->rx_payload;
+    old = s->rx_tail[id];
+    if (value >= q->rx_count || old >= q->rx_count || value == old) {
+        return 0;
+    }
+    count = (value + q->rx_count - old) % q->rx_count;
+    first = MIN(count, q->rx_count - old);
+    ret = loom_vfio_dma_read_cpu(dev->bcontainer, q->rx_iova + old * 32ULL,
+                                 desc, first * 32ULL);
+    if (!ret && first < count) {
+        ret = loom_vfio_dma_read_cpu(dev->bcontainer, q->rx_iova,
+                                     desc + first * 32, (count - first) * 32ULL);
+    }
+    if (ret) {
+        return ret == -ENOENT ? 0 : ret;
+    }
+    for (unsigned i = 0; i < count; i++) {
+        /* Header split, non-native layouts, and unmapped buffers fall back. */
+        payload[i] = ldq_le_p(desc + i * 32);
+        if (ldq_le_p(desc + i * 32 + 8) || !payload[i] ||
+            !loom_vfio_dma_range_covered(dev->bcontainer, payload[i],
+                                          q->rx_buffer_size)) {
+            return 0;
+        }
+    }
+    if (!loom_vfio_dma_range_covered(dev->bcontainer, q->rx_iova,
+                                      q->rx_count * 32ULL)) {
+        return 0;
+    }
+    for (unsigned i = 0; i < count; i++) {
+        ret = loom_vfio_dma_sync_to_device_range(dev->bcontainer, payload[i],
+                                                 q->rx_buffer_size);
+        if (ret) {
+            return ret;
+        }
+    }
+    /* Publish payloads first, then descriptors, before the physical tail. */
+    ret = loom_vfio_dma_sync_to_device_range(dev->bcontainer,
+                            q->rx_iova + old * 32ULL, first * 32ULL);
+    if (!ret && first < count) {
+        ret = loom_vfio_dma_sync_to_device_range(dev->bcontainer, q->rx_iova,
+                                                 (count - first) * 32ULL);
+    }
+    if (!ret) {
+        ret = loom_vfio_dma_sync_to_device_range(dev->bcontainer,
+                                         q->rx_iova + value * 32ULL + 8, 8);
+    }
+    return ret ? ret : 1;
 }

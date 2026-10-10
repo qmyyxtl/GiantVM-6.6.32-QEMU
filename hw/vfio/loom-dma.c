@@ -752,6 +752,46 @@ uint64_t loom_vfio_dma_epoch(VFIOContainerBase *bc)
     return bc && bc->loom_dma ? bc->loom_dma->epoch : 0;
 }
 
+/* Read translated CPU-owned bytes without publishing them to hardware. */
+int loom_vfio_dma_read_cpu(VFIOContainerBase *bc, hwaddr iova,
+                           void *buffer, uint64_t size)
+{
+    uint8_t *out = buffer;
+
+    if (!bc || !bc->loom_dma) {
+        return -ENODEV;
+    }
+    if (!size || size > 64 * MiB || iova + size < iova) {
+        return -EINVAL;
+    }
+    while (size) {
+        LoomDMABuffer *found = NULL;
+        uint64_t offset, len;
+
+        for (GList *p = bc->loom_dma->buffers; p; p = p->next) {
+            LoomDMABuffer *b = p->data;
+
+            if (iova >= b->iova && iova - b->iova < b->size) {
+                found = b;
+                break;
+            }
+        }
+        if (!found) {
+            return -ENOENT;
+        }
+        offset = iova - found->iova;
+        len = MIN(size, found->size - offset);
+        if (address_space_read(&address_space_memory, found->gpa + offset,
+                               MEMTXATTRS_UNSPECIFIED, out, len) != MEMTX_OK) {
+            return -EIO;
+        }
+        out += len;
+        iova += len;
+        size -= len;
+    }
+    return 0;
+}
+
 /* Read QEMU's already-published baseline, never the live DMA pool. */
 int loom_vfio_dma_read_baseline(VFIOContainerBase *bc, hwaddr iova,
                                 void *buffer, uint64_t size)
