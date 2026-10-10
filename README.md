@@ -1664,3 +1664,35 @@ Lost Samples=0、memfd 1.160 MB，调用栈明确为 recv_thread_func。
 再比较 idle/active CPU 与同启动吞吐；不改 guest 或 HPET。
 最终 CPU 0–3 在线、hpet，两端 QMP pair=false，所检查 BUG/DMA/QI/TX timeout
 错误为空；采样进程、memfd、Jinx 接收端/临时地址已清理，host 未重启。
+
+## RDMA 请求接收 CQ 事件等待（默认关闭，待真实 RDMA 验证）
+
+`LOOM_RDMA_RECV_CQ_EVENTS=1` 仅为专用请求接收连接创建非阻塞 completion
+channel。同步响应 CQ 与发送完成 CQ 保留原来的单消费者轮询语义，
+消息协议、request FIFO、control handler、guest 内核和 HPET 均不变。
+默认未设置或为 0 时保持旧接收轮询路径；启动日志输出实际 events/poll 模式，
+创建 channel/带 channel 的 CQ 失败时回退无 channel 的 CQ。
+
+事件接收 helper 先 arm 通知，再 poll CQ；有完成项立即返回原处理路径，
+没有完成项才 poll channel fd 和共享 stop eventfd（100 ms 上限）。
+收到事件先 ack 后再次 arm/drain，允许没有 CQE 的额外事件；
+EINTR/EAGAIN 重试，通知或事件等待/读取异常回退 usleep(10) 的旧轮询。
+依据 [rdma-core 的 ibv_get_cq_event 文档](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/man/ibv_get_cq_event.3)，
+成功取得的 CQ event 都须 ack，重 arm 后可能出现无对应 CQE 的额外通知。
+
+running 标志改为原子访问；cleanup 先清除 running 并写 stop eventfd，
+该 fd 不由单个 receiver 消费，保证所有接收线程可见。
+join 所有接收及 worker 线程后，停止 event-mode receive QP、取得并 ack
+剩余事件，再销毁该 CQ/channel，最后关闭 stop fd。其他 legacy 连接
+仍沿用已有资源生命周期，本修改不宣称完成原有全部连接资源回收。
+
+实际 helper 源码提取到 memfd，ASan/UBSan 隔离测试通过：
+arm-before-drain、完成在 arm 后到达、额外空事件、EAGAIN/EINTR、
+stop/超时、notify/poll/get 错误回退、错误 CQ 的 ack 与旧轮询分支。
+另用实际 poll/pipe/eventfd/pthread 和三个模拟接收者测试停止：
+一次 stop 写入唤醒全部三个线程，join 后 eventfd 仍保留该计数，
+再关闭资源，ASan/UBSan 通过。verbs/CQE 使用 stub，不是 RDMA 硬件测试。
+另核查源码清理次序为 wake→join→QP→event ack→CQ/channel→stop fd。
+Ezreal 构建通过；两端运行中的 QEMU 仍为旧代码 `6af87e7c27`，
+没有启用新的事件路径。下一步完成两端构建与部署，核实实际模式、
+真实消息和 shutdown、idle/active CPU，再测单卡吞吐，不能提前宣称收益。

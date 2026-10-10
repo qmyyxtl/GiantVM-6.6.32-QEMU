@@ -1,5 +1,8 @@
 #include "qemu/osdep.h"
 #include "qemu/rcu.h"
+#include "qemu/atomic.h"
+#include <poll.h>
+#include <sys/eventfd.h>
 #include "rdma-gvm.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +36,8 @@ typedef struct {
     struct rdma_cm_id *cm_id;
     struct ibv_pd *pd;
     struct ibv_cq *cq;
+    struct ibv_comp_channel *cq_channel;
+    bool cq_wait_enabled, cq_armed;
     struct ibv_qp *qp;
     
     // Send buffers
@@ -82,7 +87,9 @@ static struct {
     pthread_t *recv_threads;
     router_worker_t *workers;
     bool running;
-} g_ctx;
+    bool recv_cq_events;
+    int stop_fd;
+} g_ctx = { .stop_fd = -1 };
 
 // 消息处理回调
 typedef int (*msg_handler_t)(int peer_id, rdma_msg_header_t *hdr, void *data);
@@ -90,7 +97,7 @@ static msg_handler_t g_msg_handler = NULL;
 static msg_handler_t g_control_handler;
 
 // 前向声明
-static int create_connection(const char *host, int port, struct rdma_cm_id *server_cm_id, rdma_conn_t **out_conn);
+static int create_connection(const char *host, int port, struct rdma_cm_id *server_cm_id, rdma_conn_t **out_conn, bool event_receive);
 static int post_all_recvs(rdma_conn_t *conn);
 static int rdma_send_msg(rdma_conn_t *conn, rdma_msg_header_t *hdr, const void *data);
 static int rdma_wait_completion(rdma_conn_t *conn, struct ibv_wc *wc);
@@ -104,7 +111,15 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
     
     g_ctx.local_id = local_id;
     g_ctx.total_nodes = total_nodes;
-    g_ctx.running = true;
+    qatomic_set(&g_ctx.running, true);
+    g_ctx.recv_cq_events =
+        g_strcmp0(getenv("LOOM_RDMA_RECV_CQ_EVENTS"), "1") == 0;
+    if (g_ctx.recv_cq_events) {
+        g_ctx.stop_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (g_ctx.stop_fd < 0) {
+            return -1;
+        }
+    }
     
     g_ctx.request_conns = calloc(total_nodes, sizeof(rdma_conn_t*));
     g_ctx.response_for_req_conns = calloc(total_nodes, sizeof(rdma_conn_t*));
@@ -179,7 +194,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
             debugf("[RDMA] Connecting to %s:%d (request channel)\n", hosts[i], port1);
             int retry = 0;
             while (retry < 10) {
-                if (create_connection(hosts[i], port1, NULL, &conn1) == 0) {
+                if (create_connection(hosts[i], port1, NULL, &conn1, false) == 0) {
                     break;
                 }
                 retry++;
@@ -197,7 +212,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
             debugf("[RDMA] Connecting to %s:%d (reply channel)\n", hosts[i], port2);
             retry = 0;
             while (retry < 10) {
-                if (create_connection(hosts[i], port2, NULL, &conn2) == 0) {
+                if (create_connection(hosts[i], port2, NULL, &conn2, false) == 0) {
                     break;
                 }
                 retry++;
@@ -220,7 +235,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
             }
             
             rdma_conn_t *recv_conn;
-            if (create_connection(NULL, 0, event1->id, &recv_conn) < 0) {
+            if (create_connection(NULL, 0, event1->id, &recv_conn, true) < 0) {
                 return -1;
             }
             
@@ -266,7 +281,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
             }
             
             rdma_conn_t *resp_conn;
-            if (create_connection(NULL, 0, event2->id, &resp_conn) < 0) {
+            if (create_connection(NULL, 0, event2->id, &resp_conn, false) < 0) {
                 return -1;
             }
             
@@ -319,7 +334,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
             }
             
             rdma_conn_t *recv_conn;
-            if (create_connection(NULL, 0, event1->id, &recv_conn) < 0) {
+            if (create_connection(NULL, 0, event1->id, &recv_conn, true) < 0) {
                 return -1;
             }
             
@@ -365,7 +380,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
             }
             
             rdma_conn_t *resp_conn;
-            if (create_connection(NULL, 0, event2->id, &resp_conn) < 0) {
+            if (create_connection(NULL, 0, event2->id, &resp_conn, false) < 0) {
                 return -1;
             }
             
@@ -407,7 +422,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
             debugf("[RDMA] Connecting to %s:%d (request channel)\n", hosts[i], port1);
             int retry = 0;
             while (retry < 10) {
-                if (create_connection(hosts[i], port1, NULL, &conn1) == 0) {
+                if (create_connection(hosts[i], port1, NULL, &conn1, false) == 0) {
                     break;
                 }
                 retry++;
@@ -425,7 +440,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
             debugf("[RDMA] Connecting to %s:%d (reply channel)\n", hosts[i], port2);
             retry = 0;
             while (retry < 10) {
-                if (create_connection(hosts[i], port2, NULL, &conn2) == 0) {
+                if (create_connection(hosts[i], port2, NULL, &conn2, false) == 0) {
                     break;
                 }
                 retry++;
@@ -476,7 +491,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
 // ============ 创建连接 ============
 
 // 修改函数签名，服务器端传入 cm_id
-static int create_connection(const char *host, int port, struct rdma_cm_id *server_cm_id, rdma_conn_t **out_conn)
+static int create_connection(const char *host, int port, struct rdma_cm_id *server_cm_id, rdma_conn_t **out_conn, bool event_receive)
 {
     rdma_conn_t *conn = calloc(1, sizeof(rdma_conn_t));
     pthread_mutex_init(&conn->send_lock, NULL);
@@ -493,7 +508,32 @@ static int create_connection(const char *host, int port, struct rdma_cm_id *serv
         
         // 从 cm_id 的 verbs 创建资源
         conn->pd = ibv_alloc_pd(conn->cm_id->verbs);
-        conn->cq = ibv_create_cq(conn->cm_id->verbs, RDMA_CQ_SIZE, NULL, NULL, 0);
+        if (event_receive && g_ctx.recv_cq_events) {
+            conn->cq_channel = ibv_create_comp_channel(conn->cm_id->verbs);
+            if (conn->cq_channel) {
+                int flags = fcntl(conn->cq_channel->fd, F_GETFL);
+                if (flags < 0 ||
+                    fcntl(conn->cq_channel->fd, F_SETFL,
+                          flags | O_NONBLOCK) < 0) {
+                    ibv_destroy_comp_channel(conn->cq_channel);
+                    conn->cq_channel = NULL;
+                }
+            }
+        }
+        conn->cq = ibv_create_cq(conn->cm_id->verbs, RDMA_CQ_SIZE,
+                                 conn->cq_channel ? conn : NULL,
+                                 conn->cq_channel, 0);
+        if (!conn->cq && conn->cq_channel) {
+            ibv_destroy_comp_channel(conn->cq_channel);
+            conn->cq_channel = NULL;
+            conn->cq = ibv_create_cq(conn->cm_id->verbs, RDMA_CQ_SIZE,
+                                     NULL, NULL, 0);
+        }
+        conn->cq_wait_enabled = conn->cq_channel != NULL;
+        if (event_receive) {
+            fprintf(stderr, "[RDMA] receive CQ mode: %s\n",
+                    conn->cq_wait_enabled ? "events" : "poll");
+        }
         
     } else {
         // ========== 客户端：创建新的 cm_id 并连接 ==========
@@ -715,10 +755,10 @@ static void *request_worker_func(void *arg)
     for (;;) {
         router_work_t *work;
         pthread_mutex_lock(&worker->lock);
-        while (g_ctx.running && !worker->head) {
+        while (qatomic_read(&g_ctx.running) && !worker->head) {
             pthread_cond_wait(&worker->ready, &worker->lock);
         }
-        if (!g_ctx.running) {
+        if (!qatomic_read(&g_ctx.running)) {
             pthread_mutex_unlock(&worker->lock);
             break;
         }
@@ -739,6 +779,74 @@ static void *request_worker_func(void *arg)
     return NULL;
 }
 
+
+/*
+ * One consumer owns each request receive CQ. Arm before draining, then wait
+ * for its event channel; an extra event without a CQE is valid. The stop fd
+ * remains readable for every receiver until all threads have joined.
+ */
+static int rdma_recv_completion(rdma_conn_t *conn, struct ibv_wc *wc)
+{
+    while (qatomic_read(&g_ctx.running)) {
+        int n;
+
+        if (conn->cq_wait_enabled && !conn->cq_armed) {
+            if (ibv_req_notify_cq(conn->cq, 0)) {
+                fprintf(stderr, "[RDMA] CQ notify failed; using polling\n");
+                conn->cq_wait_enabled = false;
+            } else {
+                conn->cq_armed = true;
+            }
+        }
+        n = ibv_poll_cq(conn->cq, 1, wc);
+        if (n) {
+            return n;
+        }
+        if (!conn->cq_wait_enabled) {
+            usleep(10);
+            return 0;
+        }
+
+        struct pollfd fds[2] = {
+            { .fd = conn->cq_channel->fd, .events = POLLIN },
+            { .fd = g_ctx.stop_fd, .events = POLLIN },
+        };
+        int ret = poll(fds, 2, 100);
+
+        if (ret < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ret < 0 || (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            fprintf(stderr, "[RDMA] CQ event wait failed; using polling\n");
+            conn->cq_wait_enabled = false;
+            continue;
+        }
+        if (!qatomic_read(&g_ctx.running) || (fds[1].revents & POLLIN)) {
+            return 0;
+        }
+        if (fds[0].revents & POLLIN) {
+            struct ibv_cq *cq;
+            void *context;
+
+            if (ibv_get_cq_event(conn->cq_channel, &cq, &context)) {
+                if (errno != EAGAIN && errno != EINTR) {
+                    fprintf(stderr, "[RDMA] CQ event read failed; using polling\n");
+                    conn->cq_wait_enabled = false;
+                }
+                continue;
+            }
+            ibv_ack_cq_events(cq, 1);
+            if (cq != conn->cq) {
+                fprintf(stderr, "[RDMA] unexpected CQ event; using polling\n");
+                conn->cq_wait_enabled = false;
+                continue;
+            }
+            conn->cq_armed = false;
+        }
+    }
+    return 0;
+}
+
 static void* recv_thread_func(void *arg)
 {
     int peer_id = *(int*)arg;
@@ -747,9 +855,9 @@ static void* recv_thread_func(void *arg)
     rdma_conn_t *conn = g_ctx.recv_conns[peer_id];
     debugf("[RDMA Router] Recv thread started for peer %d\n", peer_id);
     
-    while (g_ctx.running) {
+    while (qatomic_read(&g_ctx.running)) {
         struct ibv_wc wc;
-        int n = ibv_poll_cq(conn->cq, 1, &wc);
+        int n = rdma_recv_completion(conn, &wc);
         
         if (n < 0) {
             fprintf(stderr, "[RDMA] poll_cq error\n");
@@ -757,7 +865,6 @@ static void* recv_thread_func(void *arg)
         }
         
         if (n == 0) {
-            usleep(10);
             continue;
         }
         
@@ -774,7 +881,7 @@ static void* recv_thread_func(void *arg)
             if (wc.byte_len < sizeof(*hdr) || hdr->data_len > MAX_MSG_DATA_SIZE ||
                 hdr->data_len > wc.byte_len - sizeof(*hdr)) {
                 fprintf(stderr, "[RDMA] Malformed request\n");
-                g_ctx.running = false;
+                qatomic_set(&g_ctx.running, false);
                 break;
             }
             void *data = buf + sizeof(*hdr);
@@ -990,7 +1097,16 @@ int rdma_router_send_response(int peer_id, uint16_t msg_type, uint64_t sequence,
 
 void rdma_router_cleanup(void)
 {
-    g_ctx.running = false;
+    qatomic_set(&g_ctx.running, false);
+    if (g_ctx.stop_fd >= 0) {
+        uint64_t wake = 1;
+        ssize_t ret = write(g_ctx.stop_fd, &wake, sizeof(wake));
+
+        if (ret < 0 && errno != EAGAIN) {
+            fprintf(stderr, "[RDMA] receiver stop wake failed: %s\n",
+                    strerror(errno));
+        }
+    }
     
     for (int i = 0; i < g_ctx.total_nodes; i++) {
         if (i != g_ctx.local_id) {
@@ -1011,6 +1127,40 @@ void rdma_router_cleanup(void)
         }
     }
     
+    /*
+     * Release only event-mode receive CQ resources after all consumers exit.
+     * Stop the QP first so no further completion events can be generated.
+     * Other legacy connection resources keep their existing lifetime.
+     */
+    for (int i = 0; i < g_ctx.total_nodes; i++) {
+        rdma_conn_t *conn = g_ctx.recv_conns[i];
+
+        if (!conn || !conn->cq_channel) {
+            continue;
+        }
+        rdma_destroy_qp(conn->cm_id);
+        conn->qp = NULL;
+        struct ibv_cq *cq;
+        void *context;
+        for (;;) {
+            if (ibv_get_cq_event(conn->cq_channel, &cq, &context) == 0) {
+                ibv_ack_cq_events(cq, 1);
+            } else if (errno != EINTR) {
+                break;
+            }
+        }
+        if (ibv_destroy_cq(conn->cq)) {
+            fprintf(stderr, "[RDMA] receive CQ destroy failed\n");
+            continue;
+        }
+        conn->cq = NULL;
+        ibv_destroy_comp_channel(conn->cq_channel);
+        conn->cq_channel = NULL;
+    }
+    if (g_ctx.stop_fd >= 0) {
+        close(g_ctx.stop_fd);
+        g_ctx.stop_fd = -1;
+    }
     // TODO: cleanup connections, buffers, etc.
 }
 
