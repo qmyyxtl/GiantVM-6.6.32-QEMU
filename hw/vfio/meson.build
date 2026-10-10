@@ -4,6 +4,7 @@ vfio_ss.add(files(
   'common.c',
   'container-base.c',
   'loom-dma.c',
+  'loom-physical.c',
   'loom-iavf.c',
   'loom-iavf-admin.c',
   'loom-iavf-bar.c',

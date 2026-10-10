@@ -23,6 +23,7 @@
 #include <linux/vfio.h>
 
 #include "hw/vfio/vfio-common.h"
+#include "hw/vfio/loom-dma.h"
 #include "exec/address-spaces.h"
 #include "exec/memory.h"
 #include "exec/ram_addr.h"
@@ -642,8 +643,14 @@ static bool vfio_connect_container(VFIOGroup *group, AddressSpace *as,
     group->container = container;
     QLIST_INSERT_HEAD(&container->group_list, group, container_next);
 
+    bcontainer->loom_physical = loom_vfio_physical_mode() == 1;
     bcontainer->listener = vfio_memory_listener;
     memory_listener_register(&bcontainer->listener, bcontainer->space->as);
+
+    if (bcontainer->loom_physical && !bcontainer->loom_ram &&
+        !bcontainer->error) {
+        error_setg(&bcontainer->error, "physical DMA has no authorized RAM");
+    }
 
     if (bcontainer->error) {
         error_propagate_prepend(errp, bcontainer->error,

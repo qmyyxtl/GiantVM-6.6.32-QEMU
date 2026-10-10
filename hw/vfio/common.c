@@ -26,6 +26,7 @@
 #include <linux/vfio.h>
 
 #include "hw/vfio/vfio-common.h"
+#include "hw/vfio/loom-dma.h"
 #include "hw/vfio/pci.h"
 #include "exec/address-spaces.h"
 #include "exec/memory.h"
@@ -576,6 +577,16 @@ static void vfio_listener_region_add(MemoryListener *listener,
     int ret;
     Error *err = NULL;
 
+    if (bcontainer->loom_physical) {
+        ret = loom_vfio_physical_region(bcontainer, section, true);
+        if (ret < 0) {
+            error_setg(&err, "sparse physical RAM add failed: %s",
+                       strerror(-ret));
+            goto fail;
+        }
+        return;
+    }
+
     if (!vfio_listener_valid_section(section, "region_add")) {
         return;
     }
@@ -721,6 +732,16 @@ static void vfio_listener_region_del(MemoryListener *listener,
     Int128 llend, llsize;
     int ret;
     bool try_unmap = true;
+
+    if (bcontainer->loom_physical) {
+        ret = loom_vfio_physical_region(bcontainer, section, false);
+        if (ret < 0) {
+            error_report("sparse physical RAM removal failed: %s",
+                         strerror(-ret));
+            hw_error("vfio: cannot revoke RAM while hardware DMA may be active");
+        }
+        return;
+    }
 
     if (!vfio_listener_valid_section(section, "region_del")) {
         return;
@@ -1542,6 +1563,20 @@ bool vfio_attach_device(char *name, VFIODevice *vbasedev,
     const VFIOIOMMUClass *ops =
         VFIO_IOMMU_CLASS(object_class_by_name(TYPE_VFIO_IOMMU_LEGACY));
     HostIOMMUDevice *hiod = NULL;
+    int physical = loom_vfio_physical_attach(vbasedev, as);
+
+    if (physical < 0) {
+        if (physical == -EINVAL) {
+            error_setg(errp, "LOOM_VFIO_PHYSICAL_DMA must be 0 or 1");
+        } else {
+            error_setg(errp, "physical DMA requires staged X710 PCI VF, legacy "
+                       "VFIO, 4KiB host pages and system RAM without guest IOMMU");
+        }
+        return false;
+    }
+    if (physical) {
+        vbasedev->enable_migration = ON_OFF_AUTO_OFF;
+    }
 
     if (vbasedev->iommufd) {
         ops = VFIO_IOMMU_CLASS(object_class_by_name(TYPE_VFIO_IOMMU_IOMMUFD));

@@ -52,6 +52,7 @@ typedef struct VFIOContainerBase {
     GList *iova_ranges;
     NotifierWithReturn cpr_reboot_notifier;
     struct LoomVFIORAM *loom_ram;
+    bool loom_physical;
 } VFIOContainerBase;
 
 typedef struct VFIOGuestIOMMU {

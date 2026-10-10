@@ -3074,6 +3074,13 @@ static void vfio_realize(PCIDevice *pdev, Error **errp)
         pci_get_word(pdev->config + PCI_VENDOR_ID) == 0x8086 &&
         pci_get_word(pdev->config + PCI_DEVICE_ID) == 0x154c;
 
+    if (loom_vfio_physical_mode() == 1 &&
+        (!vbasedev->loom_iavf_irq_control || !vbasedev->reset_works)) {
+        error_setg(errp, "physical DMA supports only reset-capable Intel "
+                   "X710 VF (8086:154c)");
+        goto error;
+    }
+
     /* vfio emulates a lot for us, but some bits need extra love */
     vdev->emulated_config_bits = g_malloc0(vdev->config_size);
 

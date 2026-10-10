@@ -7,6 +7,18 @@ import resource
 import signal
 import subprocess
 
+def iommu_environment(physical, legacy_bridge):
+    if physical not in ("0", "1"):
+        raise ValueError("LOOM_VFIO_PHYSICAL_DMA must be 0 or 1")
+    if physical == "1" and legacy_bridge:
+        raise ValueError("physical DMA cannot use the guest-assisted DMA bridge")
+    if legacy_bridge:
+        return {}
+    enabled = "0" if physical == "1" else "1"
+    return dict(GVM_MACHINE="q35", GVM_IOMMU=enabled,
+                GVM_OWNER_IOMMU=enabled, LOOM_OWNER_IOMMU=enabled)
+
+
 parser = argparse.ArgumentParser()
 parser.add_argument("node", type=int, choices=(0, 1))
 parser.add_argument("--host", required=True, help="VF PCI address, e.g. 0000:0c:02.0")
@@ -14,6 +26,12 @@ parser.add_argument("--legacy-dma-bridge", action="store_true",
                     help="use the old guest-assisted identity DMA bridge")
 parser.add_argument("--data-disk", type=Path, help="existing dedicated raw data image")
 args = parser.parse_args()
+physical = os.environ.get("LOOM_VFIO_PHYSICAL_DMA", "0")
+try:
+    startup_iommu = iommu_environment(physical, args.legacy_dma_bridge)
+except ValueError as exc:
+    parser.error(str(exc))
+
 if args.data_disk is not None:
     args.data_disk = args.data_disk.resolve()
     if not args.data_disk.is_file() or args.data_disk.stat().st_size != 1024 ** 3:
@@ -25,6 +43,9 @@ root = Path(__file__).resolve().parent.parent
 pci = Path("/sys/bus/pci/devices") / args.host
 if not (pci / "physfn").exists():
     parser.error("only an SR-IOV VF is accepted; refusing to detach a host PF")
+if physical == "1" and ((pci / "vendor").read_text().strip() != "0x8086" or
+                        (pci / "device").read_text().strip() != "0x154c"):
+    parser.error("physical DMA supports only Intel X710 VF (8086:154c)")
 parent = (pci / "physfn").resolve()
 if (parent / "driver").resolve().name != "i40e":
     parser.error("the host PF must remain bound to i40e")
@@ -70,7 +91,7 @@ try:
     if args.legacy_dma_bridge:
         extra += ["-device", bridge]
     else:
-        env.update(GVM_MACHINE="q35", GVM_IOMMU="1", GVM_OWNER_IOMMU="1")
+        env.update(startup_iommu)
         extra += ["-object", "memory-backend-ram,id=n0,size=2G",
                   "-object", "memory-backend-ram,id=n1,size=2G",
                   "-numa", "node,nodeid=0,cpus=0-1,memdev=n0",

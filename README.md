@@ -3174,3 +3174,64 @@ pending LEN影子与真实 reset可见、默认禁用时无IO/无gate分配。
 同时源文件 diff --check、QEMU 编译链接通过。
 guest代码、HPET、现有巨虚和 Garen worker-g4 保持不变；不使用 Lux，
 未生成实验脚本/日志/数据文件。
+
+### 2026-10-11：接通 sparse RAM listener 与默认关闭的物理 DMA 启动入口
+
+新增 hw/vfio/loom-physical.c，LOOM_VFIO_PHYSICAL_DMA 未设置或0走旧路径，
+1选择物理 DMA 原型，其他值在 VFIO attach 前拒绝。新模式必须同时满足：
+LOOM_VFIO_DSM_DMA=1使 staging 可用（单机控制还需 LOCAL_STAGE=1），
+system-memory AddressSpace、4KiB host页、legacy VFIO、非mdev PCI设备；
+有 guest vIOMMU 或 iommufd 时拒绝。读取真实 PCI配置后再确认
+Intel X710 VF 8086:154c且 reset-capable，guest-visible ID覆盖不能绕过检查。
+物理模式关闭 VFIO migration，不支持恢复未知 DMA 生命周期。
+
+legacy container 在 listener replay 前记录 loom_physical。
+普通 RAM 区域登记 guest 地址范围及 readonly权限，只授权覆盖完整4KiB页，
+不在 replay 时硬件映射、不为整个4GiB域分配 pool。
+地址取 offset_within_address_space；CPU读取仍通过 system AddressSpace，
+不把 RAMBlock offset或跨区别名误当 guest GPA。
+MMIO/RAMDevice区域排除；protected RAM、RamDiscardManager和gIOMMU拒绝。
+部分页裁掉，错位alias、溢出/空区间拒绝；没有任何可授权RAM则初始化失败。
+descriptor/doorbell的已有 sparse prepare 在提交时才建立必要的私有 pool，
+注册/初始化/GPA关联完成后才让硬件映射可见，温热页沿用现有映射。
+
+listener在物理模式跳过原本普通RAM的整域 dma_map/unmap/ref路径，
+授权只保存地址/权限、不保存直接RAM指针，因此不额外引用 section。
+初始化失败的注销尚无 DMA页面，保留授权元数据到 container销毁：
+不能对未成功授权的section猜测remove范围，也不能错误地中断正常清理。
+初始化若意外出现DMA页面则拒绝继续清理，避免未静止时释放。
+
+运行时只要设备仍挂载且已有 materialized buffer，RAM region_del 在
+修改授权/unmap/释放pool之前返回EBUSY，listener执行fatal error停止进程；
+VM pause/BQL并不证明硬件静止，不能仅vm_stop后就回收。
+暂不支持运行时RAM热移除。正常legacy detach从容器列表删除设备并关闭
+device fd，最后group的listener才注销；此时撤销授权/硬件映射，
+最后container fd关闭之后object finalize释放pool。
+当前PCI reset仍保持旧gate failed，需关闭QEMU后fresh启动；尚未实现
+有硬件成功/排空证据的reset恢复，这个限制没有被startup开关隐藏。
+
+scripts/gvm-device-vfio-node.py在改绑VF之前验证新设置、
+拒绝physical+legacy-dma-bridge组合，并检查真实sysfs X710 ID。
+物理模式保留四CPU/4GiB/双NUMA和owner设备布局，
+设置GVM_IOMMU/GVM_OWNER_IOMMU/LOOM_OWNER_IOMMU=0；
+默认模式仍为1。guest内核不改，HPET不改。
+新入口是显式物理地址DMA配置，不能在现有映射上动态切换环境变量。
+
+后续待验证的命令构造是在原来sudo env前加入
+LOOM_VFIO_PHYSICAL_DMA=1；原脚本的guest内核、IB地址、数据盘等保持。
+匹配单机控制需删除 -device intel-iommu并设置
+LOOM_VFIO_DSM_DMA=1 LOOM_VFIO_LOCAL_STAGE=1 LOOM_VFIO_PHYSICAL_DMA=1。
+本次没有关闭/重启现有巨虚，没有启动该原型的真实硬件：
+必须先正常退出旧QEMU/确认VF恢复，再验证单机及巨虚收发/错误/映射增长，
+之后才能对比性能，不能以配置/模型测试宣称已经提升带宽。
+
+验证：实际 listener/attach策略、sparse core、map_full/map_iommu及
+registration保护函数抽取后，memfd ASan/UBSan共348908断言PASS；
+外部MemoryRegion/Int128/硬件map与GPA注册模拟。
+覆盖默认关闭/设置错误、地址空间/后端/页大小/设备类型保护，
+RAM授权不映射、4GiB以上GPA、完整页裁剪、readonly/alias/溢出/hole，
+初始失败清理、设备仍挂载拒绝删除且pool/映射保持、关闭设备后删除、
+revoke失败poison，以及原4000步区间状态模型/首次注册/温热复用检查。
+实际Python启动模式函数6项检查及全脚本AST语法PASS；
+没有执行sysfs改绑或真实launch。QEMU编译链接与diff --check PASS。
+guest、HPET、现有巨虚及Garen worker-g4保持，不使用Lux，不生成实验文件。

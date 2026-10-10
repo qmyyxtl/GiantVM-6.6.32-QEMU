@@ -42,4 +42,11 @@ int loom_vfio_ram_remove(VFIOContainerBase *, hwaddr, uint64_t);
 int loom_vfio_ram_read_cpu(VFIOContainerBase *, hwaddr, void *, uint64_t);
 int loom_vfio_ram_materialize(VFIOContainerBase *, hwaddr, uint64_t,
                               bool device_writes);
+/* Startup only: 0 default, 1 physical prototype, negative invalid setting. */
+int loom_vfio_physical_mode(void);
+int loom_vfio_physical_attach(VFIODevice *, AddressSpace *);
+/* 0 legacy, 1 handled authorization/ignored overlay, negative fatal error.
+ * Runtime removal with attached devices and materialized pages is unsupported.
+ */
+int loom_vfio_physical_region(VFIOContainerBase *, MemoryRegionSection *, bool);
 #endif
