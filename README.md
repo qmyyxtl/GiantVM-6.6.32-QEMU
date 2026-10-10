@@ -1861,3 +1861,59 @@ vfio_region_write当前完成同步与控制观察后，通过pwrite写物理BAR
 所有探针进程退出并cleanup，接收端和Jinx临时地址已清理。最终10秒两端
 watchdog/成功GET_STATS各5次，检查错误为空，HPET=hpet，
 discard/tx_errors快照为0；两端巨虚与Garen原libvirt VM保持运行。
+
+## BAR 系统调用与当前 host CPU 调用栈（2026-10-10）
+
+两端仍运行 `821986ba72`，未改guest/host/QEMU运行代码、CPU配置或HPET。
+Garen实际VFIO device fd32指向anon_inode:[vfio-device]；
+针对PID3466448/fd32的pwrite64系统调用入口/退出做24秒tracepoint监测。
+按真实文件offset和4字节写分类（不是推定所有VFIO文件写都是BAR0）：
+
+| offset类别 | 次数 | 累计秒 | 平均µs | 超过10µs | 短写/错误 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0x0–0x3c TX tail | 48322 | 0.043496 | 0.900 | 1 | 0 |
+| 0x2000–0x203c RX tail | 5435 | 0.004855 | 0.893 | 0 | 0 |
+| 0x3800–0x38fc IRQ control | 67678 | 0.054312 | 0.803 | 2 | 0 |
+| 其他低offset | 50 | 0.000118 | 2.370 | 0 | 0 |
+
+实际主要offset为0x3800/0x3804、0/4、0x2000/0x2004，
+其他有0x5c00、0x5000、0x7000、0x8400。合计121485次、
+约0.102782秒；这是带探针的syscall墙钟累计时间，不是纯CPU时间。
+物理BAR pwrite份额较小，暂不为其实现额外私有mmap。
+此窗口发送173.45/156.01/168.89 MiB/s，校验通过，不作正式性能基线。
+
+系统perf包装器不能自动找到自编译krdma内核工具，使用现有
+/usr/lib/linux-tools/6.8.0-146-generic/perf，无安装或内核修改。
+CPU-clock:H排除guest执行，199 Hz、24秒、DWARF stack8192，
+记录61,983,992字节memfd，约5K样本、Lost Samples=0。
+Self热点分散：_raw_spin_unlock_irqrestore6.60%，kvm_dsm_memcpy2.36%，
+perf_iterate_ctx2.12%，syscall_enter_from_user_mode2.06%，ioctl1.79%，
+g_hash_table_lookup1.57%。这些是采样CPU分布，不能把锁Self%认定锁竞争，
+采样自身有开销，不能据此直接推出路径吞吐上限。
+
+为定位调用来源，再做49 Hz/24秒的独立host-only栈采样：
+15,125,228字节memfd，perf script解析994样本，其中115个leaf unknown。
+78个_raw_spin_unlock_irqrestore leaf中，37个栈经qi_submit_sync、
+qi_flush_iotlb、iommu_flush_iotlb_psi、intel_iommu_tlb_sync到ioctl；
+另16个经krdma_poll/send、kvm_dsm_fetch和guest page fault，
+5个经DSM invalidate。这里是所列具体栈的采样计数，未知帧和采样不足
+限制归因，不表示其完整inclusive成本或所有锁竞争来自这两条链。
+
+ioctl leaf有7个来自vtd_get_slpte/page_walk的DSM metadata读、
+5个来自sync_buffer→TX提交，3个来自VFIO DMA unmap、
+3个来自DMA register。哈希查找有4个来自loom_vfio_dma_unmap，
+4个来自map_at→unmap；mutex_lock样本多处明确进入kvm_dsm_memcpy、
+ivy_kvm_dsm_page_fault或dsm_lock。因此没有证据支持盲目改通用QEMU锁。
+这些读/复制的系统调用与DSM路径耦合，不能宣称已被从DSM开销中分离。
+
+源码检查：vtd_sync_shadow_page_hook立即逐event通知，
+vfio_iommu_map_notify将UNMAP交给vfio_container_dma_unmap，
+legacy backend做真实VFIO_IOMMU_UNMAP_DMA ioctl。
+下一步先统计每次失效产生的通知数、范围和可合并性，再考虑同一失效内
+合并安全的相邻host unmap。必须保留真实硬件unmap/flush、DMA lifetime、
+dirty tracking、通知顺序、错误处理和QI完成语义，不能缓存失效映射或跳过flush。
+
+所有发送窗口内容/字节校验通过；没有本轮无探针对照收益结论。
+memfd及采样/tracepoint进程全部结束，Jinx接收端和临时地址已清理；
+最终10秒两端watchdog/成功GET_STATS各5次，检查错误为空，HPET=hpet，
+discard/tx_errors快照为0，Garen已有libvirt VM未改，两端巨虚保持运行。
