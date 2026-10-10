@@ -1205,6 +1205,7 @@ typedef int (*vtd_page_walk_hook)(const IOMMUTLBEvent *event, void *private);
  * @hook_fn: hook func to be called when detected page
  * @private: private data to be passed into hook func
  * @notify_unmap: whether we should notify invalid entries
+ * @batch_leaf_reads: snapshot adjacent RAM leaf entries within this walk
  * @as: VT-d address space of the device
  * @aw: maximum address width
  * @domain: domain ID of the page walk
@@ -1214,6 +1215,7 @@ typedef struct {
     vtd_page_walk_hook hook_fn;
     void *private;
     bool notify_unmap;
+    bool batch_leaf_reads;
     uint8_t aw;
     uint16_t domain_id;
 } vtd_page_walk_info;
@@ -1300,6 +1302,60 @@ static int vtd_page_walk_one(IOMMUTLBEvent *event, vtd_page_walk_info *info)
     return hook_fn(event, private);
 }
 
+/*
+ * A leaf snapshot is private to one shadow-walk frame. Caching-mode guests
+ * publish table changes before their invalidation commands; the next command
+ * gets a fresh snapshot. Do not use this for live DMA translation or replay.
+ */
+typedef struct VTDLeafRead {
+    uint64_t entries[16];
+    uint32_t first, count;
+    bool failed;
+} VTDLeafRead;
+
+static uint64_t vtd_get_leaf_slpte(dma_addr_t addr, uint32_t offset,
+                                  uint64_t iova, uint64_t end,
+                                  VTDLeafRead *cache)
+{
+    unsigned count;
+    uint64_t remaining;
+    hwaddr xlat, len;
+    MemoryRegion *mr;
+
+    assert(offset < VTD_SL_PT_ENTRY_NR && iova < end);
+    if (cache->count && offset >= cache->first &&
+        offset - cache->first < cache->count) {
+        return le64_to_cpu(cache->entries[offset - cache->first]);
+    }
+    if (cache->failed || (addr & 4095) || addr > UINT64_MAX - 4095) {
+        return vtd_get_slpte(addr, offset);
+    }
+    remaining = ((end - 1) >> 12) - (iova >> 12) + 1;
+    count = MIN(ARRAY_SIZE(cache->entries), VTD_SL_PT_ENTRY_NR - offset);
+    count = MIN(count, remaining);
+    if (count < 2) {
+        return vtd_get_slpte(addr, offset);
+    }
+    /* Do not prefetch device memory or cross a translated RAM section. */
+    len = count * 8;
+    mr = address_space_translate(&address_space_memory, addr + offset * 8,
+                                 &xlat, &len, false, MEMTXATTRS_UNSPECIFIED);
+    if (!mr || !memory_region_is_ram(mr) || memory_region_is_ram_device(mr) ||
+        len < count * 8) {
+        cache->failed = true;
+        return vtd_get_slpte(addr, offset);
+    }
+    cache->count = 0;
+    if (dma_memory_read(&address_space_memory, addr + offset * 8,
+                        cache->entries, count * 8, MEMTXATTRS_UNSPECIFIED)) {
+        cache->failed = true;
+        return vtd_get_slpte(addr, offset);
+    }
+    cache->first = offset;
+    cache->count = count;
+    return le64_to_cpu(cache->entries[0]);
+}
+
 /**
  * vtd_page_walk_level - walk over specific level for IOVA range
  *
@@ -1323,6 +1379,11 @@ static int vtd_page_walk_level(dma_addr_t addr, uint64_t start,
     uint64_t iova_next;
     int ret = 0;
 
+    VTDLeafRead leaf;
+
+    leaf.count = 0;
+    leaf.failed = false;
+
     trace_vtd_page_walk_level(addr, level, start, end);
 
     subpage_size = 1ULL << vtd_slpt_level_shift(level);
@@ -1332,7 +1393,9 @@ static int vtd_page_walk_level(dma_addr_t addr, uint64_t start,
         iova_next = (iova & subpage_mask) + subpage_size;
 
         offset = vtd_iova_level_offset(iova, level);
-        slpte = vtd_get_slpte(addr, offset);
+        slpte = level == 1 && info->batch_leaf_reads ?
+                vtd_get_leaf_slpte(addr, offset, iova, end, &leaf) :
+                vtd_get_slpte(addr, offset);
 
         if (slpte == (uint64_t)-1) {
             trace_vtd_page_walk_skip_read(iova, iova_next);
@@ -1654,6 +1717,8 @@ static int vtd_sync_shadow_page_table_range(VTDAddressSpace *vtd_as,
         .hook_fn = vtd_sync_shadow_page_hook,
         .private = &notify,
         .notify_unmap = true,
+        .batch_leaf_reads = s->loom_leaf_batch_read && s->caching_mode &&
+                            !s->root_scalable && migration_is_idle(),
         .aw = s->aw_bits,
         .as = vtd_as,
         .domain_id = vtd_get_domain_id(s, ce, vtd_as->pasid),
@@ -4526,6 +4591,20 @@ static void vtd_set_unmap_coalesce(Object *obj, bool enabled, Error **errp)
     INTEL_IOMMU_DEVICE(obj)->loom_unmap_coalesce = enabled;
 }
 
+static bool vtd_get_leaf_batch_read(Object *obj, Error **errp)
+{
+    return INTEL_IOMMU_DEVICE(obj)->loom_leaf_batch_read;
+}
+
+static void vtd_set_leaf_batch_read(Object *obj, bool enabled, Error **errp)
+{
+    if (enabled && !loom_iommu_enabled()) {
+        error_setg(errp, "leaf batching requires owner IOMMU");
+        return;
+    }
+    INTEL_IOMMU_DEVICE(obj)->loom_leaf_batch_read = enabled;
+}
+
 static void vtd_realize(DeviceState *dev, Error **errp)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
@@ -4564,6 +4643,9 @@ static void vtd_realize(DeviceState *dev, Error **errp)
 
     s->loom_unmap_coalesce = loom_iommu_enabled() &&
         g_strcmp0(getenv("LOOM_VTD_UNMAP_COALESCE"), "1") == 0;
+
+    s->loom_leaf_batch_read = loom_iommu_enabled() &&
+        g_strcmp0(getenv("LOOM_VTD_LEAF_BATCH_READ"), "1") == 0;
 
     s->loom_qi_pair_read = loom_iommu_enabled() &&
         g_strcmp0(getenv("LOOM_VTD_QI_PAIR_READ"), "1") == 0;
@@ -4606,6 +4688,8 @@ static void vtd_realize(DeviceState *dev, Error **errp)
     /* Pseudo address space under root PCI bus. */
     x86ms->ioapic_as = vtd_host_dma_iommu(bus, s, Q35_PSEUDO_DEVFN_IOAPIC);
     qemu_add_machine_init_done_notifier(&vtd_machine_done_notify);
+    object_property_add_bool(OBJECT(s), "loom-leaf-batch-read",
+                             vtd_get_leaf_batch_read, vtd_set_leaf_batch_read);
     object_property_add_bool(OBJECT(s), "loom-unmap-coalesce",
                              vtd_get_unmap_coalesce, vtd_set_unmap_coalesce);
     object_property_add_bool(OBJECT(s), "loom-qi-pair-read",

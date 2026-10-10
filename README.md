@@ -2036,3 +2036,26 @@ rx/tx discard、tx error 均为 0，guest dmesg 无 error 级别信息。
 1024 页为 `[153.273, 147.112, 166.386]` MiB/s（中位数 153.273）。
 这是跨启动的对照，样本重叠，未证明稳定的吞吐改善；不把减少 mmap/munmap 的结果等同于带宽提升。
 目前保持代码默认 64 页，实验启动显式使用 1024 页，继续检查其余开销；guest 与 HPET 未改。
+
+### Legacy shadow walk 的叶页表批读（实验开关）
+
+`LOOM_VTD_LEAF_BATCH_READ=1` 或 Intel IOMMU 的 QMP 属性
+`loom-leaf-batch-read=true` 启用默认关闭的批读路径。
+仅在 owner IOMMU、caching-mode、legacy 页表、migration idle 下的
+shadow 通知遍历使用，每个叶层 frame 最多缓存 16 个相邻条目（128 字节），
+只覆盖本次遍历的 IOVA 范围且不跨页表页；普通 DMA 翻译与 replay 不使用。
+只预读普通 RAM，设备内存、短的 RAM section、非对齐或溢出地址回退。
+批读失败后当前 frame 逐条读，保持原跳过读错误的行为；通知顺序与完成处理不变。
+快照不跨 frame/遍历或 invalidation 保留，下一条 invalidation 重新读取。
+该模式依赖 caching-mode guest 在失效命令之前发布页表更新的既有顺序，
+不修改 guest、QI 执行次序或 HPET。
+
+原实现的 18 秒实机计数：276585 个叶层 frame，1233467 个叶条目，
+加上父层，共 1786637 次 8 字节页表读取；无遍历错误。
+按范围统计，批读预计可把该窗口叶层读取降到约 276585 次，
+这是几何估算，并非已经测得的 syscall 或吞吐收益。
+
+提取实际 helper 的 ASan/UBSan 6006 个用例通过，覆盖区间、尾部、
+512 个条目边界、读取失败、RAM/device/section 回退和新 frame 读取更新。
+实际新旧叶层 walk 的 4000 个差分用例通过，覆盖权限、跳过项、通知顺序、
+hook 失败与默认关闭路径。模块编译和 diff 检查通过；实机批读仍待验证。
