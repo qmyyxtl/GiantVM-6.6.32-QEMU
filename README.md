@@ -1522,3 +1522,31 @@ owner 本地原生 4 KiB buffer 在完成写回、队列失效并从 live index/
 baseline/pointer 生命周期、最终分配/释放平衡。另行核查缓存只进入已完成
 失效且移除索引的原生页级成功 unmap 路径。构建和真实 VF 部署结果另行记录，
 此处不宣称吞吐收益。
+
+### buffer 复用部署验证
+
+代码 `3f18950b0c` 两端构建通过。原 guest 正常 poweroff，确认两端 QEMU
+退出 0 后重新启动；host 未重启，Garen 既有 libvirt VM 未停止。
+guest 仍为同一个 #26，CPU 0–3 在线、HPET、4 GiB/双 NUMA；
+两张真实 VF 识别，恢复两队列 RX512/TX128、XPS/RPS=0、owner-local IRQ，
+两端 ping 均为 3/3。ring 重配置期间 ethtool 曾读到 transient link-down，
+随后 link-up 且实际 ping 成功。两块数据盘在两端 PCI 目录中注册；
+本轮没有扩大磁盘性能测试范围。
+
+两端实际进程环境确认 buffer 复用开启。Garen owner0 24 秒单卡发送
+诊断窗口，依据当前二进制 DWARF 得到 recycle_buffers/free_buffer_count
+偏移 0x258/0x25c，在实际 buffer_new 入口读取参数与缓存状态：
+复用 586224 次、原生新分配 115861 次、非页及切片均为 0。
+即约 83.50% 原生 buffer_new 走复用分支；不是所有 malloc 的减少比例。
+此探针窗口三轮 131.09/130.75/130.96 MiB/s，不作性能收益证据。
+
+探针退出后同配置无探针三轮单 VF→Jinx，2 worker、6 秒，
+133.93/127.22/168.58 MiB/s，中位数 133.93；全部字节及内容校验通过。
+与前一启动的在线测试不同，本轮没有同一次启动开关交替对照，
+数值仍明显波动，不能宣称吞吐提升；单卡主要差距尚未解决。
+本优化确认减少了已观察到的本地分配成本，还剩大量新分配、索引、
+VT-d 小块元数据访问以及必须保留的硬件映射操作。
+
+最终 10 秒两端 watchdog/GET_STATS 各完成 5 次，所检查 BUG、DMA fault、
+TX timeout 类错误为空，HPET 为 hpet。短窗口不能证明长期无丢包/重传。
+所有探针/辅助接收端与 Jinx 临时地址已清理，源码已同步两端 origin 分支。
