@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Hardware DMA remains local to its VFIO owner. The guest DMA API registers
- * buffers; BAR submission and IRQ delivery merge changed bytes through DSM.
+ * Hardware DMA remains local to its VFIO owner. Standard IOMMU notifications
+ * (or the legacy DMA bridge) register translated buffers. BAR submission and
+ * IRQ delivery merge changed bytes through DSM.
  * No hardware DMA mapping points at DSM-managed guest RAM in this mode.
  */
 #include "qemu/osdep.h"

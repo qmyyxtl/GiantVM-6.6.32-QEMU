@@ -381,3 +381,22 @@ backend 成功解除硬件 DMA 后，先将失效区间的设备修改发布到 
 该验证没有创建磁盘上的实验文件，不是物理 VFIO/DMA 收发验证。
 自动接入标准 MAP 通知、真实网卡以及吞吐测量仍需继续推进。
 guest 内核、驱动和 HPET 未修改。
+
+### 标准 VFIO MAP 通知接入（2026-10-10）
+
+vfio_iommu_map_notify 使用标准通知中的 IOVA 和 translated_addr/GPA，
+调用新的 vfio_container_dma_map_iommu。staging 模式先初始化 pool 和同步
+buffer，再交给 VFIO backend，避免硬件观察到尚未填充的 pool。
+设备只读映射使用 to-device 同步，允许设备写入的映射使用双向同步。
+大叶映射按最多 64 MiB 分段注册；初始化或 backend MAP 失败时回滚。
+普通非 staging 模式仍直接使用原 RAM 地址。
+
+gvm-device-vfio-node.py 默认使用 q35、owner IOMMU 和双 NUMA，
+不挂 DMA bridge，guest 使用已有标准 IAVF/I40E 驱动。
+--legacy-dma-bridge 保留旧测试入口；数据盘改为现有 MSI-X/owner IOThread 参数。
+HPET 保留。该入口仍只接受独立 IOMMU group 的 SR-IOV VF，不解绑 host PF。
+
+实际源码配合模拟 RAM/backend 的内存测试通过：初始化先于 backend MAP、
+自动映射/失效生命周期、只读权限、大叶分段、初始化失败和 backend 失败回滚、
+普通非 staging 路径。此记录尚不证明真实网卡成功初始化或真实 DMA 收发，
+需继续进行硬件验证，不能据此宣称吞吐已改善。

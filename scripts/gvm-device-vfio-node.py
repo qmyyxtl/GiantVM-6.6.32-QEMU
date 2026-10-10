@@ -10,6 +10,8 @@ import subprocess
 parser = argparse.ArgumentParser()
 parser.add_argument("node", type=int, choices=(0, 1))
 parser.add_argument("--host", required=True, help="VF PCI address, e.g. 0000:0c:02.0")
+parser.add_argument("--legacy-dma-bridge", action="store_true",
+                    help="use the old guest-assisted identity DMA bridge")
 parser.add_argument("--data-disk", type=Path, help="existing dedicated raw data image")
 args = parser.parse_args()
 if args.data_disk is not None:
@@ -65,17 +67,29 @@ try:
               f"addr=0{3 + args.node}.0,target-devfn={8 * (7 + args.node)},"
               f"loom-aggregate=on,loom-numa-node={args.node}")
     extra = []
+    if args.legacy_dma_bridge:
+        extra += ["-device", bridge]
+    else:
+        env.update(GVM_MACHINE="q35", GVM_IOMMU="1", GVM_OWNER_IOMMU="1")
+        extra += ["-object", "memory-backend-ram,id=n0,size=2G",
+                  "-object", "memory-backend-ram,id=n1,size=2G",
+                  "-numa", "node,nodeid=0,cpus=0-1,memdev=n0",
+                  "-numa", "node,nodeid=1,cpus=2-3,memdev=n1",
+                  "-numa", "dist,src=0,dst=1,val=20",
+                  "-numa", "dist,src=1,dst=0,val=20"]
     if args.data_disk is not None:
-        extra = ["-drive", f"file={args.data_disk},format=raw,if=none,"
+        extra += ["-object", "iothread,id=owner-io,poll-max-ns=0",
+                  "-drive", f"file={args.data_disk},format=raw,if=none,"
                  f"id=data-owner-{args.node},cache=none,aio=threads",
                  "-device", f"virtio-blk-pci,drive=data-owner-{args.node},"
                  f"id=data-owner-{args.node},addr=0{9 + args.node:x}.0,"
-                 f"serial=GVM-DATA-OWNER{args.node},ioeventfd=off,vectors=0,"
-                 f"loom-aggregate=on,loom-numa-node={args.node}"]
+                 f"serial=GVM-DATA-OWNER{args.node},ioeventfd=on,vectors=5,"
+                 f"loom-aggregate=on,loom-numa-node={args.node},"
+                 "iothread=owner-io"]
     print(f"VF {args.host}; host PF {parent.name} remains on i40e", flush=True)
     child = subprocess.Popen([str(root / "scripts/gvm-device-node.sh"),
                               str(args.node), "-device", endpoint,
-                              "-device", bridge, *extra], env=env)
+                              *extra], env=env)
     print(f"QEMU PID {child.pid}", flush=True)
     raise SystemExit(child.wait())
 finally:

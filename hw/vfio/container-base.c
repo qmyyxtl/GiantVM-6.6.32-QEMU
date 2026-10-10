@@ -13,26 +13,67 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/units.h"
 #include "hw/vfio/vfio-container-base.h"
 #include "hw/vfio/loom-dma.h"
 
-int vfio_container_dma_map(VFIOContainerBase *bcontainer,
-                           hwaddr iova, ram_addr_t size,
-                           void *vaddr, bool readonly)
+static int vfio_container_dma_map_full(VFIOContainerBase *bcontainer,
+                                       hwaddr iova, ram_addr_t size,
+                                       void *vaddr, bool readonly,
+                                       const hwaddr *gpa)
 {
     VFIOIOMMUClass *vioc = VFIO_IOMMU_GET_CLASS(bcontainer);
-
     int ret = loom_vfio_dma_map(bcontainer, iova, size, &vaddr, readonly);
 
     if (ret) {
         return ret;
     }
+    if (gpa && loom_vfio_dma_enabled()) {
+        uint64_t offset = 0;
+
+        if (*gpa + size < *gpa) {
+            ret = -EINVAL;
+            goto rollback;
+        }
+        /*
+         * Initialize the translated pool before hardware can access it.
+         * Bound each synchronization buffer even for large IOMMU leaves.
+         */
+        while (offset < size) {
+            uint64_t len = MIN(size - offset, 64 * MiB);
+
+            ret = loom_vfio_dma_register(bcontainer, iova + offset,
+                                         *gpa + offset, len, readonly ? 1 : 0);
+            if (ret) {
+                goto rollback;
+            }
+            offset += len;
+        }
+    }
     g_assert(vioc->dma_map);
     ret = vioc->dma_map(bcontainer, iova, size, vaddr, readonly);
-    if (ret) {
-        loom_vfio_dma_unmap(bcontainer, iova, size);
+    if (!ret) {
+        return 0;
     }
+rollback:
+    loom_vfio_dma_unmap(bcontainer, iova, size);
     return ret;
+}
+
+int vfio_container_dma_map(VFIOContainerBase *bcontainer,
+                           hwaddr iova, ram_addr_t size,
+                           void *vaddr, bool readonly)
+{
+    return vfio_container_dma_map_full(bcontainer, iova, size,
+                                       vaddr, readonly, NULL);
+}
+
+int vfio_container_dma_map_iommu(VFIOContainerBase *bcontainer,
+                                 hwaddr iova, hwaddr gpa, ram_addr_t size,
+                                 void *vaddr, bool readonly)
+{
+    return vfio_container_dma_map_full(bcontainer, iova, size,
+                                       vaddr, readonly, &gpa);
 }
 
 int vfio_container_dma_unmap(VFIOContainerBase *bcontainer,
