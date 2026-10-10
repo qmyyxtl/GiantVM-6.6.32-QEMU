@@ -688,3 +688,65 @@ tx_errors 均为 0；后续需定位 RX 队列资源及处理延迟，不能只�
 198.18.11.1 消失已现场确认，恢复地址后连通。测试须前后核实测试 IP
 和直连路由，不能把这些超时全部归因于设备/DSM。所有 TCP sink/接收进程
 已退出，未保存实验文件；Lux、host 内核、原 libvirt VM 均未改动。
+
+### 合并 DMA 提交读取与 DSM 现场（2026-10-10）
+
+QEMU 3317c14343 修正 physmem 中 DSM RAM 复制失败的返回值：负 errno
+或正的未复制字节数均为 MEMTX_ERROR，读失败清空输出，部分写保留 dirty
+通知，避免调用者把失败结果提交到 DMA baseline。实际函数提取到 memfd
+测试，负错误、正 partial-copy、普通 RAM 路径通过。
+
+5367c7124a 在 CPU→设备提交同步中合并注册顺序中相邻 GPA 的读取，
+每批最多 64 KiB，可向前或向后延伸；不读取空洞、不重排 merge、不跳过
+标准 RX 映射，设备→CPU 的两阶段完成发布顺序保持。暂存区每个 DMA
+context 只分配一次，释放时回收。真实源码测试覆盖正反顺序、独立页内容、
+跨空洞、64 KiB 上限、设备字节保留、读取失败/重试、map/unmap/partial
+unmap 及 24 种完成交错；两端实际 QEMU 构建通过。
+
+两端启动新版、guest #25，原生 iavf 两队列/128 项 RX/TX ring。
+一次双端各 4 MiB RX 的长度/内容均通过，host 耗时约 0.586/0.687 秒、
+TCP 重传 0/1，刷新统计后两 VF rx_discards 增量均 0。之前的短样本
+未节流时丢包 3/0，而 16 KiB/1 ms 目标小批次发送为 0/0；不是严格
+限速或稳定吞吐对照，不能由这些样本认定 RX 丢包已根治。
+
+覆盖本次 RX 与空闲期的 15 秒实际提交同步探针：
+Garen 296 次完整提交同步，58600 次 DSM_MEMCPY 读，487403520 字节；
+Ezreal 288 次完整提交同步，29282 次读，420564992 字节。
+可观察到 8–64 KiB 调用。若同一批字节全部按 4 KiB 读取，分别需要
+118995/102677 次调用；本样本调用数少约 50.8%/71.5%。这是相对于
+同字节数逐页调用的计算，非相同条件旧版 A/B，也不是减少了这些 DSM
+页面访问或 RDMA 数据量。探针包含成本，不能将同步耗时视为纯 CPU。
+
+一次未采样完整 DSM 的 6 秒双卡四 worker TX 校验通过、短时 33.58
+MiB/s、四个连接 TCP total_retrans=0；同轮双盘四 worker
+O_RDONLY/O_DIRECT 回归通过、短时 3235 MiB/s，均非正式性能基线。
+随后带 DSM 探针的 TX 为 21.67 MiB/s、数据仍通过，但出现 guest
+enqueue_dl_entity 的重复入队 WARN，本轮不可作为干净性能结果。
+
+18 秒含双卡发送的 DSM 探针（kvm_dsm_fetch 的 req 是 arg3，
+GFN 位于 req+8）显示活动秒每端约 1.3万–1.7万次 fetch，空闲秒约
+几百次。主要来自 vCPU；同步内提交/完成 fetch Garen 21/73、
+Ezreal 9/8 次。最高热点 GFN11270，随后 14428、11271、14429，
+对应既有 HPET/时间维护共享路径；并非网卡 payload 的大量搬迁。
+非同步 fetch 累积阻塞耗时 Garen 1.963 秒、Ezreal 1.922 秒，
+是各线程累积，不能视为整个业务的壁钟占比。HPET 代码和配置不改。
+
+警告现场为 CPU2 migration/2 → move_queued_task → enqueue_task_fair
+→ dl_server_start → enqueue_dl_entity，WARN_ON_ONCE(on_dl_rq)。
+当前 Linux6.12 guest 缺少上游 b53127db1dbf（重复入队修复）及
+c7f7e9c73178（只为 active server 记账）。症状/源码与上游问题吻合，
+尚不能仅凭 WARN 证明是此问题或排除 DSM。已正常关闭自己的两端 QEMU，
+再回移这组修复构建 guest；未重启 host，未触碰 Lux/原 libvirt VM。
+测试进程已清理，无新增实验脚本、日志或结果文件。
+
+guest 回移提交为 8d19eb6e8/ab3a8e924，已推送
+https://github.com/qmyyxtl/GVM-guest-kernel/tree/device-aggregation 。
+#26 完整构建、两端重新启动并登录；read_hpet 地址/长度/机器码 SHA256
+与 #25 完全相同。两 VF 队列/ring 重配置、ping、两进程共 320 次跨节点
+亲和性切换及后续双卡四 worker TX、双盘四 worker只读回归通过，
+未再出现 enqueue_dl_entity 警告，不能以有限运行证明永不复现。
+#26 的 RX 内容正确，但更快的突发发送出现 rx_discards 12/65、
+TCP 重传 12/65，仍需定位 RX 队列处理延迟。最终短时 TX 25.48 MiB/s，
+四个连接重传 0/0/0/1；只读双盘 3222 MiB/s。两者仅为功能回归观测，
+未运行同条件多轮单卡/双卡或单盘/双盘正式对照，不能声称性能提升或
+线性扩展。所有 receiver/sink/observer 已退出，自己的 QEMU 保留运行。
