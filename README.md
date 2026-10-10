@@ -1810,3 +1810,54 @@ guest仍运行，Garen既有libvirt VM未改，host未重启，guest代码未改
 本版本真实开关/消息已经验证；新版本正常shutdown尚未另测，
 此前event版本正常cleanup返回与当前实际poll/eventfd三线程stop测试
 提供相关证据，不把它们当作新版本完整shutdown硬件证明。
+
+## VFIO 中断、完成与提交路径成本定位（2026-10-10）
+
+运行代码仍为 `821986ba72`，CPU0–3在线、guest#26、HPET、两队列/
+RX512 TX128不变，CQ events开启。Garen单VF→第三方Jinx两个CPU0/1 worker。
+两个独立24秒窗口针对实际Garen进程3466448做PID过滤BCC uprobe/uretprobe；
+每个函数记录入口到返回的墙钟时间及调用数。窗口含三轮6秒发送与后台控制消息。
+这些是受探针影响的诊断数据，累计时间有嵌套，不是CPU用时或墙钟占比，
+不能相加，两个窗口也不能当成配置性能对照。
+
+第一窗口：
+| 函数 | 调用数 | 累计秒 | 平均µs |
+| --- | ---: | ---: | ---: |
+| vfio_msi_interrupt | 36992 | 0.8170 | 22.08 |
+| loom_iavf_sync_data_completion | 122762 | 1.5604 | 12.71 |
+| loom_vfio_dma_sync | 235 | 0.0814 | 346.57 |
+| loom_iavf_reconcile_completion | 122960 | 0.2800 | 2.28 |
+| msix_notify | 36992 | 0.1244 | 3.36 |
+
+第二窗口进一步覆盖BAR和提交路径：
+| 函数 | 调用数 | 累计秒 | 平均µs |
+| --- | ---: | ---: | ---: |
+| vfio_msi_interrupt | 75028 | 1.1134 | 14.84 |
+| vfio_region_write | 125922 | 2.3798 | 18.90 |
+| loom_iavf_submit_tx | 46123 | 0.8100 | 17.56 |
+| loom_iavf_submit_rx | 50893 | 0.1892 | 3.72 |
+| loom_iavf_sync_data_completion | 200888 | 1.3803 | 6.87 |
+| loom_vfio_dma_sync | 235 | 0.0833 | 354.68 |
+| msix_notify | 75028 | 0.2140 | 2.85 |
+
+调用入口计数含不适用/空操作分支，不能把submit_rx计数等同有效RX提交。
+第一窗口发送155.85/139.34/146.23，第二窗口130.43/156.03/157.39 MiB/s，
+接收字节与内容全部通过；不把这些数值作为无探针性能基线。
+
+源码证实 scoped完成同步同时被helpers.c的BAR写前路径与pci.c中断回调调用；
+第一窗口次数约为中断回调3.3倍。它在每次扫描所有已启用TX ring、检查RX
+completion并保留不可识别状态full同步回退，不能简单删除doorbell前同步：
+提交必须合并晚到DMA、保留CPU页重用与payload/descriptor发布顺序。
+本地目标MSI已经在loom_pci_forward_msi中绕过远端RPC；
+x-no-kvm-msix=on保留用户态完成同步，再调用msix_notify。
+直接使用普通VFIO irqfd会绕过该DMA发布步骤，不能用配置强开取代正确性。
+
+证据把下一步重点放在BAR/队列提交中的非DSM固定工作及物理MMIO成本。
+vfio_region_write当前完成同步与控制观察后，通过pwrite写物理BAR；
+可进一步测量此syscall份额，再判断owner私有的BAR映射是否值得实现。
+若采用映射，必须保留guest MMIO陷入与同步，不能直接映射给guest绕过模型。
+本轮没有更改运行代码、guest/host内核或HPET，也没有证明全路径开销已消除。
+
+所有探针进程退出并cleanup，接收端和Jinx临时地址已清理。最终10秒两端
+watchdog/成功GET_STATS各5次，检查错误为空，HPET=hpet，
+discard/tx_errors快照为0；两端巨虚与Garen原libvirt VM保持运行。
