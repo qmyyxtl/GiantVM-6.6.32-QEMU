@@ -7,10 +7,14 @@
 
 ## 当前版本
 
-本次整理从原 `device-aggregation` 分支 `0be1943958` 起保留提交历史；
-新增仓库入口说明和 2026-10-09 IRQ locality 验证记录，功能代码保持不变。
-`main` 与 `device-aggregation` 在整理时指向同一版本。
-配套 KVM 功能基线为 `878db8c75`，host 内核名 `6.6.32-krdma+`。
+当前开发在原 origin `git@github.com:xue-123-song/GVM-qemu.git` 的
+`device-aggregation` 分支。`0deb973ad9` 实现控制面目录推送，
+配套 `86812dc787` 修复远端 CPU 占位线程暂停状态，验证记录见末尾。
+配套 KVM 源码基线为 `c05e13ce3`，两端 host 内核名仍为 `6.6.32-krdma+`。
+
+供同事使用的 GiantVM 新仓库保留 2026-10-09 整理时的快照；
+该快照保留此前历史，`main` 与 `device-aggregation` 当时指向同一版本，
+本轮没有更新该副本。
 
 ## 功能与边界
 
@@ -23,7 +27,8 @@
 - 已验证跨端独立 raw 数据盘读写、flush、跨端回读；
   VFIO 网卡有独立启动/测试工具，当前带宽回归未挂网卡，
   不能将本轮结果解读为真实网卡聚合吞吐测试。
-- **双盘并行目前没有带宽增益**；共享状态/页面争用仍待定位。
+- 最新双盘读测试已观察到带宽增益：2935 MiB/s，约为两端单盘吞吐之和的 83%；
+  尚未达到线性扩展，剩余开销仍待进一步区分。
 
 ## 构建
 
@@ -47,7 +52,8 @@ ninja -j8 qemu-system-x86_64
 先准备匹配 host 内核、正常 RDMA/IPoIB 链路、既有 root 镜像，
 以及 master 使用的 guest bzImage。当前验证 guest 为
 `6.12.0-vanilla-vfio #20`，4 vCPU / 4 GiB，`clocksource=hpet`。
-下面使用已部署的专用 1 GiB raw；新机器需先另行准备数据盘。
+下面是使用既有专用 1 GiB raw 的基础 INTx 启动示例；
+最新 MSI-X/IOThread 参数见末尾。新机器需先另行准备数据盘。
 
 在两端各自的本仓库目录执行；需要 host 上的 KVM/DSM 权限。
 以下保留当前部署使用的镜像路径，按实际环境替换。
