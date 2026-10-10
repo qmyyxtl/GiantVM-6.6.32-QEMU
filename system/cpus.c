@@ -588,6 +588,16 @@ void cpu_thread_signal_destroyed(CPUState *cpu)
 
 void cpu_pause(CPUState *cpu)
 {
+    /*
+     * Remote placeholders never execute guest instructions. Their wait loop
+     * does not consume halt_cond kicks, so acknowledge pause under the BQL.
+     */
+    if (!cpu->local) {
+        cpu->stop = false;
+        cpu->stopped = true;
+        qemu_cond_broadcast(&qemu_pause_cond);
+        return;
+    }
     if (qemu_cpu_is_self(cpu)) {
         qemu_cpu_stop(cpu, true);
     } else {
@@ -598,6 +608,11 @@ void cpu_pause(CPUState *cpu)
 
 void cpu_resume(CPUState *cpu)
 {
+    if (!cpu->local) {
+        cpu->stop = false;
+        cpu->stopped = true;
+        return;
+    }
     cpu->stop = false;
     cpu->stopped = false;
     qemu_cpu_kick(cpu);
