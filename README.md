@@ -3363,3 +3363,70 @@ guest在线0-3、HPET、error级dmesg为空，Garen worker-g4 PID6122保持。
 两个perf进程及对应Python任务已正常结束，没有新增实验文件。
 仍需解决双卡波动、完整DMA同步兜底开销，完成RX匹配对照/长期映射增长检查，
 以及physical模式reset恢复；不标记目标完成。
+
+### 2026-10-11：CPU offline 对照与完整 DMA 兜底路径成本核实
+
+代码仍为38937e909a，guest #26、HPET、physical sparse DMA不变；本轮没有改guest代码。
+先前“完整DMA同步兜底可能是主要吞吐瓶颈”的说法只是调用栈线索。
+本轮关联实际BAR访问、完整sync调用及耗时后，不再将它作为首要优化目标。
+
+CPU offline对照在同一次巨虚运行内完成：Garen owner0、guest CPU0/1固定两个worker，
+CPU2/3按在线→下线→恢复顺序；每阶段分别测单卡与单盘，各三轮。
+单卡enp0s7→Jinx198.18.10.3，两路TCP每轮6秒，接收端核验模式、字节数与elapsed。
+单盘/dev/vda，serial GVM-DATA-OWNER0，既有未挂载1GiB raw，
+O_DIRECT/libaio只读，1MiB、每worker QD4、2秒预热+8秒计数。
+没有覆盖磁盘数据，没有生成实验文件。
+
+| 三轮中位数 MiB/s | 全CPU在线（前） | 远端CPU2/3下线 | 全CPU恢复（后） |
+| --- | ---: | ---: | ---: |
+| Garen单卡TCP发送 | 507.447 | 835.005 | 692.896 |
+| Garen单盘读取 | 1981.250 | 2005.250 | 1981.375 |
+
+下线后NIC约7.005Gbit/s，高于前后在线组，但在线前后有明显波动，
+不能把65%或20%作为稳定因果收益，也不能据此证明原因就是DSM。
+磁盘约1.21%的差异小于本轮轮次波动，不视为实质收益。
+本地NIC data IRQ36→CPU0/37→CPU1，vda实际使用IRQ27→CPU0/28→CPU1，
+三阶段都保持本地，因此并不是只有offline阶段才把本地I/O完成中断移回本地。
+offline不删除远端QEMU、设备owner或DSM。
+CPU2/3及原请求IRQ掩码已恢复，所有阶段error级guest dmesg为空。
+
+BAR/full-sync成本核实使用Garen当前QEMU PID3994428的BCC entry/return uprobes，
+只记录内存内聚合表。DWARF验证VFIORegion.nr偏移48，实时exe与build inode匹配。
+关联vfio_region_read/write的region/地址/方向与loom_vfio_dma_sync的方向。
+各26秒窗口包含三轮6秒单卡或双卡发送及边缘空闲时间；采样吞吐不当作未采样对照。
+4个异常计数（上下文溢出、full-sync嵌套、缺失return上下文、统计表容量失败）均为0，
+所有full-sync return错误数0。这里只测Garen，不能外推Ezreal。
+uprobes累计inclusive elapsed包含阻塞和探针开销，不能当作exclusive CPU或吞吐损失比例。
+
+| Garen完整sync累计耗时 | 单卡窗口 | 双卡窗口 |
+| --- | ---: | ---: |
+| 26秒内所有方向/来源总和 | 258.491 ms | 256.474 ms |
+
+高频data BAR写没有触发完整sync：单卡TX tail0/4共202889次，
+data IRQ控制3800/3804共185536次；双卡Garen对应48661、70940次。
+完整sync主要由管理寄存器读6400/8000/7400/6800等，
+写5000/5c00/7000/8400，以及无BAR上下文的中断事件触发。
+双卡没有使这些调用频率显著增加，故本次证据不支持“全量扫描爆炸”解释。
+正确的控制/完成同步继续保留，尚未缩小AdminQ同步范围。
+
+随后对Garen双卡26秒流量做24秒主机CPU采样：
+perf6.8.12，cpu-clock:H 99Hz、DWARF8192，memfd、禁buildid缓存，
+evlist确认exclude_guest=1、live inode匹配。
+2430样本、24.545秒CPU权重，解析bad block0，script stderr为空。
+互斥分类以DSM调用栈优先，DSM51.564%，VFIO13.621%，RPC4.321%，OTHER30.494%。
+VFIO不含可见DSM调用栈的子分类（占全部采样主机CPU）：
+scoped完成同步6.091%，physical提交准备4.486%，materialize1.193%，
+完整sync0.700%，其余VFIO约1.152%。
+generic ioctl入口等仍可能没有可见DSM帧，分类并非完美剥离所有DSM成本。
+VFIO叶符号unknown约2.469%，整个窗口unknown约3.621%。
+不包含guest CPU、阻塞等待、QEMU外kernel worker，也未独立验证零lost events。
+该采样流量272.365MiB/s、所有接收内容/计数正确，仅为定位成本。
+
+下一步优先检查physical_read_ring已验证描述符后，physical_stage又通过
+sync_to_device_range重新读取同一CPU描述符的重复工作：
+考虑复用调用者持有的不可变快照，先完整预检覆盖/方向/注册生命周期，
+保留payload先于descriptor、所有准备先于真实tail写及成功后才commit tail。
+这是候选方案，还没有实现或宣称性能收益。不能直接跳过完成发布。
+仍需完成单卡非DSM成本优化、RX性能对照、长期映射增长及reset恢复验证。
+本轮所有探针、perf和接收任务正常退出、Jinx两个临时IP已移除，
+4个guest CPU在线、HPET不变；巨虚继续运行，Garen worker-g4未动，Lux未访问。
