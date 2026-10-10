@@ -639,3 +639,50 @@ EPT 缺页合计 Garen 29、Ezreal 125；对应 fetch 请求 79/127（含 INVALI
 最终 guest HPET=hpet，NIC rx_discards/tx_discards/tx_errors 均 0，
 未发现 DMA fault/QI submission/invalidation error/TX timeout。
 所有 TCP sink 已退出，host 内核不变，Lux 和 Garen 原有 libvirt VM 未动。
+
+### 定时器本地化与 VFIO 完成发布顺序（2026-10-10）
+
+guest 原 origin 的 5d6dbedcf 修改 kernel/sched/core.c：sched_init 在
+boot CPU 上初始化全部 runqueue，导致远端 CPU 的未启用 hrtick_timer
+仍指向 CPU0 的 hrtimer clock_base。调用栈为 task_tick_fair ->
+hrtimer_active，CPU2/3 周期性读取 CPU0 页的 seqcount。只读 /proc/kcore
+确认初始 CPU1/2/3 的 hrtick base 均为 CPU0，上线时重新初始化 inactive
+timer 后各自指向本地。保留 active timer、原同步语义和 HPET；用户的
+fair.c 未提交修改保留。当前 guest 构建 #25，源码 HEAD 仍为 5d6dbedcf。
+
+短时业务的 15 秒探针窗口中，每端约 98 万次 4 KiB 的提交同步 DSM_MEMCPY
+读取、约 4 GB 扫描；相应提交同步 fetch 仅 19/3 次。这不是 RDMA 数据量：
+很多成本来自本地页检查、锁、ioctl 和复制。尝试按只写 IOMMU 权限跳过
+RX CPU 扫描，QEMU c174924b1b 已由 93bff2e687 回退，guest PTE 临时改动
+也已恢复。实际同步代码在 memfd 中可复现反例：DMA 写 0x22，CPU 回收
+缓冲区改为 0x33，下一轮 DMA 又写 0x22；跳过提交刷新后 baseline 仍为
+0x22，完成差分检测漏掉该字节，guest 错误保留 0x33。保留双向刷新会正确
+恢复 0x22。因此 DMA 方向不足以替代回收/完成生命周期信息，不能据此
+直接省掉永久映射 RX 缓冲区的提交同步。
+
+QEMU e66dad55f9 将设备写回改为两阶段，cdbfb2b777 保留 partial unmap
+后片段的原注册位置。目标 iavf 的 coherent descriptor 注册早于 streaming
+payload：先按旧到新顺序快照，再按新到旧顺序发布，只发布已有快照，
+避免数据扫描之后又读取刚完成的描述符。旧代码的受控交错测试可出现
+descriptor_done=1、payload=00 而设备 payload=44；新代码此时不暴露
+完成位，下一次同步正确发布。24 种完成时机（含部分解除映射）通过，
+原有 map/unmap、最后发布、失败重试、只读及跨映射回归通过。
+这一顺序依赖描述符先于数据缓冲区注册；不是任意设备协议的通用证明。
+
+两台机器已 Git 同步并构建、启动上述 QEMU。两张真实 VF 各接收 4 MiB，
+长度/内容均通过；host 侧耗时约 0.80/0.99 秒、重传 63/46，仍有重传。
+回退方向优化后的此前同尺寸样本为 2.28/2.69 秒、重传 62/107；
+重启、IRQ 亲和性和 DSM 页布局不同，不能归因全部差异于完成顺序修改。
+新代码一次双卡四 worker 发送内容校验通过，短时仅 6.26 MiB/s，
+不能声称网络性能已改善；双盘 O_RDONLY/O_DIRECT 四 worker 回归通过，
+短时 3170 MiB/s，不作为新正式基线。无 DSM 的实际源码 microtest，
+1178 个未改变的 4 KiB buffer，每次完成扫描旧版中位 364 us，
+两阶段版本约 399 us；正确性修复仍增加了遍历成本，后续需继续优化。
+
+设备重配中一次 ethtool -G 报 reset 等待超时，现场显示设置随后为
+2 queue / 128 RX / 128 TX 且链路恢复；未为此重启 host。启动 printk
+时间戳存在跨 CPU 偏差，但当前 monotonic 取样正常，HPET 配置/代码不变。
+两台 host 的 systemd-networkd 重配置可能删除临时测试 IP；本次 Garen
+198.18.11.1 消失已现场确认，恢复地址后连通。测试须前后核实测试 IP
+和直连路由，不能把这些超时全部归因于设备/DSM。所有 TCP sink/接收进程
+已退出，未保存实验文件；Lux、host 内核、原 libvirt VM 均未改动。
