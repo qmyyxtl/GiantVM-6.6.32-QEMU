@@ -1199,3 +1199,45 @@ Runtime inspection of the first index revision found zero hits despite native
 map revision keeps those maps in a separate list, indexes native maps and
 buffers, and reconstructs indexes after non-page buffer invalidations. This is
 why source regression success alone is insufficient evidence of optimization.
+
+
+#### Mixed-map runtime validation
+
+Revision 6a4917adf4 was built on both owners and started with the unchanged
+guest kernel build #26, 4 vCPUs, 4 GiB, two NUMA nodes, two queues per VF and
+128-entry RX/TX rings. A 35-second diagnostic window containing dual-NIC TX
+and dual-disk read-only activity observed these index-enabled operations:
+
+| Owner | DMA map | Submission range | DMA unmap | General-state observations |
+| --- | ---: | ---: | ---: | ---: |
+| Garen | 67247 | 40632 | 67131 | 0 |
+| Ezreal | 42160 | 28333 | 42032 | 0 |
+
+The probes inspect index state rather than assert every internal instruction
+path; sampled map requests were 4 KiB. Native and mixed-map source checks also
+cover a page buffer inside a larger pool, page invalidation splitting that pool,
+retained pointer/index consistency, and remapping the invalidated page.
+
+All four TX streams passed receiver byte-content checks. A six-second diagnostic
+run reported 58.15 MiB/s and dual raw O_DIRECT/O_RDONLY reads reported
+3205.26 MiB/s. A separate 12-second TX run during host CPU profiling reported
+42.50 MiB/s with all four receiver checks passing and retransmits 0/1/1/3.
+These runs are not a controlled performance A/B or proof of linear scaling.
+
+The subsequent host-userspace-only profile reported Ezreal memcmp self samples
+50.36%, snapshot_from_device 8.97%, and loom_vfio_dma_sync 3.59%. DMA map, unmap
+and range-coverage symbols no longer appeared above the 0.5% report threshold.
+Garen also no longer listed those three symbols above that threshold, but many
+libc samples remained unresolved, so no matching memcmp percentage is assigned.
+Changing sampled CPU proportions does not measure total elapsed-time savings
+or DSM wait fractions.
+
+Both RX streams received and validated 4 MiB. Owner-0 RX had 75 discarded
+packets and the corresponding sender had 75 retransmits; owner-1 had neither.
+Thus payload correctness passed, while burst receive service remains a
+performance concern. Afterwards each VF completed five GET_STATS control
+requests over ten seconds, with no tested DMA/queue/error signatures and HPET
+still selected. The existing boot FAT warning is not covered by that statement.
+All diagnostic probes, receivers, senders and TCP sinks exited; the guest
+remains running. Full completion scans and their publication ordering are the
+next optimization target. No guest or host-kernel source was modified.
