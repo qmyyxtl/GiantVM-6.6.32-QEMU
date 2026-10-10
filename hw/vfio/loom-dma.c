@@ -324,12 +324,13 @@ int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
         if (start >= stop) {
             continue;
         }
+        /* Keep surviving slices at the original registration position. */
         if (start > b->iova) {
-            ctx->buffers = g_list_prepend(ctx->buffers,
+            ctx->buffers = g_list_insert_before(ctx->buffers, p,
                 buffer_slice(b, 0, start - b->iova));
         }
         if (stop < b->iova + b->size) {
-            ctx->buffers = g_list_prepend(ctx->buffers,
+            ctx->buffers = g_list_insert_before(ctx->buffers, p,
                 buffer_slice(b, stop - b->iova, b->iova + b->size - stop));
         }
         ctx->buffers = g_list_delete_link(ctx->buffers, p);
