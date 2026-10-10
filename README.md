@@ -2818,3 +2818,64 @@ translated map才在硬件dma_map前注册/初始化外部pool。
 本轮无新优化或吞吐提升声明。guest代码和HPET保持，
 CPU0-3/HPET及错误级dmesg为空已确认；巨虚与Garen worker-g4保持，
 Jinx正常STOPLOOM并删除临时IP，没有使用Lux或实验文件。
+
+### 2026-10-11：普通 RAM 映射与稀疏物理 DMA 路径的契约核对
+
+本轮为源码/运行布局核对，不启用新数据路径、不改guest/HPET。
+普通RAM listener真实入口common.c:vfio_listener_region_add，
+IOVA是section.offset_within_address_space加主机页对齐修正；
+VFIO container listener注册在bcontainer->space->as。
+pci_device_iommu_address_space在没有guest IOMMU或bypass时返回
+&address_space_memory，只有此身份下普通RAM的IOVA才可按GPA使用。
+不能把其他AddressSpace、RAMDevice或RamDiscardManager都当作同样的RAM。
+RAMBlock内部offset/alias不是GPA，实际GPA必须按AddressSpace外部坐标处理。
+
+QMP info mtree -f实测当前system memory：
+n0主RAM低地址段至0x7fffffff，低端有VGA/ROM覆盖；
+n1在0x100000000..0x17fffffff。两段各约2GiB且中间并不连续，
+0xb0000000..PCI/MMIO/HPET等不是普通RAM。不得把0..4GiB全当RAM授权。
+VGA VRAM在0xfd000000另有16MiB，必须另辨RAM类型而非混入n0/n1。
+实测Garen可用内存约368462MiB，当前QEMU RSS4308332KiB；
+内存充足不证明全域同步可接受。QMP现有filter=false、CQ spin=0。
+
+阻止直接开启“全RAM注册”的具体代码：
+1. loom_vfio_dma_register每次最多64MiB，buffer_new为每buffer分配
+   sizeof(header)+2*size（baseline+scratch），另外map还有pool。
+   若全4GiB注册，额外虚拟存储约12GiB/container（4GiB pool+两份缓冲），
+   不含guest RAM与metadata；resident触碰量/保留量随同步变化，不是实测RSS预测。
+2. page_index_layout遇非4KiB注册禁用page_indexed，
+   page_generation当前因此返回0，data IRQ scoped路径会回退。
+3. sync(false/true)全域路径会遍历全部注册buffer，控制vector或unknown状态
+   仍用此路径。全RAM注册因此可能在中断/doorbell上扫描、同步GB级无关内存。
+4. 非page buffer可合法重叠（相同翻译）；scoped snapshot只选择一个buffer
+   时不能擅自忽略其他baseline。不能简单把page_generation非page检查删掉。
+5. partial unmap先完成所有device publication，再队列invalidate、
+   保留slice/改变映射/munmap；buffer_slice保留原generation和baseline，
+   新布局必须同时验证覆盖/生命周期/重叠语义，不能凭一个旧cache pointer复用。
+
+更合适的后续原型：仅支持确认的X710 VF物理RAM模式，启动opt-in，
+保持host真实IOMMU隔离；guest内核与HPET不改，只评估QEMU平台配置。
+普通RAM listener先描述合法GPA权限/区间，而不是把全RAM作为活跃同步buffer。
+已观察AdminQ/TX/RX队列首次使用的页，才分配owner本地4KiB pool，
+初始化注册并完成硬件VFIO map；随后复用同一物理页映射。
+普通物理DMA下guest没有vIOMMU MAP/UNMAP通知，必须由RAM区间失效、
+queue reset/停止DMA和container退出定义寿命，不能照搬当前短期IOVA寿命。
+单页有效性以GPA、RAM权限、注册generation和当前授权区间为依据，
+触及无效/ROM写入/MMIO/RAM hole时不得创建硬件映射。
+RAM只读权限与queue方向不同：普通RAM R/W页重复用于TX/RX时不能因上一用途
+保留错误权限；ROM等只读区间始终拒绝设备写权限。
+硬件map成功前所有描述符/payload页完整初始化；新map失败必须全回滚；
+MSI先capture完整device snapshot，payload先发布，completion最后发布，沿用排序。
+未知AdminQ/数据队列状态不能用“全4GiB同步”掩盖未实现协议；
+该物理模式应明确拒绝未支持状态/设备，保留原vIOMMU路径作为可靠回退配置。
+宿主RAM区间remove必须先停硬件DMA/完成原有发布，再解除真实IOMMU映射、
+失效队列状态和释放pool，测试要覆盖失败与部分范围。
+保留已识别页可减少运行时map churn，但会增加长期页/内存保留；
+页数不能超过授权RAM页数，需测稳定运行映射数量、RSS、启动与回收成本。
+
+当前AdminQ ASQ/ARQ base/count、data queue/ring/payload观察器已经存在，
+因此有候选同步范围来源，不等于上述物理路径已经实现。
+先验证授权范围、第一次map/回滚、queue依赖与失效的模拟外部状态测试，
+再做匹配配置单机无DSM控制与真实Garen/Ezreal功能/吞吐对照。
+禁止只删intel-iommu参数便宣称支持；现有gpa=NULL map没有该契约。
+本轮保持巨虚、所有CPU、guest与host内核及模块参数；不使用Lux/实验文件。
