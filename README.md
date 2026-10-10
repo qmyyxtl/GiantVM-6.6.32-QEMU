@@ -1388,3 +1388,34 @@ root 替换、翻译启停、reset、generation 回绕、失败/非 present 重�
 `loom-notify-context-cache` 布尔属性；`qom-get` 读取实际状态。该属性只在设备
 完成 realize 后注册，使用已有 IOMMU 锁；切换不清除 context 缓存或改变硬件
 DMA 生命周期，既有失效机制持续生效。开启要求 owner IOMMU 模式。
+
+### context 缓存真实 VF 验证
+
+代码 `f06ebe6810` 两端构建、运行。同规格 Ezreal 单 VF→Jinx、2 worker、
+6 秒三轮、无性能探针，首次分开启动对照：关闭 163.67/104.78/170.70 MiB/s，
+开启 101.02/138.43/122.62 MiB/s。启动状态与轮间波动明显，这一对照
+不能证明优化收益或回退；没有用它替代普通 VM 对照。
+
+独立 12 秒诊断窗口各包含约 6 秒发送，关闭：QI fetch 76808 次、
+fresh context 76808 次、16 字节 memcpy 读 307618 次；开启：
+QI fetch 69946 次、fresh context 0 次、16 字节读 140257 次。
+按 QI fetch 归一化，16 字节读约 4.005→2.005 次，重复 root/context 读取消除，
+同时 DMA map/unmap 仍各执行 167726 / 152311 次（对应关闭 / 开启）。
+诊断窗口负载与吞吐不同，计数不作为性能样本。
+
+随后代码 `93412ed86f` 加入运行时 QMP 开关，两端正常 guest poweroff 后
+重新启动同一个 guest #26。保持 4 vCPU/4 GiB、两 NUMA 节点、owner-local
+CPU 2/3 两个发送 worker、两队列 RX512/TX128、XPS/RPS=0、HPET，
+同一 VF 和 Jinx 接收端，单次启动内交替 OFF/ON、ON/OFF、OFF/ON：
+关闭 130.18/86.81/104.15，开启 93.99/115.04/116.12 MiB/s，
+中位数 104.15→115.04 MiB/s（观察约 +10.45%）。
+每轮无性能探针，两端 QMP 读回实际开关，接收字节数与内容校验通过。
+结果仍重叠且只有三对短测试，不能宣称稳定提升；与普通 VM 的主要差距仍未解释。
+
+开启状态下，两张 VF 从第三方 Jinx 各接收 4 MiB，内容校验通过，
+RX discard 增量均为 0。队列从默认 4 调为 2、ring 重配置后 ping 正常；
+随后 10 秒两端 watchdog/GET_STATS 各 5 次完成，所检查的 BUG、DMA fault、
+TX timeout 类错误未出现，HPET 为 hpet。短测试不能证明长期无重传/丢包。
+当前保留缓存开启；各探针、发送/接收辅助进程和 Jinx 临时地址已清理。
+host 内核及 guest 代码不变，磁盘不重测，Garen 既有 libvirt VM 未停止。
+下一步继续区分剩余 DMA 生命周期、队列处理与锁等待成本。
