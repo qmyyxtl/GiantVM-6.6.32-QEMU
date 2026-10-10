@@ -1168,9 +1168,10 @@ workload elapsed time. Inclusive call-tree percentages overlap and must not be
 added. The profile is diagnostic evidence, not a controlled throughput A/B.
 
 DMA containers now maintain page-to-map and page-to-buffer hash indexes while
-all successful mappings/registrations use aligned, disjoint 4 KiB IOVA pages on
-a 64-bit host with 4 KiB pages. Any other layout permanently falls back to the
-general ordered lists for that container. Mapping conflicts, references and
+buffer registrations use aligned, disjoint 4 KiB IOVA pages on
+a 64-bit host with 4 KiB pages. Other buffer layouts use the general lists;
+indexes can be reconstructed after incompatible buffers are invalidated.
+Large maps use a separate lookup list without disabling native page lookups. Mapping conflicts, references and
 final unregisters retain their existing semantics. Cached list links allow
 native single-page unmaps without whole-list searches or tail recomputation.
 Device writes are published before removal; publication failures preserve the
@@ -1191,3 +1192,10 @@ Existing RX/TX reuse, wrap, preflight/error, late-DMA completion, batching and
 BAR doorbell-order regressions pass. Runtime rollout and real-device validation
 of this revision are tracked separately; no scaling improvement is claimed
 from these source checks. Guest and HPET are unchanged.
+
+Runtime inspection of the first index revision found zero hits despite native
+4 KiB traffic mappings: boot-time identity mappings (up to 2 GiB) and recurring
+16 MiB device-memory mappings had disabled the whole-container index. The mixed
+map revision keeps those maps in a separate list, indexes native maps and
+buffers, and reconstructs indexes after non-page buffer invalidations. This is
+why source regression success alone is insufficient evidence of optimization.
