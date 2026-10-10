@@ -2879,3 +2879,61 @@ MSI先capture完整device snapshot，payload先发布，completion最后发布�
 再做匹配配置单机无DSM控制与真实Garen/Ezreal功能/吞吐对照。
 禁止只删intel-iommu参数便宣称支持；现有gpa=NULL map没有该契约。
 本轮保持巨虚、所有CPU、guest与host内核及模块参数；不使用Lux/实验文件。
+
+
+### 2026-10-11：稀疏物理 DMA 核心 API（尚未接入启动路径）
+
+hw/vfio/loom-dma.c 新增 loom_vfio_ram_add/remove/read_cpu/materialize，
+由 caller 持 BQL，且仅在 staging 开启、container AddressSpace 严格为
+address_space_memory 时适用。add 只记录对齐的普通 RAM GPA 范围及 RAM 权限；
+caller 必须先判别普通 RAM、RAMDevice、RamDiscardManager 与 MMIO，
+不能把 RAMBlock offset 或其他 AddressSpace 当作 GPA。
+read_cpu 先确认请求完整覆盖合法区间，然后读取 CPU GPA 视图；
+没有建立 active buffer 或硬件映射，用于第一次 queue 发现。
+
+materialize 先检查全部覆盖页及 RAM 写权限、已有页的 GPA/权限/pool 身份，
+再逐个建立并初始化 4KiB owner pool。沿用实际
+vfio_container_dma_map_iommu/full 在 hardware dma_map 前注册/初始化的顺序；
+重复使用相同页不重复注册或 map，普通 R/W RAM 允许 TX/RX 角色复用。
+失败只回滚本次新建的页，保留此前有效页。
+回滚或 revoke 的 backend unmap/publication 失败时保留仍可能被硬件访问的 pool，
+标记该模式失败，拒绝继续使用；不得将 metadata 存在当作 hardware map 仍有效。
+remove 先检查请求全部属于授权范围，再解除 backend map、执行原有 publication/
+队列失效/metadata 回收，然后拆分剩余权限区间。
+caller 必须先停止对应 DMA，失败后不得恢复该路径。
+
+测试从当前源文件抽取实际新函数和实际 map_full/map_iommu 编译，
+CPU/GPA 读取、pool 分配与 VFIO hardware backend 为模拟边界，
+不是运行真实硬件的测试。memfd 中 GCC ASan/UBSan：
+238 个定向检查，加 4000 步确定性状态操作，共 348834 次断言 PASS。
+覆盖无映射授权、RAM hole/高 GPA/readonly/overflow、
+多页初始化及 hardware map 每个失败位置的回滚、旧页保留、
+unmap/publication 失败后保留与禁止复用、stale GPA 拒绝，
+以及 authorize/remove 分裂与重新授权、页复用和权限变化的参考模型核对。
+legacy teardown 源码确认 container fd close 在 object_unref/finalize/free pool 前；
+新路径仍需在接入 MemoryListener 时验证设备停 DMA 和动态 RAM 删除的顺序。
+QEMU 编译通过、git diff --check 通过；未生成实验文件。
+
+这些 API 目前没有 MemoryListener 或 AdminQ/TX/RX 调用者，
+没有物理 DMA 启动开关，也未移除当前 guest vIOMMU；
+正常运行路径仅增加最终释放空授权对象的检查。
+不能据此声称物理模式已能启动或性能已改善。
+后续须在真实硬件 enable/tail 之前发现并初始化完整 ring/payload 依赖，
+限定已验证 X710 VF，拒绝未知状态并保留原 vIOMMU 启动配置。
+guest 内核、HPET 和运行中巨虚配置保持不变。
+
+### 2026-10-11：再次核对 guest 远端 CPU 下线影响
+
+同一次巨虚启动、Garen 本地单卡发送至第三台 Jinx、
+本地 /dev/vda raw 单盘 O_DIRECT 读；两 worker 固定 guest CPU0/1。
+每状态各三轮，NIC 每轮6秒，磁盘1MiB/QD4每worker、预热2秒/计量8秒。
+依次 CPU0-3在线、CPU2/3下线、恢复CPU0-3；HPET与源码/配置保持。
+中位数（MiB/s）：NIC 226.875 → 256.661 → 210.236；
+单盘读 1989.125 → 2037.375 → 2015.625。
+下线时 NIC 比首组高13.13%，单盘读高2.43%，磁盘仍在本次波动范围。
+远端 CPU 在线影响 NIC 的证据可重复，但该对照不区分 DSM、
+跨节点同步、时钟访问或 CPU hotplug 导致的中断/队列变化，
+也不是普通 VM 匹配配置对照，不能声称全部瓶颈已解决。
+NIC 所有字节/内容验证通过；读 completion 长度正确。
+最后 CPU0-3 恢复、中断请求亲和性恢复错误列表为空、guest 错误级 dmesg 为空；
+Jinx 临时接收端/地址已清理，不使用 Lux、不改 guest、不生成实验文件。

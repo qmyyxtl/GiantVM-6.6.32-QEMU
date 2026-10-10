@@ -30,4 +30,16 @@ int loom_vfio_dma_publish_snapshot(VFIOContainerBase *, hwaddr,
                                    const void *, uint64_t);
 /* Registration lifetime of a native device-writable page, or zero. */
 uint64_t loom_vfio_dma_page_generation(VFIOContainerBase *, hwaddr);
+/*
+ * Physical DMA prototype: caller holds BQL and supplies system-memory RAM
+ * sections only. Authorization installs no hardware map. Materialization must
+ * finish before any descriptor/doorbell exposes these bytes to the device.
+ * Remove requires the caller to stop DMA and never resume on a failed revoke.
+ */
+int loom_vfio_ram_add(VFIOContainerBase *, hwaddr, uint64_t, bool readonly);
+int loom_vfio_ram_remove(VFIOContainerBase *, hwaddr, uint64_t);
+/* Queue discovery only: authorized CPU bytes, no pool allocation or DMA map. */
+int loom_vfio_ram_read_cpu(VFIOContainerBase *, hwaddr, void *, uint64_t);
+int loom_vfio_ram_materialize(VFIOContainerBase *, hwaddr, uint64_t,
+                              bool device_writes);
 #endif

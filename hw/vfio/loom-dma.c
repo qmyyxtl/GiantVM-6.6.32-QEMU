@@ -9,6 +9,7 @@
 #include "qemu/units.h"
 #include "qemu/atomic.h"
 #include "qemu/cutils.h"
+#include "qemu/main-loop.h"
 #include "qemu/error-report.h"
 #include "exec/address-spaces.h"
 #include "hw/boards.h"
@@ -53,6 +54,8 @@ struct LoomVFIODMA {
     LoomDMABuffer *free_buffers[64];
     bool skip_redundant_zero;
 };
+
+static void loom_vfio_ram_free(VFIOContainerBase *bc);
 
 /*
  * Native guest VT-d buffers describe disjoint 4 KiB pages. Index these pages
@@ -406,6 +409,7 @@ static void buffer_retire(LoomVFIODMA *ctx, LoomDMABuffer *b)
 
 void loom_vfio_dma_free(VFIOContainerBase *bc)
 {
+    loom_vfio_ram_free(bc);
     if (!bc->loom_dma) {
         return;
     }
@@ -1323,4 +1327,251 @@ uint64_t loom_vfio_dma_page_generation(VFIOContainerBase *bc, hwaddr iova)
     }
     b = buffer_at(bc->loom_dma, iova);
     return b && b->direction != 1 ? b->generation : 0;
+}
+
+/* Sparse physical DMA: authorization is independent of active pool pages. */
+typedef struct LoomRAMRange {
+    hwaddr start, end;
+    bool readonly;
+} LoomRAMRange;
+
+struct LoomVFIORAM {
+    GList *ranges;
+    bool failed;
+};
+
+static void loom_vfio_ram_free(VFIOContainerBase *bc)
+{
+    if (bc->loom_ram) {
+        g_list_free_full(bc->loom_ram->ranges, g_free);
+        g_free(bc->loom_ram);
+        bc->loom_ram = NULL;
+    }
+}
+
+static bool ram_extent_valid(hwaddr start, uint64_t size)
+{
+    return size && !(start & 4095) && !(size & 4095) &&
+           size <= UINT64_MAX - start;
+}
+
+static LoomRAMRange *ram_range_at(VFIOContainerBase *bc, hwaddr page)
+{
+    for (GList *p = bc->loom_ram->ranges; p; p = p->next) {
+        LoomRAMRange *r = p->data;
+
+        if (page >= r->start && page < r->end) {
+            return r;
+        }
+    }
+    return NULL;
+}
+
+int loom_vfio_ram_add(VFIOContainerBase *bc, hwaddr start, uint64_t size,
+                      bool readonly)
+{
+    LoomRAMRange *r;
+
+    assert(bql_locked());
+    if (!bc || !bc->space || bc->space->as != &address_space_memory ||
+        !loom_vfio_dma_enabled()) {
+        return -ENOTSUP;
+    }
+    if (!ram_extent_valid(start, size)) {
+        return -EINVAL;
+    }
+    if (!bc->loom_ram) {
+        bc->loom_ram = g_new0(struct LoomVFIORAM, 1);
+    }
+    if (bc->loom_ram->failed) {
+        return -EIO;
+    }
+    for (GList *p = bc->loom_ram->ranges; p; p = p->next) {
+        r = p->data;
+        if (start < r->end && r->start < start + size) {
+            return -EBUSY;
+        }
+    }
+    r = g_new(LoomRAMRange, 1);
+    *r = (LoomRAMRange) { start, start + size, readonly };
+    bc->loom_ram->ranges = g_list_prepend(bc->loom_ram->ranges, r);
+    return 0;
+}
+
+/*
+ * Before a queue has been materialized, discover its descriptors through the
+ * authorized CPU GPA view. Never dispatch a guessed GPA to an MMIO device or
+ * read an entire RAM domain as a substitute for identifying active buffers.
+ */
+int loom_vfio_ram_read_cpu(VFIOContainerBase *bc, hwaddr addr, void *data,
+                           uint64_t size)
+{
+    hwaddr end;
+
+    assert(bql_locked());
+    if (!bc || !bc->loom_ram || !bc->space ||
+        bc->space->as != &address_space_memory || !loom_vfio_dma_enabled()) {
+        return -ENOTSUP;
+    }
+    if (bc->loom_ram->failed) {
+        return -EIO;
+    }
+    if (!data || !size || size > 64 * KiB || size > UINT64_MAX - addr) {
+        return -EINVAL;
+    }
+    end = addr + size;
+    for (hwaddr pos = addr; pos < end; ) {
+        LoomRAMRange *r = ram_range_at(bc, pos);
+
+        if (!r) {
+            return -EACCES;
+        }
+        pos = MIN(end, r->end);
+    }
+    return address_space_read(&address_space_memory, addr,
+                               MEMTXATTRS_UNSPECIFIED, data, size)
+           == MEMTX_OK ? 0 : -EIO;
+}
+
+/*
+ * Every byte must be authorized before creating the first hardware map.
+ * Existing pages retain their registrations and are never part of rollback.
+ * RAM permissions, not the previous TX/RX role, determine a page's DMA domain.
+ */
+int loom_vfio_ram_materialize(VFIOContainerBase *bc, hwaddr addr, uint64_t size,
+                              bool device_writes)
+{
+    hwaddr start, end, page, *created;
+    unsigned count = 0;
+    int ret = 0;
+    VFIOIOMMUClass *vioc;
+
+    assert(bql_locked());
+    if (!bc || !bc->loom_ram ||
+        !bc->space || bc->space->as != &address_space_memory ||
+        !loom_vfio_dma_enabled()) {
+        return -ENOTSUP;
+    }
+    if (bc->loom_ram->failed) {
+        return -EIO;
+    }
+    if (!size || size > 64 * MiB || addr > UINT64_MAX - size ||
+        addr + size > UINT64_MAX - 4095) {
+        return -EINVAL;
+    }
+    start = addr & ~UINT64_C(4095);
+    end = (addr + size + 4095) & ~UINT64_C(4095);
+    for (page = start; page < end; page += 4096) {
+        LoomRAMRange *r = ram_range_at(bc, page);
+        LoomDMAMap *m = bc->loom_dma ? map_at(bc->loom_dma, page) : NULL;
+
+        if (!r || (device_writes && r->readonly)) {
+            return -EACCES;
+        }
+        if (m) {
+            LoomDMABuffer *b = buffer_at(bc->loom_dma, page);
+
+            if (!bc->loom_dma->page_indexed || m->iova != page ||
+                m->size != 4096 || m->readonly != r->readonly || !b ||
+                b->iova != page || b->gpa != page || b->size != 4096 ||
+                b->direction != (r->readonly ? 1 : 0) || b->pool != m->pool) {
+                return -ESTALE;
+            }
+        }
+    }
+    vioc = VFIO_IOMMU_GET_CLASS(bc);
+    created = g_new(hwaddr, (end - start) / 4096);
+    for (page = start; page < end; page += 4096) {
+        LoomRAMRange *r = ram_range_at(bc, page);
+
+        if (bc->loom_dma && map_at(bc->loom_dma, page)) {
+            continue;
+        }
+        /* The enabled staging path replaces NULL with its initialized pool. */
+        ret = vfio_container_dma_map_iommu(bc, page, page, 4096, NULL,
+                                           r->readonly);
+        if (ret) {
+            goto rollback;
+        }
+        created[count++] = page;
+    }
+    g_free(created);
+    return 0;
+rollback:
+    while (count) {
+        page = created[--count];
+        if (vioc->dma_unmap(bc, page, 4096, NULL) ||
+            loom_vfio_dma_unmap(bc, page, 4096)) {
+            /* Keep the pool alive if hardware could still have its mapping. */
+            bc->loom_ram->failed = true;
+            ret = -EIO;
+            break;
+        }
+    }
+    g_free(created);
+    return ret;
+}
+
+/*
+ * Backend removal first stops DMA access to every selected active page.
+ * Preserve authority on failure and poison the mode: a caller cannot assume
+ * retained metadata means that the old hardware mappings are still present.
+ */
+int loom_vfio_ram_remove(VFIOContainerBase *bc, hwaddr start, uint64_t size)
+{
+    VFIOIOMMUClass *vioc;
+    GList *next;
+    int ret;
+
+    assert(bql_locked());
+    if (!bc || !bc->loom_ram || !ram_extent_valid(start, size)) {
+        return -EINVAL;
+    }
+    if (bc->loom_ram->failed) {
+        return -EIO;
+    }
+    /* Revoke only owned intervals; a caller must not erase unrelated DMA. */
+    for (hwaddr pos = start; pos < start + size; ) {
+        LoomRAMRange *r = ram_range_at(bc, pos);
+
+        if (!r) {
+            return -EACCES;
+        }
+        pos = MIN(start + size, r->end);
+    }
+    vioc = VFIO_IOMMU_GET_CLASS(bc);
+    ret = vioc->dma_unmap(bc, start, size, NULL);
+    if (!ret) {
+        ret = loom_vfio_dma_unmap(bc, start, size);
+    }
+    if (ret) {
+        bc->loom_ram->failed = true;
+        return ret;
+    }
+    for (GList *p = bc->loom_ram->ranges; p; p = next) {
+        LoomRAMRange *r = p->data;
+        hwaddr lower = MAX(start, r->start);
+        hwaddr upper = MIN(start + size, r->end);
+
+        next = p->next;
+        if (lower >= upper) {
+            continue;
+        }
+        if (lower > r->start) {
+            LoomRAMRange *left = g_new(LoomRAMRange, 1);
+
+            *left = (LoomRAMRange) { r->start, lower, r->readonly };
+            bc->loom_ram->ranges = g_list_prepend(bc->loom_ram->ranges, left);
+        }
+        if (upper < r->end) {
+            LoomRAMRange *right = g_new(LoomRAMRange, 1);
+
+            *right = (LoomRAMRange) { upper, r->end, r->readonly };
+            bc->loom_ram->ranges = g_list_prepend(bc->loom_ram->ranges, right);
+        }
+        bc->loom_ram->ranges =
+            g_list_delete_link(bc->loom_ram->ranges, p);
+        g_free(r);
+    }
+    return 0;
 }
