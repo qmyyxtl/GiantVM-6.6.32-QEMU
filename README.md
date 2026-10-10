@@ -2128,3 +2128,44 @@ ON `[207.064,189.812,198.135,210.879,206.645,205.017]` MiB/s。
 四 CPU 在线、HPET 保持，guest dmesg 无 error 级别信息，
 两卡 rx/tx discard 与 tx error 均为 0。
 两端开关开启状态下正常关机，QEMU 退出 0，VFIO IOMMU 模块引用回到 0。
+
+
+### BQL 持有期间的等待与 CPU 采样（2026-10-11）
+
+为区分持锁线程和等待锁线程，诊断使用当前 ELF 的 `bql` 地址，
+由编译类型确认 `QemuMutex.lock.__data.__owner` 位于偏移 8、长度 4，
+读取实际 pthread mutex owner 并与当前 TID 比较。
+没有仅依赖 `bql_locked` TLS 标志：条件变量等待可释放实际锁而仍保留该标志。
+sched_switch 按 `prev_state & 255` 区分休眠和 runnable，排除抢占标志；
+只对目标 QEMU 进程读取 owner。收集程序、事件和数据都在内存中，完成后清理。
+
+Garen 30 秒窗口（四 CPU 在线、本地 CPU0/1 单 VF 向 Jinx 两个 TCP worker、
+四轮六秒）：1374324 次 owner 读取，仅一次失败。
+记录到持有 BQL 的 off-CPU 时间合计 22.724 ms，
+其中 DSM/RDMA 函数族累计 4.517 ms，其余主要是用户态 nanosleep。
+这是睡眠/被调度走的区间，不是完整 BQL 持有时间，也不包含在 CPU 上忙等的时间。
+未持锁线程的 poll、KVM halt、接收 worker 条件变量等待不能归入持锁阻塞。
+这个窗口不支持“长时间持 BQL 睡眠等待 DSM 是单卡主要瓶颈”的判断，
+也不能据此断言 DSM 总成本很小。
+
+另外按现有线程逐个打开 perf CPU-clock 事件，设置 exclude_guest，
+以 99 Hz 和 199 Hz 采样，在采样点读取实际 owner；没有对每次锁操作插入 uprobe。
+捕获 kernel stack 和用户 IP。199 Hz 的 26 秒窗口共有 7622 个样本，
+owner 读取无失败，其中 3010 个采样点属于当前 BQL 持有线程：
+用户态 1410（46.8%）、真实 VFIO/IOMMU 函数族 593（19.7%）、
+DSM/RDMA 函数族 722（24.0%）、其他内核代码 285（9.5%）。
+99 Hz 的较短重叠窗口也看到用户态和真实 IOMMU 工作占据较大部分。
+事件会带来采样开销，这些窗口的吞吐不作为无探针对照。
+
+函数族只是栈分类：DSM memcpy 栈包含本地拷贝、地址转换和锁，
+不是全部在做网络传输；这些样本比例也不是可直接扣除的带宽损耗比例。
+用户帧回溯受当前构建影响，部分 glib/libc 的 IP 只能解析为 unknown，
+因此不把其全部计为 malloc、memcpy 或任何指定函数。
+可识别的用户态热点包括 hash lookup、iova_tree_compare、队列完成扫描及分配。
+
+下一项候选来自源码：VT-d shadow walk 已查找到待删除的映射，
+`iova_tree_remove` 又执行范围查找、GTree 删除和结束查找。
+对于与现有映射范围完全相同的删除，可以研究复用已找到的节点，
+而部分范围/多节点范围保留原路径。
+还未修改该路径；需要先确认精确匹配的占比并验证通知、范围删除与节点寿命语义。
+本轮未修改 guest、HPET、host 模块或设备处理代码；本地 BAR 合并加锁保持关闭。
