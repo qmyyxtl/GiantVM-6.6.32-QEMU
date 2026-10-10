@@ -22,4 +22,10 @@ uint64_t loom_vfio_dma_count(VFIOContainerBase *);
 uint64_t loom_vfio_dma_epoch(VFIOContainerBase *);
 int loom_vfio_dma_read_cpu(VFIOContainerBase *, hwaddr, void *, uint64_t);
 int loom_vfio_dma_read_baseline(VFIOContainerBase *, hwaddr, void *, uint64_t);
+/* Device snapshot capture and exact publication; caller orders dependencies. */
+int loom_vfio_dma_read_pool(VFIOContainerBase *, hwaddr, void *, uint64_t);
+int loom_vfio_dma_publish_snapshot(VFIOContainerBase *, hwaddr,
+                                   const void *, uint64_t);
+/* Registration lifetime of a native device-writable page, or zero. */
+uint64_t loom_vfio_dma_page_generation(VFIOContainerBase *, hwaddr);
 #endif

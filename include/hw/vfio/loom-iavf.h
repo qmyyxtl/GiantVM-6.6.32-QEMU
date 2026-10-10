@@ -11,6 +11,10 @@ int loom_iavf_submit_rx(VFIODevice *, hwaddr, uint32_t);
 int loom_iavf_submit_tx(VFIODevice *, hwaddr, uint32_t);
 void loom_iavf_observe_write(VFIODevice *, hwaddr, uint32_t);
 void loom_iavf_observe_completion(VFIODevice *);
+/* Reconcile only completions already published by the full DMA path. */
+void loom_iavf_reconcile_completion(VFIODevice *);
+/* 1 scoped data completion, 0 full fallback, negative synchronization error. */
+int loom_iavf_sync_data_completion(VFIODevice *);
 void loom_iavf_reset(VFIODevice *);
 void loom_iavf_free(VFIODevice *);
 /* size == 0 invalidates all state before container destruction. */

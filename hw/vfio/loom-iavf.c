@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Observe native X710 VF AdminQ queue configuration. Read only the baseline
- * already published by loom-dma, never resample live hardware DMA. This stage
- * uses acknowledged queue state for scoped RX/TX submissions, with full fallback.
+ * Observe native X710 VF AdminQ queue configuration. Control observation reads published baselines.
+ * Acknowledged native data queues use scoped submission and immutable DMA
+ * completion snapshots, with full synchronization for unsupported state.
  */
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
@@ -20,6 +20,17 @@ typedef struct LoomIAVFQueue {
     uint32_t rx_count, tx_count, rx_buffer_size;
 } LoomIAVFQueue;
 
+typedef struct LoomIAVFRXSlot {
+    uint64_t iova, first_generation, last_generation;
+} LoomIAVFRXSlot;
+
+typedef struct LoomIAVFCompletion {
+    LoomIAVFRXSlot *rx_slot;
+    uint8_t *rx_snapshot, *tx_snapshot;
+    unsigned rx_next;
+    bool seeded;
+} LoomIAVFCompletion;
+
 struct LoomIAVFQueues {
     uint64_t asq_base, arq_base, epoch;
     uint16_t asq_count, arq_count, asq_next, arq_next;
@@ -33,10 +44,184 @@ struct LoomIAVFQueues {
     uint64_t submit_payload[4096];
     uint16_t tx_tail[VF_QUEUE_COUNT], tx_tail_known;
     uint32_t tx_length[4096];
+    LoomIAVFCompletion completion[VF_QUEUE_COUNT];
+    uint8_t *completion_payload;
 };
+
+static void completion_free(LoomIAVFQueues *s)
+{
+    g_clear_pointer(&s->completion_payload, g_free);
+    for (unsigned i = 0; i < VF_QUEUE_COUNT; i++) {
+        LoomIAVFCompletion *c = &s->completion[i];
+
+        g_free(c->rx_slot);
+        g_free(c->rx_snapshot);
+        g_free(c->tx_snapshot);
+        memset(c, 0, sizeof(*c));
+    }
+}
+
+static void completion_init(LoomIAVFQueues *s)
+{
+    completion_free(s);
+    s->completion_payload = g_malloc(4096);
+    for (unsigned i = 0; i < VF_QUEUE_COUNT; i++) {
+        LoomIAVFQueue *q = &s->queue[i];
+        LoomIAVFCompletion *c = &s->completion[i];
+
+        if (!(s->valid_mask & (1U << i))) {
+            continue;
+        }
+        c->rx_slot = g_new0(LoomIAVFRXSlot, q->rx_count);
+        c->rx_snapshot = g_malloc(q->rx_count * 32ULL);
+        c->tx_snapshot = g_malloc(q->tx_count * 16ULL);
+    }
+}
+
+static bool rx_slot_set(VFIODevice *dev, const LoomIAVFQueue *q,
+                         LoomIAVFRXSlot *slot, uint64_t iova)
+{
+    *slot = (LoomIAVFRXSlot) { .iova = iova };
+    if (!iova || !q->rx_buffer_size || q->rx_buffer_size > 4096 ||
+        iova > UINT64_MAX - q->rx_buffer_size) {
+        return false;
+    }
+    slot->first_generation = loom_vfio_dma_page_generation(dev->bcontainer,
+                                                          iova);
+    slot->last_generation = loom_vfio_dma_page_generation(dev->bcontainer,
+                                         iova + q->rx_buffer_size - 1);
+    return slot->first_generation && slot->last_generation;
+}
+
+static bool rx_slot_valid(VFIODevice *dev, const LoomIAVFQueue *q,
+                           const LoomIAVFRXSlot *slot)
+{
+    return slot->iova && slot->first_generation &&
+        slot->first_generation == loom_vfio_dma_page_generation(dev->bcontainer,
+                                                                 slot->iova) &&
+        slot->last_generation == loom_vfio_dma_page_generation(dev->bcontainer,
+                                  slot->iova + q->rx_buffer_size - 1);
+}
+
+/* Capture addresses before ENABLE_QUEUES can let hardware erase them. */
+static void completion_seed_rx(VFIODevice *dev, LoomIAVFQueues *s, unsigned id)
+{
+    LoomIAVFQueue *q = &s->queue[id];
+    LoomIAVFCompletion *c = &s->completion[id];
+
+    c->seeded = false;
+    c->rx_next = 0;
+    if (!c->rx_slot || q->rx_buffer_size > 4096) {
+        return;
+    }
+    memset(c->rx_slot, 0, q->rx_count * sizeof(*c->rx_slot));
+    for (unsigned n = 0; n < q->rx_count; n++) {
+        uint8_t desc[32];
+        uint64_t address;
+
+        if (loom_vfio_dma_read_baseline(dev->bcontainer, q->rx_iova + n * 32ULL,
+                                        desc, sizeof(desc)) ||
+            ldq_le_p(desc + 8)) {
+            return;
+        }
+        address = ldq_le_p(desc);
+        if (address && !rx_slot_set(dev, q, &c->rx_slot[n], address)) {
+            return;
+        }
+    }
+    c->seeded = true;
+}
+
+/* Harvest rearmed slots after CPU submission but before the physical tail. */
+static void completion_refresh_rx(VFIODevice *dev, LoomIAVFQueues *s,
+                                   unsigned id, uint32_t tail)
+{
+    LoomIAVFQueue *q = &s->queue[id];
+    LoomIAVFCompletion *c = &s->completion[id];
+    unsigned start, count;
+
+    if (!c->seeded || tail >= q->rx_count) {
+        return;
+    }
+    if (s->rx_tail_known & (1U << id)) {
+        start = s->rx_tail[id];
+        count = (tail + q->rx_count - start) % q->rx_count;
+    } else {
+        start = 0;
+        count = q->rx_count;
+    }
+    for (unsigned n = 0; n < count; n++) {
+        unsigned slot = (start + n) % q->rx_count;
+        uint8_t desc[32];
+
+        if (loom_vfio_dma_read_baseline(dev->bcontainer,
+                         q->rx_iova + slot * 32ULL, desc, sizeof(desc))) {
+            c->seeded = false;
+            return;
+        }
+        /* The first tail may also cover already completed or unused slots. */
+        if (ldq_le_p(desc + 8)) {
+            if (s->rx_tail_known & (1U << id)) {
+                c->seeded = false;
+                return;
+            }
+            continue;
+        }
+        uint64_t address = ldq_le_p(desc);
+        if (!address && !(s->rx_tail_known & (1U << id))) {
+            continue;
+        }
+        if (!rx_slot_set(dev, q, &c->rx_slot[slot], address)) {
+            c->seeded = false;
+            return;
+        }
+    }
+}
+
+/*
+ * Full DMA publication can let the guest consume slots before the next scoped
+ * interrupt. Advance the cache from published baselines before a tail's CPU
+ * submission clears those completion flags; never resample hardware here.
+ */
+void loom_iavf_reconcile_completion(VFIODevice *dev)
+{
+    LoomIAVFQueues *s = dev->loom_iavf_queues;
+
+    if (!s) {
+        return;
+    }
+    for (unsigned id = 0; id < VF_QUEUE_COUNT; id++) {
+        LoomIAVFQueue *q = &s->queue[id];
+        LoomIAVFCompletion *c = &s->completion[id];
+
+        if (!(s->valid_mask & s->enabled_rx & (1U << id)) || !c->seeded) {
+            continue;
+        }
+        for (unsigned n = 0; n < q->rx_count; n++) {
+            LoomIAVFRXSlot *slot = &c->rx_slot[c->rx_next];
+            uint8_t status[8];
+
+            if (!slot->iova) {
+                break;
+            }
+            if (!rx_slot_valid(dev, q, slot) ||
+                loom_vfio_dma_read_baseline(dev->bcontainer,
+                   q->rx_iova + c->rx_next * 32ULL + 8, status, sizeof(status))) {
+                c->seeded = false;
+                break;
+            }
+            if (!(ldq_le_p(status) & 1)) {
+                break;
+            }
+            memset(slot, 0, sizeof(*slot));
+            c->rx_next = (c->rx_next + 1) % q->rx_count;
+        }
+    }
+}
 
 static void queues_invalidate(LoomIAVFQueues *s)
 {
+    completion_free(s);
     s->pending = false;
     s->pending_mask = 0;
     s->valid_mask = 0;
@@ -49,12 +234,16 @@ static void queues_invalidate(LoomIAVFQueues *s)
 void loom_iavf_reset(VFIODevice *dev)
 {
     if (dev->loom_iavf_queues) {
+        completion_free(dev->loom_iavf_queues);
         memset(dev->loom_iavf_queues, 0, sizeof(LoomIAVFQueues));
     }
 }
 
 void loom_iavf_free(VFIODevice *dev)
 {
+    if (dev->loom_iavf_queues) {
+        completion_free(dev->loom_iavf_queues);
+    }
     g_free(dev->loom_iavf_queues);
     dev->loom_iavf_queues = NULL;
 }
@@ -221,6 +410,11 @@ static void observe_request(VFIODevice *dev, LoomIAVFQueues *s,
             queues_invalidate(s);
             return;
         }
+        for (unsigned id = 0; id < VF_QUEUE_COUNT; id++) {
+            if (rx & (1U << id)) {
+                completion_seed_rx(dev, s, id);
+            }
+        }
         s->pending_rx = rx;
         s->pending_tx = tx;
         s->enable_pending = true;
@@ -268,6 +462,7 @@ void loom_iavf_observe_write(VFIODevice *dev, hwaddr addr, uint32_t value)
         s = dev->loom_iavf_queues;
         if (s && (s->valid_mask & s->enabled_rx & (1U << id))) {
             if (value < s->queue[id].rx_count) {
+                completion_refresh_rx(dev, s, id, value);
                 s->rx_tail[id] = value;
                 s->rx_tail_known |= 1U << id;
             } else {
@@ -379,6 +574,7 @@ void loom_iavf_observe_completion(VFIODevice *dev)
                 !ldl_le_p(desc + 12) && queues_covered(dev, s)) {
                 memcpy(s->queue, s->candidate, sizeof(s->queue));
                 s->valid_mask = s->pending_mask;
+                completion_init(s);
                 error_report("Loom iavf %s queue config observed mask=0x%x",
                              dev->name, s->valid_mask);
             } else {
@@ -603,4 +799,197 @@ int loom_iavf_submit_tx(VFIODevice *dev, hwaddr addr, uint32_t value)
                                                  (count - first) * 16ULL);
     }
     return ret ? ret : 1;
+}
+
+static bool payload_intersects_descriptors(LoomIAVFQueues *s, uint64_t iova,
+                                            uint32_t size)
+{
+    if (range_intersects(iova, size, s->asq_base,
+                         s->asq_count * AQ_DESC_SIZE) ||
+        range_intersects(iova, size, s->arq_base,
+                         s->arq_count * AQ_DESC_SIZE)) {
+        return true;
+    }
+    for (unsigned id = 0; id < VF_QUEUE_COUNT; id++) {
+        LoomIAVFQueue *q = &s->queue[id];
+
+        if ((s->valid_mask & (1U << id)) &&
+            (range_intersects(iova, size, q->rx_iova, q->rx_count * 32ULL) ||
+             range_intersects(iova, size, q->tx_iova, q->tx_count * 16ULL))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Data-vector interrupts and native data doorbells need only data queues.
+ * Control-vector interrupts and unknown operations retain the full DMA path.
+ * Capture every completion descriptor before publishing any payload, then
+ * publish those immutable descriptors only after all selected payloads.
+ */
+int loom_iavf_sync_data_completion(VFIODevice *dev)
+{
+    static int scoped = -1;
+    LoomIAVFQueues *s = dev->loom_iavf_queues;
+    unsigned done[VF_QUEUE_COUNT] = { 0 }, devices = 0;
+    VFIODevice *member;
+    int ret;
+
+    if (scoped < 0) {
+        const char *mode = getenv("LOOM_IAVF_COMPLETION_SCOPED");
+
+        scoped = !mode || strcmp(mode, "0");
+    }
+    if (!scoped || !dev->loom_iavf_irq_control || !dev->bcontainer ||
+        !s || !s->valid_mask || !(s->enabled_rx | s->enabled_tx) ||
+        s->pending || s->enable_pending || s->ambiguous ||
+        !s->completion_payload) {
+        return 0;
+    }
+    /* A container shared with another device needs its complete DMA domain. */
+    QLIST_FOREACH(member, &dev->bcontainer->device_list, container_next) {
+        devices++;
+    }
+    if (devices != 1) {
+        return 0;
+    }
+    loom_iavf_reconcile_completion(dev);
+    for (unsigned id = 0; id < VF_QUEUE_COUNT; id++) {
+        LoomIAVFQueue *q = &s->queue[id];
+        LoomIAVFCompletion *c = &s->completion[id];
+
+        if (s->enabled_tx & (1U << id)) {
+            if (!(s->valid_mask & (1U << id)) || !c->tx_snapshot ||
+                !loom_vfio_dma_page_generation(dev->bcontainer, q->tx_iova) ||
+                !loom_vfio_dma_range_covered(dev->bcontainer, q->tx_iova,
+                                              q->tx_count * 16ULL)) {
+                return 0;
+            }
+            ret = loom_vfio_dma_read_pool(dev->bcontainer, q->tx_iova,
+                                          c->tx_snapshot, q->tx_count * 16ULL);
+            if (ret) {
+                return ret;
+            }
+            for (unsigned n = 0; n < q->tx_count; n++) {
+                unsigned type = ldq_le_p(c->tx_snapshot + n * 16 + 8) & 15;
+
+                if (type != 0 && type != 1 && type != 15) {
+                    return 0;
+                }
+            }
+        }
+        if (!(s->enabled_rx & (1U << id))) {
+            continue;
+        }
+        if (!(s->valid_mask & (1U << id)) || !c->seeded || !c->rx_slot ||
+            !c->rx_snapshot || q->rx_buffer_size > 4096 ||
+            !loom_vfio_dma_page_generation(dev->bcontainer, q->rx_iova) ||
+            !loom_vfio_dma_range_covered(dev->bcontainer, q->rx_iova,
+                                          q->rx_count * 32ULL)) {
+            return 0;
+        }
+        for (unsigned n = 0; n < q->rx_count; n++) {
+            unsigned slot = (c->rx_next + n) % q->rx_count;
+            LoomIAVFRXSlot *posted = &c->rx_slot[slot];
+            uint8_t status[8], *snapshot = c->rx_snapshot + slot * 32;
+            uint64_t word;
+
+            if (!posted->iova) {
+                break;
+            }
+            if (!rx_slot_valid(dev, q, posted) ||
+                payload_intersects_descriptors(s, posted->iova,
+                                                 q->rx_buffer_size)) {
+                c->seeded = false;
+                return 0;
+            }
+            ret = loom_vfio_dma_read_pool(dev->bcontainer,
+                                q->rx_iova + slot * 32ULL + 8, status, 8);
+            if (ret) {
+                return ret;
+            }
+            word = ldq_le_p(status);
+            if (!(word & 1)) {
+                break;
+            }
+            /*
+             * read_pool's DMA read barrier orders the following descriptor
+             * fields after DD, as in the native guest driver's dma_rmb().
+             */
+            ret = loom_vfio_dma_read_pool(dev->bcontainer,
+                                q->rx_iova + slot * 32ULL, snapshot, 32);
+            if (ret) {
+                return ret;
+            }
+            if (ldq_le_p(snapshot + 8) != word ||
+                ((word >> 38) & 0x3fff) > q->rx_buffer_size ||
+                (word >> 52)) {
+                c->seeded = false;
+                return 0;
+            }
+            done[id]++;
+        }
+    }
+    /* No guest writes until every descriptor, lifetime and range is checked. */
+    for (unsigned id = 0; id < VF_QUEUE_COUNT; id++) {
+        LoomIAVFQueue *q = &s->queue[id];
+        LoomIAVFCompletion *c = &s->completion[id];
+
+        for (unsigned n = 0; n < done[id]; n++) {
+            unsigned slot = (c->rx_next + n) % q->rx_count;
+            uint64_t address = c->rx_slot[slot].iova;
+
+            ret = loom_vfio_dma_read_pool(dev->bcontainer, address,
+                                  s->completion_payload, q->rx_buffer_size);
+            if (!ret) {
+                ret = loom_vfio_dma_publish_snapshot(dev->bcontainer, address,
+                                  s->completion_payload, q->rx_buffer_size);
+            }
+            if (ret) {
+                return ret;
+            }
+        }
+    }
+    for (unsigned id = 0; id < VF_QUEUE_COUNT; id++) {
+        LoomIAVFQueue *q = &s->queue[id];
+        LoomIAVFCompletion *c = &s->completion[id];
+
+        if (s->enabled_tx & (1U << id)) {
+            ret = loom_vfio_dma_publish_snapshot(dev->bcontainer, q->tx_iova,
+                                          c->tx_snapshot, q->tx_count * 16ULL);
+            if (ret) {
+                return ret;
+            }
+        }
+        for (unsigned n = 0; n < done[id]; n++) {
+            unsigned slot = c->rx_next;
+
+            uint64_t descriptor = q->rx_iova + slot * 32ULL;
+            uint8_t *snapshot = c->rx_snapshot + slot * 32;
+
+            /*
+             * merge_buffer writes changed byte runs independently. Publish
+             * metadata/length before the byte containing DD, so a concurrent
+             * guest cannot see completion with an old length or RSS field.
+             */
+            ret = loom_vfio_dma_publish_snapshot(dev->bcontainer,
+                                                  descriptor, snapshot, 8);
+            if (!ret) {
+                ret = loom_vfio_dma_publish_snapshot(dev->bcontainer,
+                                         descriptor + 9, snapshot + 9, 23);
+            }
+            if (!ret) {
+                smp_wmb();
+                ret = loom_vfio_dma_publish_snapshot(dev->bcontainer,
+                                         descriptor + 8, snapshot + 8, 1);
+            }
+            if (ret) {
+                return ret;
+            }
+            memset(&c->rx_slot[slot], 0, sizeof(c->rx_slot[slot]));
+            c->rx_next = (slot + 1) % q->rx_count;
+        }
+    }
+    return 1;
 }

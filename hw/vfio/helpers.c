@@ -151,6 +151,9 @@ bool vfio_set_irq_signaling(VFIODevice *vbasedev, int index, int subindex,
 static bool vfio_loom_sync(VFIODevice *dev, bool submit)
 {
     int ret = loom_vfio_dma_sync(dev->bcontainer, false);
+    if (!ret) {
+        loom_iavf_reconcile_completion(dev);
+    }
     if (!ret && submit) {
         ret = loom_vfio_dma_sync(dev->bcontainer, true);
     }
@@ -189,9 +192,22 @@ static bool vfio_loom_sync_write(VFIORegion *region, hwaddr addr,
     VFIODevice *dev = region->vbasedev;
     int ret = 0;
 
-    if (!vfio_loom_sync(dev, false)) {
+    if (region->nr == 0 && size == 4 &&
+        ((addr <= 0x3c && !(addr & 3)) ||
+         (addr >= 0x2000 && addr <= 0x203c && !(addr & 3)) ||
+         (addr >= 0x3800 && addr <= 0x38fc && !(addr & 3)))) {
+        ret = loom_iavf_sync_data_completion(dev);
+    }
+    if (ret < 0) {
+        error_report("VFIO DSM scoped completion failed for %s: %s",
+                     dev->name, strerror(-ret));
+        vm_stop(RUN_STATE_INTERNAL_ERROR);
         return false;
     }
+    if (!ret && !vfio_loom_sync(dev, false)) {
+        return false;
+    }
+    ret = 0;
     if (!vfio_loom_write_submits_dma(region, addr, size)) {
         return true;
     }

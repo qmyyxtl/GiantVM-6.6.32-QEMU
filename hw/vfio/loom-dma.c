@@ -31,6 +31,7 @@ typedef struct LoomDMABuffer {
     struct LoomDMABuffer *snapshot_next;
     GList *link;
     uint64_t registration_sequence;
+    uint64_t generation;
 } LoomDMABuffer;
 
 struct LoomVFIODMA {
@@ -911,6 +912,7 @@ int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
     }
     loom_iavf_dma_invalidate_container(bc, iova, size);
     ctx->epoch++;
+    b->generation = ctx->epoch;
     ctx->buffers = g_list_prepend(ctx->buffers, b);
     b->link = ctx->buffers;
     if (ctx->registration_sequence == UINT64_MAX) {
@@ -1072,4 +1074,85 @@ int loom_vfio_dma_read_baseline(VFIOContainerBase *bc, hwaddr iova,
         size -= len;
     }
     return 0;
+}
+
+/*
+ * Read device staging bytes without publishing them or sampling guest RAM.
+ * Queue-aware callers capture completion descriptors before reading payloads.
+ */
+int loom_vfio_dma_read_pool(VFIOContainerBase *bc, hwaddr iova,
+                            void *destination, uint64_t size)
+{
+    int ret;
+
+    if (!bc || !bc->loom_dma) {
+        return -ENODEV;
+    }
+    if (!destination || !size || iova + size < iova) {
+        return -EINVAL;
+    }
+    if (!loom_vfio_dma_range_covered(bc, iova, size)) {
+        return -ENOENT;
+    }
+    smp_rmb();
+    ret = pool_copy(bc->loom_dma, iova, destination, size, false);
+    smp_rmb();
+    return ret;
+}
+
+/*
+ * Publish only a caller-owned immutable snapshot. Never re-read device memory:
+ * doing so could expose a late descriptor completion before its payload.
+ * Preflight coverage before the first guest write; merge only changed bytes,
+ * preserving CPU modifications and producer baselines outside this range.
+ */
+int loom_vfio_dma_publish_snapshot(VFIOContainerBase *bc, hwaddr iova,
+                                   const void *snapshot, uint64_t size)
+{
+    const uint8_t *bytes = snapshot;
+    hwaddr end;
+    int ret;
+
+    if (!bc || !bc->loom_dma) {
+        return -ENODEV;
+    }
+    if (!snapshot || !size || iova + size < iova) {
+        return -EINVAL;
+    }
+    if (!loom_vfio_dma_range_covered(bc, iova, size)) {
+        return -ENOENT;
+    }
+    end = iova + size;
+    while (iova < end) {
+        LoomDMABuffer *b = buffer_at(bc->loom_dma, iova);
+        uint64_t len = MIN(end - iova, b->size - (iova - b->iova));
+        LoomDMABuffer part = buffer_view(b, iova - b->iova, len);
+
+        if (b->direction != 1) {
+            ret = merge_buffer(bc, &part, (uint8_t *)bytes, false);
+            if (ret) {
+                return ret;
+            }
+        }
+        iova += len;
+        bytes += len;
+    }
+    return 0;
+}
+
+/*
+ * RX address caches must distinguish an IOVA's registration lifetimes.
+ * Zero rejects non-native layouts, missing pages and device-read-only pages.
+ * Unlike registration_sequence (which orders publication), this identity is
+ * not renumbered when the page index is reconstructed.
+ */
+uint64_t loom_vfio_dma_page_generation(VFIOContainerBase *bc, hwaddr iova)
+{
+    LoomDMABuffer *b;
+
+    if (!bc || !bc->loom_dma || !bc->loom_dma->page_indexed) {
+        return 0;
+    }
+    b = buffer_at(bc->loom_dma, iova);
+    return b && b->direction != 1 ? b->generation : 0;
 }

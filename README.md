@@ -1241,3 +1241,46 @@ still selected. The existing boot FAT warning is not covered by that statement.
 All diagnostic probes, receivers, senders and TCP sinks exited; the guest
 remains running. Full completion scans and their publication ordering are the
 next optimization target. No guest or host-kernel source was modified.
+
+
+### Scoped native data-queue completion (guest unchanged)
+
+The data-vector interrupt path and native RX/TX tail or data-vector interrupt
+control writes can now synchronize acknowledged native data queues rather than
+scan every registered DMA buffer. AdminQ vector zero, control reads/writes,
+unknown layouts and containers shared by multiple devices retain full DMA
+synchronization. LOOM_IAVF_COMPLETION_SCOPED=0 selects that full fallback for
+comparison. Errors stop the VM before the physical doorbell or guest interrupt.
+
+RX addresses are cached from published CPU baselines before ENABLE_QUEUES lets
+hardware erase them. Rearm updates the cache after CPU submission and before
+the physical tail. Each cached buffer stores its first/last page registration
+lifetimes; currently the scoped layout supports receive buffers up to 4 KiB,
+covering at most two native pages. IOVA reuse with another registration cannot
+reuse a cached address. Unknown or unsupported state falls back. Reset and
+queue invalidation free the caches. Scratch storage is allocated at queue
+configuration, with no allocation in steady completion handling.
+
+The data path reads DD before capturing RX metadata, captures all selected
+descriptor snapshots before any payload publication, and publishes payloads
+before those immutable snapshots. RX metadata and length are published before
+the byte containing DD. It never re-reads a live descriptor after publishing
+payload, which would expose a late completion without matching data. Full-path
+completion reconciliation advances the cached cursor before CPU rearm can
+clear already-published DD bits. TX snapshots cover only configured rings;
+TX data payloads are hardware input and are not completion-scan candidates.
+
+New DMA APIs capture device staging bytes and publish exact immutable snapshot
+ranges through the existing changed-byte merge. Coverage is checked before
+guest writes; unrelated CPU bytes and out-of-range baselines are preserved.
+Native page lifetime identities survive index reconstruction and change after
+unregister/remap. General full completion snapshot ordering is unchanged.
+
+Build and actual-source in-memory regressions pass for late DMA, DD-last
+metadata/payload visibility, RX reuse, ring wrap, first/last-page lifetime ABA,
+failure/retry without premature DD or cursor advancement, unknown/header-split
+fallback, shared containers, cache reset/reconfiguration, and published
+completion reconciliation before rearm. Actual BAR and MSI-X handlers are
+checked for publication-before-doorbell/notify and error suppression. These
+source checks do not yet establish runtime fast-path hits or throughput gains;
+real-device rollout is recorded separately.

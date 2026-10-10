@@ -370,7 +370,15 @@ static void vfio_msi_interrupt(void *opaque)
         abort();
     }
 
-    int dma_ret = loom_vfio_dma_sync(vdev->vbasedev.bcontainer, false);
+    int dma_ret = nr ? loom_iavf_sync_data_completion(&vdev->vbasedev) : 0;
+    if (!dma_ret) {
+        dma_ret = loom_vfio_dma_sync(vdev->vbasedev.bcontainer, false);
+        if (!dma_ret) {
+            loom_iavf_reconcile_completion(&vdev->vbasedev);
+        }
+    } else if (dma_ret > 0) {
+        dma_ret = 0;
+    }
     if (dma_ret) {
         error_report("VFIO DSM DMA completion synchronization failed: %s",
                      strerror(-dma_ret));
