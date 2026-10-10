@@ -268,3 +268,23 @@ Garen 单盘双 worker 1783.9、Ezreal 单盘双 worker 1722.9、
 两端已重新启动并通过上述检查。退出异常尚未定位，不能宣称正常退出已验证。
 当前 VFIO staging 路径仍依赖 guest DMA bridge；透明真实网卡支持和
 双网卡吞吐目标尚未完成。
+
+### 分布式 QEMU 退出顺序修正（2026-10-10）
+
+旧版在收到 shutdown 请求时就唤醒远端 CPU 占位线程，使其退出并执行
+kvm_arch_destroy_vcpu/munmap。此时 VM 停止流程尚未完成，状态通知可能仍遍历
+这些 vCPU 注册的回调，合并 MMIO ring 也可能仍引用已释放的 kvm_run 映射。
+现场确认旧版 slave 在 kvm_flush_coalesced_mmio_buffer 的 ring 读取处 SIGSEGV；
+调整映射生命周期时还暴露 master 的 vm_state_notify 崩溃。
+
+最终只修改退出顺序：请求阶段仅通知主循环；qemu_cleanup 先执行 vm_shutdown，
+完成停止通知和 block drain，再唤醒远端 CPU 退出。不保留额外的 ring alias
+迁移改动，也不改 guest 或 KVM 内核。仅含该顺序修正的版本在两端重新启动、
+root 登录、双盘四 worker 读取校验、guest sync/poweroff 后，两端 QEMU 均返回 0。
+普通双 CPU/64 MiB TCG 实例的 QMP quit 也返回 0；这不是普通 KVM 性能基线。
+短时读取属于功能回归，不作为新的吞吐优化结论。
+
+透明 VFIO 下一步需要标准 vIOMMU 的设备级映射通知：分别保留 IOVA 与 GPA，
+将远端设备映射/失效送至 owner，并在解除映射前发布已完成的 DMA 写入。
+当前 master 的 vIOMMU 控制状态不会自动配置 slave；仅添加 intel-iommu 参数
+不能解决问题。现有 staging 仍依赖 DMA bridge，尚未实现上述透明路径。

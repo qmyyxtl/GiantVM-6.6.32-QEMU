@@ -711,7 +711,6 @@ void qemu_system_shutdown_request(ShutdownCause reason)
     trace_qemu_system_shutdown_request(reason);
     replay_shutdown_request(reason);
     shutdown_requested = reason;
-    wakeup_remote_cpu(true);
     qemu_notify_event();
 }
 
@@ -889,9 +888,12 @@ void qemu_cleanup(int status)
 
 
     /* No more vcpu or device emulation activity beyond this point */
-    /* Also stop remote placeholders for signal-driven shutdown. */
-    wakeup_remote_cpu(true);
     vm_shutdown();
+    /*
+     * Remote vCPU teardown removes VM state callbacks and unmaps kvm_run.
+     * Retire placeholders only after stop notifications and device drains.
+     */
+    wakeup_remote_cpu(true);
     replay_finish();
 
     /* stop routers and close connection */ 
