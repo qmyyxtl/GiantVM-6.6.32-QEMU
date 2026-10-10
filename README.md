@@ -25,7 +25,8 @@
 - 跨端 PCI 配置和设备访问由现有设备转发逻辑处理；
   QEMU 对 guest RAM 的相关访问经过 DSM，DMA pin 遵守内核所有权协议。
 - 可选 owner IOMMU 模式通过标准 ACPI DMAR 按设备归属提供控制单元；
-  已验证两单元启用及本地控制访问，VFIO 标准映射生命周期接入仍未完成。
+  已接入 VFIO 标准映射生命周期，并验证两端独立 X710 VF 的真实收发；
+  网卡吞吐和非 DSM 开销优化仍未完成。
 - 已验证跨端独立 raw 数据盘读写、flush、跨端回读；
   VFIO 网卡有独立启动/测试工具，当前带宽回归未挂网卡，
   不能将本轮结果解读为真实网卡聚合吞吐测试。
@@ -400,3 +401,48 @@ HPET 保留。该入口仍只接受独立 IOMMU group 的 SR-IOV VF，不解绑 
 自动映射/失效生命周期、只读权限、大叶分段、初始化失败和 backend 失败回滚、
 普通非 staging 路径。此记录尚不证明真实网卡成功初始化或真实 DMA 收发，
 需继续进行硬件验证，不能据此宣称吞吐已改善。
+
+### 双 X710 VF 的标准驱动硬件验证（2026-10-10）
+
+两端 0000:0c:00.0 / ens101f0np0 的 host PF 仍使用 i40e、链路 UP，
+各创建一个 VF 0000:0c:02.0，独立 IOMMU group，由启动器绑定 vfio-pci。
+Garen VF MAC=02:47:56:4d:00:01，Ezreal VF MAC=02:47:56:4d:01:01。
+host 的管理端口和 ibs4f0 DSM 链路未解绑。当前 VF 保留供后续测试。
+
+两端用 scripts/gvm-device-vfio-node.py 启动，分别传入 node 0/1、
+--host 0000:0c:02.0、--data-disk /home/xtl/start/gvm-device-data-node0.raw
+或 node1.raw。env 使用 GVM_IPLIST='172.0.1.4 172.0.1.2'、
+GVM_GUEST_EXTRA_ARGS=clocksource=hpet。前提是已创建 VF 并配置上述 MAC，
+且两端旧实验 QEMU 已退出。启动器退出时恢复 VF 原 driver；
+当前实验仍在运行。
+
+guest 未修改的 6.12.0-vanilla-vfio #20 正常启动并登录，
+原生 iavf 驱动识别 00:07.0/enp0s7/dmar0 与 00:08.0/enp0s8/dmar1，
+两张独立网卡均报告 10 Gbps 链路 UP。guest clocksource 确认 hpet。
+
+收发使用两个临时子网，避免 guest 内部本地路由绕过硬件：
+- enp0s7=198.18.10.2/24，目标 Ezreal host PF 上的 198.18.10.1/24。
+- enp0s8=198.18.11.2/24，目标 Garen host PF 上的 198.18.11.1/24。
+
+两组初始 5 次 ping 均无丢包；对端 host PF 的 tcpdump 直接看到上述 VF
+MAC 发出的 ICMP request 及 reply，未写 pcap 文件。驱动计数随后刷新，
+两张卡 RX/TX 都增长、错误数为 0，不能以首次立即读取的 0 判定无收发。
+
+IRQ affinity 按设备 owner 设置为 07.0 -> CPU0-1、08.0 -> CPU2-3，
+活跃队列后续 effective affinity 转到 owner CPU；尚未再次触发的 IRQ
+可能仍显示旧 effective affinity，需要下一次实际中断确认。
+配置后各 10 次 ping 无丢包；期间使用过 GDB 暂停检查，因此这不是性能对照。
+初始 RTT 已有约 20-60 ms，不能宣称网卡开销低或达到线性吞吐。
+
+关闭两张接口后，两端实际 staging map/buffer 均降到 66 个 / 270336 字节，
+重新开启接口后再次各 5 次 ping 无丢包，检查未发现 DMA fault 或 TX timeout。
+Garen 重新开启后的首批回复出现最高约 1 秒延迟，此处只作为生命周期功能检查。
+接口开启时曾观察 Garen 1178 个 / 4825088 字节、Ezreal 1114 个 / 4562944 字节。
+现有同步遍历 buffer，pool_copy 再遍历 map 链表，重复查找会随映射数放大，
+下一步应去除这部分非 DSM 成本，并测量同步、复制与队列处理时间。
+
+两端测试 IP alias 当前保留；结束此硬件测试时分别删除：
+Ezreal: sudo ip addr del 198.18.10.1/24 dev ens101f0np0
+Garen: sudo ip addr del 198.18.11.1/24 dev ens101f0np0
+停止本实验 QEMU、VF 恢复 iavf 后，确认 VF 未被其他进程使用，再将各 PF
+sriov_numvfs 恢复 0。不得在 VF 仍直通时直接删除。Garen 的其他 libvirt VM 未操作。
