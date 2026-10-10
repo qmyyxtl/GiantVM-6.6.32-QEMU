@@ -3504,3 +3504,47 @@ materialize0.925%、完整sync0.540%、其余1.850%。
 
 接收服务、RX source与perf任务已正常结束，memfd关闭，Jinx临时IP清理；
 新巨虚保持运行，未生成实验脚本、结果文件或新磁盘。
+
+### 2026-10-11：四字节槽批量验证 TX snapshot 类型
+
+实现commit 88d6c47ce9，origin/device-aggregation，Ezreal修改后同步Garen，
+两端编译通过，guest/HPET/host kernel不变。
+完成路径仍验证全部TX descriptor，允许0/1/15，非法类型仍回退完整同步。
+新增tx_snapshot_types_valid每组四项只取little-endian command的最低类型字节，
+打包为4个独立byte lane：types&0x0e检测不属于0/1，types^0x0f检测不是15；
+各lane加0x7f后的最高位求交为非法项。
+每lane值最多15，加法小于256，不跨lane进位；最后不足4项逐个验证。
+没有取消任何检查、减少DMA发布或修改完成顺序。
+
+微测试只反映该循环：Ezreal host CPU10固定，gcc -O2，128项0/1/15混合有效类型，
+每轮一百万次，7轮oldcheck72.009–72.273ms、batch48.447–48.469ms，
+中位数72.027ms→48.451ms（约32.7%减少）。
+调用noinline，循环修改不参与dtype的字节避免不变调用被编译器提升；
+不是guest流量/整体CPU或吞吐收益，也不能推断相同比例的端到端提升。
+源码实际helper提取后ASan/UBSan通过：
+四项全部65536种dtype组合、0–129长度的每位置16种类型、非零上半字节、
+未对齐输入、4096项，以及每种短尾精确贴近PROT_NONE保护页，无越界。
+测试源码/程序均在内存和memfd中，没有新增实验文件。
+
+旧Garen4019166/Ezreal743223 guest正常poweroff，两端QEMU EXIT0，
+VF恢复iavf后启动新Garen4028262/Ezreal745427。
+新guest正常启动/login #26，4CPU在线、4GiB两NUMA、HPET不变；
+每卡2queue RX512/TX128，RPS/XPS0，data vector按队列名称动态精确绑0/1/2/3，
+本启动IRQ号与前启动可能不同（Garen36/38，Ezreal39/40），不硬编码旧IRQ号。
+
+单卡与双卡各一次6秒功能发送（每卡2worker绑定owner CPU）→Jinx：
+Garen663.582MiB/s、Ezreal593.068MiB/s、双卡426.355MiB/s，
+内容、发送/接收计数及elapsed均通过。
+每卡再接收256MiB：Garen5.929150秒、Ezreal8.068116秒，
+source5.922353/8.062143秒，内容/计数正确。
+只做新实现功能验证，未重复三轮或声称是新性能中位数，
+不能与前启动881/601/470三轮中位数作有效因果对比。
+末尾guest error级dmesg空，两卡rx_errors/tx_errors/rx_dropped/tx_dropped均0；
+TCP重传仍存在，不宣称整个链路零丢包。
+接收与source正常STOP退出、aliases清理、无实验文件；
+Garen无关worker-g4保持，Lux未访问，没有host reboot。
+
+这只降低已定位纯CPU热点，不能说明整个非DSM路径已最优。
+下一步仍需严格验证descriptor snapshot与本批量检查的端到端收益，
+并继续检查其他完成处理/复制/ioctl成本、RX原生对照、
+长期physical映射增长及reset恢复。目标保持未完成。
