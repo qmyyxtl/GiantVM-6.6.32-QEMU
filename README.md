@@ -2218,3 +2218,43 @@ QEMU coalesce、CQ events、stage cache 1024；本地 BAR 合并加锁关闭。
 没有重做磁盘读写聚合性能比较。
 四 CPU 在线、HPET 保持，guest dmesg error 级别为空，两卡 discard/tx error 为 0。
 两端开启状态正常关机退出 0，VFIO IOMMU 模块引用均回到 0。
+
+### VFIO 成本拆分及 lazy 配置约束（2026-10-11）
+
+在单页指针存储已开启的状态，以 199 Hz、host-only per-thread CPU 采样
+读取真实 BQL mutex owner（不是 condvar 等待时仍可能保留的 TLS 标记）。
+6098 次读取、0 次读取失败；持锁样本 2371：
+用户态 1129、DSM/RDMA 函数族 559、VFIO/IOMMU 431、其他内核 252。
+VFIO 子分类：GUP/pin 51、锁页记账 26、IOTLB flush 127、
+unpin 9、map 10、unmap 12、其他 196。
+约 2.2% 的持锁样本落在 GUP/pin、1.1% 在锁页记账，
+当前证据不支持优先引入复杂的跨请求 page pin 缓存。
+这些是 CPU 样本，不是函数累计耗时或可以直接扣除的带宽损失；
+DSM 函数族也包含本地复制和锁，不能全部解释为跨网传页。
+带采样的吞吐不用于性能对照。
+
+20 秒 VFIO ioctl 几何计数：
+严格配置 MAP 961482 次，全部单页；
+UNMAP 的 1/2/4/8 页次数分别为 110471/49517/45961/71024，
+没有 16 页请求，读取错误 0。扩大目前 16 页批量上限不能减少此窗口的 flush。
+
+只追加启动参数 `iommu.strict=0`，不修改 guest 代码和 HPET，
+同版本 guest #26、4 CPU 的启动、两卡 ping 通过。
+全局早期日志确实打印 lazy mode，但这不代表设备最终使用 DMA-FQ：
+随后日志打印 `DMAR: IOMMU batching disallowed due to virtualization`，
+全部 sysfs IOMMU group type 为 DMA。
+实际 guest 源码 drivers/iommu/intel/iommu.c 的 intel_iommu_init 中，
+caching-mode 且非 first-level 默认 domain 的条件会调用 iommu_set_dma_strict。
+因此这次配置实际被强制回严格域，不能将结果解读成有效 lazy 的收益测试，
+也不能只用早期全局日志证明 lazy 生效。
+
+配置尝试下的无探针 Garen 单卡六轮为
+[215.917,232.868,215.821,211.790,194.045,210.295] MiB/s，
+中位数 213.806，与先前严格模式 214.231 接近；跨启动不作严格配对比较。
+另一 20 秒计数 MAP 1016643 次，仍全为单页；
+UNMAP 1/2/4/8 页次数 115704/50939/43632/78083，读取错误 0。
+原始计数依赖负载和窗口，不能直接比较两次绝对次数作为加速比例。
+Jinx 向两张 VF 各发送 256 MiB，guest owner 本地 CPU 接收，
+四条 128 MiB 连接的字节数与内容检查通过。
+已恢复原 iommu.strict=1 的启动配置，没有把该参数保留为优化，
+没有为了启用 lazy 关闭虚拟 IOMMU 的 caching-mode 或修改 guest。
