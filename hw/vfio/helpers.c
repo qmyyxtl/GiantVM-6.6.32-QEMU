@@ -197,6 +197,9 @@ static bool vfio_loom_sync_write(VFIORegion *region, hwaddr addr,
     }
     if (region->nr == 0 && size == 4) {
         ret = loom_iavf_submit_rx(dev, addr, data);
+        if (!ret) {
+            ret = loom_iavf_submit_tx(dev, addr, data);
+        }
     }
     if (!ret) {
         ret = loom_vfio_dma_sync(dev->bcontainer, true);

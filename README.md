@@ -1103,3 +1103,30 @@ QI error/TX timeout，HPET=hpet。未挂探针的短回归双网卡
 
 guest #26、HPET、host 内核不改；全部临时 probes、sender、
 receiver、TCP sink、serial observer 已退出，无新增实验文件。
+
+### 原生 TX tail 范围提交（2026-10-10）
+
+在相同的完成→提交→物理 BAR 顺序下，已配置、已成功 enable、
+已有上一 tail 的 X710 TX 队列按 [old next_to_use,new next_to_use)
+解析原生 16 字节描述符。dtype0 数据描述符同步其 64 位 IOVA、
+14 位长度对应的精确 payload；dtype1 原生 TSO/VLAN/tunnel context
+不把 qword0 当 DMA 地址，校验 reserved 字段后只提交描述符。
+未知 dtype、done、零长度、未知 context 位、覆盖空洞、首次/
+相同/越界 tail、未 enable 或失效状态均回退完整提交。
+回绕分两段；先预检全部 payload/ring，再提交全部 payload、
+当前 descriptor 区间，最后物理 tail。TX 不复制 RX 的下一
+status qword，因为原生 TX 驱动没有对应的写操作。
+LOOM_IAVF_TX_SCOPED=0 可在 QEMU 启动时关闭，RX 开关独立。
+
+复用观察器内的提交临时空间，新增每队列 TX tail/known 和
+每 fragment 的长度缓存；配置失效、ring unmap、disable、
+reset 等同时清除 RX/TX tail 状态。完成方向仍使用已有全量
+同步，不改变完成发布顺序，也不改 guest。
+
+实际源码 memfd 检查通过：context+数据、跨映射 fragment、
+TSO/context 不查伪地址、非恒等 IOVA/GPA、普通/回绕 tail、
+范围外 payload/descriptor 保留、先发布的硬件字节保留、
+未知/done/零长度/reserved/未知 context 位回退、全部范围预检、
+CPU 读取错误及部分 payload 已提交后的错误、ring unmap 失效。
+RX 范围/复用、原队列 enable/失效及实际 BAR 顺序/错误检查通过。
+真实设备命中率与内容校验结果另行记录，不提前宣称吞吐提升。

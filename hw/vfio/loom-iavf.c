@@ -2,7 +2,7 @@
 /*
  * Observe native X710 VF AdminQ queue configuration. Read only the baseline
  * already published by loom-dma, never resample live hardware DMA. This stage
- * uses acknowledged queue state for scoped RX submissions, with full fallback.
+ * uses acknowledged queue state for scoped RX/TX submissions, with full fallback.
  */
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
@@ -29,8 +29,10 @@ struct LoomIAVFQueues {
     uint16_t vsi, enabled_rx, enabled_tx, pending_rx, pending_tx;
     bool enable_pending;
     uint16_t rx_tail[VF_QUEUE_COUNT], rx_tail_known;
-    uint8_t rx_desc[4096 * 32];
-    uint64_t rx_payload[4096];
+    uint8_t submit_desc[4096 * 32];
+    uint64_t submit_payload[4096];
+    uint16_t tx_tail[VF_QUEUE_COUNT], tx_tail_known;
+    uint32_t tx_length[4096];
 };
 
 static void queues_invalidate(LoomIAVFQueues *s)
@@ -41,7 +43,7 @@ static void queues_invalidate(LoomIAVFQueues *s)
     s->enabled_rx = s->enabled_tx = 0;
     s->pending_rx = s->pending_tx = 0;
     s->enable_pending = false;
-    s->rx_tail_known = 0;
+    s->rx_tail_known = s->tx_tail_known = 0;
 }
 
 void loom_iavf_reset(VFIODevice *dev)
@@ -248,6 +250,19 @@ void loom_iavf_observe_write(VFIODevice *dev, hwaddr addr, uint32_t value)
 {
     LoomIAVFQueues *s;
 
+    if (addr <= 0x3c && !(addr & 3)) {
+        unsigned id = addr / 4;
+        s = dev->loom_iavf_queues;
+        if (s && (s->valid_mask & s->enabled_tx & (1U << id))) {
+            if (value < s->queue[id].tx_count) {
+                s->tx_tail[id] = value;
+                s->tx_tail_known |= 1U << id;
+            } else {
+                s->tx_tail_known &= ~(1U << id);
+            }
+        }
+        return;
+    }
     if (addr >= 0x2000 && addr <= 0x203c && !(addr & 3)) {
         unsigned id = (addr - 0x2000) / 4;
         s = dev->loom_iavf_queues;
@@ -437,8 +452,8 @@ int loom_iavf_submit_rx(VFIODevice *dev, hwaddr addr, uint32_t value)
         return 0;
     }
     q = &s->queue[id];
-    desc = s->rx_desc;
-    payload = s->rx_payload;
+    desc = s->submit_desc;
+    payload = s->submit_payload;
     old = s->rx_tail[id];
     if (value >= q->rx_count || old >= q->rx_count || value == old) {
         return 0;
@@ -484,6 +499,108 @@ int loom_iavf_submit_rx(VFIODevice *dev, hwaddr addr, uint32_t value)
     if (!ret) {
         ret = loom_vfio_dma_sync_to_device_range(dev->bcontainer,
                                          q->rx_iova + value * 32ULL + 8, 8);
+    }
+    return ret ? ret : 1;
+}
+
+
+/*
+ * Native iavf TX tails cover [old next_to_use,new next_to_use). Data descriptors
+ * contain a 64-bit IOVA and a 14-bit byte count; context descriptors carry no
+ * payload address. Preflight every data fragment, including mapped-page splits,
+ * then publish its bytes before the corresponding descriptor batch.
+ */
+int loom_iavf_submit_tx(VFIODevice *dev, hwaddr addr, uint32_t value)
+{
+    static int scoped = -1;
+    LoomIAVFQueues *s;
+    LoomIAVFQueue *q;
+    unsigned id, count, old, first;
+    uint8_t *desc;
+    uint64_t *payload;
+    uint32_t *length;
+    int ret;
+
+    if (addr > 0x3c || (addr & 3) || !dev->loom_iavf_irq_control) {
+        return 0;
+    }
+    if (scoped < 0) {
+        const char *mode = getenv("LOOM_IAVF_TX_SCOPED");
+        scoped = !mode || strcmp(mode, "0");
+    }
+    if (!scoped) {
+        return 0;
+    }
+    s = dev->loom_iavf_queues;
+    id = addr / 4;
+    if (!s || !(s->valid_mask & s->enabled_tx & s->tx_tail_known &
+                (1U << id)) || s->pending || s->enable_pending || s->ambiguous) {
+        return 0;
+    }
+    q = &s->queue[id];
+    desc = s->submit_desc;
+    payload = s->submit_payload;
+    length = s->tx_length;
+    old = s->tx_tail[id];
+    if (value >= q->tx_count || old >= q->tx_count || value == old) {
+        return 0;
+    }
+    count = (value + q->tx_count - old) % q->tx_count;
+    first = MIN(count, q->tx_count - old);
+    ret = loom_vfio_dma_read_cpu(dev->bcontainer, q->tx_iova + old * 16ULL,
+                                 desc, first * 16ULL);
+    if (!ret && first < count) {
+        ret = loom_vfio_dma_read_cpu(dev->bcontainer, q->tx_iova,
+                                     desc + first * 16, (count - first) * 16ULL);
+    }
+    if (ret) {
+        return ret == -ENOENT ? 0 : ret;
+    }
+    for (unsigned i = 0; i < count; i++) {
+        const uint8_t *d = desc + i * 16;
+        uint64_t command = ldq_le_p(d + 8);
+        unsigned type = command & 15;
+
+        length[i] = 0;
+        if (type == 1) {
+            /* Native TSO/VLAN/tunnel context has no external DMA address. */
+            if (lduw_le_p(d + 6) ||
+                (((command >> 4) & 0xffff) & ~0x7fU) ||
+                (command & ((UINT64_C(0x3ff) << 20) |
+                            (UINT64_C(3) << 48)))) {
+                return 0;
+            }
+            continue;
+        }
+        if (type != 0) {
+            return 0;
+        }
+        payload[i] = ldq_le_p(d);
+        length[i] = (command >> 34) & 0x3fff;
+        if (!payload[i] || !length[i] ||
+            !loom_vfio_dma_range_covered(dev->bcontainer, payload[i], length[i])) {
+            return 0;
+        }
+    }
+    if (!loom_vfio_dma_range_covered(dev->bcontainer, q->tx_iova,
+                                     q->tx_count * 16ULL)) {
+        return 0;
+    }
+    for (unsigned i = 0; i < count; i++) {
+        if (!length[i]) {
+            continue;
+        }
+        ret = loom_vfio_dma_sync_to_device_range(dev->bcontainer,
+                                                 payload[i], length[i]);
+        if (ret) {
+            return ret;
+        }
+    }
+    ret = loom_vfio_dma_sync_to_device_range(dev->bcontainer,
+                              q->tx_iova + old * 16ULL, first * 16ULL);
+    if (!ret && first < count) {
+        ret = loom_vfio_dma_sync_to_device_range(dev->bcontainer, q->tx_iova,
+                                                 (count - first) * 16ULL);
     }
     return ret ? ret : 1;
 }

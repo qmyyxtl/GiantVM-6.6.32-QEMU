@@ -8,6 +8,7 @@ typedef struct LoomIAVFQueues LoomIAVFQueues;
 /* Control hooks observe already-published DMA baselines. */
 /* Caller first publishes completions: 1 scoped, 0 full fallback, <0 error. */
 int loom_iavf_submit_rx(VFIODevice *, hwaddr, uint32_t);
+int loom_iavf_submit_tx(VFIODevice *, hwaddr, uint32_t);
 void loom_iavf_observe_write(VFIODevice *, hwaddr, uint32_t);
 void loom_iavf_observe_completion(VFIODevice *);
 void loom_iavf_reset(VFIODevice *);
