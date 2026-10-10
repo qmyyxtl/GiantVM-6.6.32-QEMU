@@ -3235,3 +3235,59 @@ revoke失败poison，以及原4000步区间状态模型/首次注册/温热复�
 实际Python启动模式函数6项检查及全脚本AST语法PASS；
 没有执行sysfs改绑或真实launch。QEMU编译链接与diff --check PASS。
 guest、HPET、现有巨虚及Garen worker-g4保持，不使用Lux，不生成实验文件。
+
+### 2026-10-11：物理 sparse DMA 首次真实启动与网络验证
+
+代码38937e909a在真实Garen/Ezreal上启用LOOM_VFIO_PHYSICAL_DMA=1，
+没有改guest内核：仍为6.12.0-vanilla-vfio #26；4vCPU/4GiB/双NUMA、HPET。
+先正常poweroff旧巨虚，两端QEMU_EXIT0、VF恢复iavf；Garen worker-g4未动。
+再启动Garen单机控制，正常退出并恢复VF后启动Garen master+Ezreal slave。
+没有host重启，没有使用Lux，没有新增实验脚本/日志/磁盘文件。
+
+单机和巨虚均可登录；guest原生iavf识别8086:154c。
+巨虚独立enp0s7/enp0s8（Garen/Ezreal owner）都成功link up 10Gbps；
+两端数据盘仍可枚举，但本轮没有重跑已接受的磁盘带宽。
+两网卡配置combined2、RX512/TX128、RPS/XPS0；
+Garen卡IRQ affinity0-1，Ezreal卡2-3。
+
+发送测试沿用此前内存中的LOOMTCP数据校验程序：
+每张卡2个worker，绑各自owner的两个CPU，每stream持续6秒，每配置3轮；
+接收端Jinx br0对应198.18.10.3/11.3，port49161，校验每字节pattern
+和实际接收字节数。单机Garen也用CPU0/1、相同VF/guest内核/HPET配置。
+全部发送结果的接收字节数和内容正确；guest与Jinx记录的持续时间接近6秒，
+没有依据异常启动printk时间戳计算吞吐。TCP retrans仍存在，本轮没有处理。
+
+| 配置 | 三轮发送MiB/s | 中位数MiB/s |
+| --- | --- | --- |
+| Garen普通VM，新physical staging路径 | 1106.508 / 1107.471 / 1110.305 | 1107.471 |
+| 巨虚Garen单卡，CPU0/1 | 709.497 / 625.299 / 801.246 | 709.497 |
+| 巨虚Ezreal单卡，CPU2/3 | 589.658 / 578.309 / 583.004 | 583.004 |
+| 巨虚双卡同时，每卡2worker，共4worker | 500.241 / 497.723 / 499.073 | 499.073 |
+
+普通VM新路径约9.29Gbit/s，已经接近本次10GbE链路容量。
+巨虚单卡明显高于此前旧启动结果（Garen约210–227MiB/s），但旧结果不是
+同一源码新启动的配对对照，不能把历史比值当成严谨的独立优化效果。
+需要在当前相同版本重测vIOMMU旧配置，才能排除重启/环境差异。
+巨虚双卡同时反而低于单卡，目标尚未实现；合计未接近Jinx10GbE上限，
+不能用接收链路容量解释这次下降。也没有证据把全部损失归因DSM，
+仍需区分guest共享竞争、DSM、owner处理和接收端影响。
+
+另外真实接收功能：Jinx port49162向两张卡并行发送，每卡256MiB，
+guest分别CPU0/CPU2完整接收并逐字节校验；源端收到OK且字节数一致。
+耗时Garen6.628秒/Ezreal6.475秒，源端计时6.621/6.467秒相符。
+这是功能检查，不是完整RX性能benchmark；这次RX速度也偏低，
+还没有匹配普通VM接收对照，不能宣称收发性能都优化完成。
+
+测试后guest在线CPU0-3、clocksource hpet、error级dmesg为空；
+两张卡ip -s link均errors/dropped为0，这不等于没有TCP重传或硬件层丢包。
+Garen当前QEMU PID3981076，Ezreal733925保持运行，源码相同。
+普通VM测试后QEMU_EXIT0且VF恢复iavf，退出/授权清理实际通过。
+Jinx两个TCP sink和RX source均正常停止，临时IP aliases已删除；
+没有残留监听49161/49162。Garen worker-g4 PID6122保持运行。
+
+短测内存快照：普通VMRSS710072KiB、VmLck15380KiB；
+巨虚GarenRSS4326844KiB/VmLck4208864KiB，
+EzrealRSS4290932KiB/VmLck4202884KiB（包括巨虚本身锁定的4GiB RAM）。
+不是长期映射增长证明，仍需检查长时间运行的页面/映射数量和回收上界。
+后续先重测同版本旧配置作单卡对照，再低频采样双卡的剩余处理路径、
+定位共享竞争；保持guest与HPET不改，不把新native线速视为巨虚目标完成。
