@@ -51,6 +51,7 @@ struct LoomVFIODMA {
     bool recycle_buffers;
     unsigned free_buffer_count;
     LoomDMABuffer *free_buffers[64];
+    bool skip_redundant_zero;
 };
 
 /*
@@ -89,15 +90,19 @@ static bool map_is_page(const LoomDMAMap *m)
  * Hardware mappings and registration generations are never cached. Bound the
  * idle storage defaults to 64 pages (256 KiB) per container and has a
  * configurable limit of at most 4096 pages; larger/partial unmaps retain
- * their existing mmap lifetime. Clear every reused page before registration.
+ * their existing mmap lifetime. Clear reused pages unless the translated
+ * caller guarantees full initialization before installing the hardware map.
  */
-static uint8_t *pool_alloc(LoomVFIODMA *ctx, uint64_t size)
+static uint8_t *pool_alloc(LoomVFIODMA *ctx, uint64_t size,
+                           bool will_initialize)
 {
     uint8_t *page;
 
     if (ctx->recycle_pages && size == 4096 && ctx->free_page_count) {
         page = ctx->free_pages[--ctx->free_page_count];
-        memset(page, 0, 4096);
+        if (!ctx->skip_redundant_zero || !will_initialize) {
+            memset(page, 0, 4096);
+        }
         return page;
     }
     return mmap(NULL, size, PROT_READ | PROT_WRITE,
@@ -241,7 +246,7 @@ bool loom_vfio_dma_enabled(void)
 }
 
 int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
-                     void **vaddr, bool readonly)
+                     void **vaddr, bool readonly, bool will_initialize)
 {
     LoomDMAMap *m;
     if (!loom_vfio_dma_enabled()) {
@@ -252,6 +257,9 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
     }
     if (!bc->loom_dma) {
         bc->loom_dma = g_new0(LoomVFIODMA, 1);
+        const char *skip_zero = getenv("LOOM_VFIO_SKIP_REDUNDANT_ZERO");
+        bc->loom_dma->skip_redundant_zero =
+            skip_zero && !strcmp(skip_zero, "1");
         const char *cache_pages = getenv("LOOM_VFIO_POOL_CACHE_PAGES");
         unsigned long cache_limit;
 
@@ -294,7 +302,7 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
         }
     }
     m = g_new0(LoomDMAMap, 1);
-    m->pool = pool_alloc(bc->loom_dma, size);
+    m->pool = pool_alloc(bc->loom_dma, size, will_initialize);
     if (m->pool == MAP_FAILED) {
         g_free(m);
         return -errno;

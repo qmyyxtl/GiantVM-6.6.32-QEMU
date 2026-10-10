@@ -23,7 +23,9 @@ static int vfio_container_dma_map_full(VFIOContainerBase *bcontainer,
                                        const hwaddr *gpa)
 {
     VFIOIOMMUClass *vioc = VFIO_IOMMU_GET_CLASS(bcontainer);
-    int ret = loom_vfio_dma_map(bcontainer, iova, size, &vaddr, readonly);
+    /* A translated map is fully registered before dma_map, or rolled back. */
+    int ret = loom_vfio_dma_map(bcontainer, iova, size, &vaddr, readonly,
+                               gpa != NULL);
 
     if (ret) {
         return ret;

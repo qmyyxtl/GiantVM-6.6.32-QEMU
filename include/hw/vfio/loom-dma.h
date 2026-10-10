@@ -8,7 +8,9 @@ enum {
     LOOM_DMA_SYNC_CPU = 3, LOOM_DMA_SYNC_DEVICE = 4,
 };
 bool loom_vfio_dma_enabled(void);
-int loom_vfio_dma_map(VFIOContainerBase *, hwaddr, uint64_t, void **, bool);
+/* will_initialize requires full pool initialization before hardware mapping. */
+int loom_vfio_dma_map(VFIOContainerBase *, hwaddr, uint64_t, void **,
+                      bool readonly, bool will_initialize);
 int loom_vfio_dma_unmap(VFIOContainerBase *, hwaddr, uint64_t);
 void loom_vfio_dma_free(VFIOContainerBase *);
 int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
