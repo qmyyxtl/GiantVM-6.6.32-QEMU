@@ -550,3 +550,44 @@ Ezreal QEMU 构建通过。尚需新进程上的硬件回归和相同条件性�
 捕获 CONFIG_VSI_QUEUES 得到两条 128 项 TX/RX ring 的实际 DMA 地址。
 两次设备 pool 与 baseline 快照中未发现未发布 DD；这是有限快照，
 不足以排除 IRQ 屏蔽期间的瞬态完成可见性问题。HPET 与 guest 驱动不变。
+
+### IRQ 写入硬件回归与 DSM 定点诊断（2026-10-10）
+
+代码 d6848154d5 已通过两端构建并在新的两端 QEMU 中运行。
+双 VF 的标准 iavf 两队列/128 项 ring 重配、关闭重开、ping 均通过，
+rx_discards/tx_discards/tx_errors 为 0，未发现 DMA fault/TX timeout。
+实际 BAR 写入探针观察到 0x3800/0x3804 共 5311 次写入，仅调用完成方向同步；
+提交方向调用为 0，tail 保留两方向调用。HPET 未修改。
+
+无探针的三轮 TCP 诊断（每 worker 至少 6 秒，含排空/接收确认）中位数：
+Garen 单卡双 worker 29.278、Ezreal 单卡双 worker 24.067、双卡四 worker
+20.739 MiB/s。所有接收内容与长度正确，双卡仍未线性扩展。
+不能用此前单轮与这次三轮结果认定修改带来了某一吞吐增益，重启也影响 DSM。
+双盘四 worker 的 O_RDONLY/O_DIRECT 只读内容回归通过，短时约 3148 MiB/s，
+不作为正式磁盘性能基线。没有保留实验文件或后台 TCP sink。
+
+按用户最新要求，暂停反复吞吐对比，优先定位 DSM；若证据支持，可修改 OS，
+HPET 保持原样。kvm_dsm_fetch 入口记录请求种类、GFN、调用栈和返回累计时间，
+同时用 loom_vfio_dma_sync 的入口/返回区分完成/提交同步中的远端请求。
+计数是实际 fetch 请求（含 INVALIDATE/READ/WRITE），不是全部 EPT fault，
+不是单纯页面数据传输次数。BPF 不采集文件，计时含探针成本。
+
+一次短时双卡业务的 25 秒采样，覆盖业务的两个 5 秒窗口中：
+Garen 121199、Ezreal 120358 次 fetch，约 12120/12036 次每秒；
+后续两个无业务窗口分别 11081/11183 次，约 1108/1118 次每秒。
+窗口覆盖初始化/收发/排空，不能拿 10 秒计数除以 6 秒推算严格活动期速率。
+25 秒中普通调用类累计 fetch 时长 Garen 2.711 秒、Ezreal 2.606 秒；
+完成同步中的累计 fetch 时长仅 3992/2343 us，Ezreal 提交同步另 1570 us。
+绝大多数栈是 EPT -> kvm_dsm_vcpu_acquire_page -> kvm_dsm_page_fault。
+这些累计时长不是 CPU 利用率或完整 DSM 成本，未覆盖外层锁、EPT 重建、TLB 等。
+
+两端最热 GFN 11270（GPA 0x2c06000）对应 guest Kernel data。
+通过 /proc/kallsyms、/proc/iomem 及 kvm_page_fault 的准确 guest_rip/页内偏移
+交叉定位：页偏移 0 的锁更新、偏移 4 的缓存值更新来自 read_hpet，
+同页还放着 mmlist_lock/tasklist_lock/softirq_vec/pidmap_lock/bit_wait_table。
+这是共享 HPET 读锁的真实共享，加上邻居对象的页面假共享，不能只靠对齐
+消除共享锁自身的竞争。其他热页是 jiffies 与锁、tk_core/timekeeper_lock、
+调度 nohz 状态；故 DMA pool 扫描不是本次跨机请求数的主要来源。
+
+后续优先区分业务新增热页、内核对象真共享/假共享以及 owner-local 分配与
+softirq 执行；OS 修改以证据为依据。保留 HPET，不把更换时钟作为优化方案。
