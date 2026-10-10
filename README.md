@@ -3097,3 +3097,26 @@ guest、HPET、现有巨虚和 Garen worker-g4保持，不使用 Lux。
 只接 AdminQ 然后启用物理模式不够：后续 TX 新分配 buffer 仍可能尚无硬件映射；
 因此必须在每次 data tail 前补齐授权/映射/同步，未知状态阻止转发。
 全部接通后才加入 RAM listener/opt-in 开关并验证匹配配置单机与真实巨虚。
+
+
+### 2026-10-11：RX 启动的未提交空槽兼容
+
+进一步读取实际未改 guest iavf_main.c:1221 和 iavf_txrx.c:839：
+初始化调用 iavf_alloc_rx_buffers(ring, IAVF_DESC_UNUSED(ring))，
+分配后清 next_to_use 的状态，再写 RX tail；常规初始布局留一个未提交槽，
+不是所有 rx_count descriptor 都有 packet address。
+此前物理 ENABLE 准备要求每个槽非零，会误拒绝这种正常初始化。
+
+现在只跳过所有四个 qword 都为0的槽，不为未提交空槽建立 GPA0 的 DMA 映射；
+address为0但其他字段非零仍拒绝。有效 packet address 仍必须完全授权、
+符合非 header-split 布局、避免覆盖描述符，payload仍先于ring同步。
+本次不意味着 hardware tail 可以暴露空槽：真实 BAR adapter 尚未接入，
+它必须验证 tail 暴露的每个槽非零且依赖已准备；初始化早期 RX tail
+可能先于 PF CONFIG/ENABLE，需暂存并在地址明确/提交范围完整准备后转发，
+不能因为这里容许未提交空槽就原样透传未知 data tail。
+稀疏物理启动仍未开放，不宣称实际网卡功能已经通过。
+
+实际 gate+observer+prepare 的 memfd ASan/UBSan 检查现11928断言PASS；
+新增 N-1 缓冲正常布局及 null-address/dirty字段三个拒绝检查。
+QEMU 编译与 diff --check通过；运行巨虚、guest、HPET保持不变，
+没有实验文件，没有使用Lux。

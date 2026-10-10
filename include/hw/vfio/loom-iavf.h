@@ -23,6 +23,7 @@ void loom_iavf_dma_invalidate_container(VFIOContainerBase *, hwaddr, uint64_t);
  * Physical AdminQ gate callback: zero prepared, negative error; no BAR write.
  * Caller publishes prior completions, then authorizes/maps/synchronizes all
  * submitted dependencies before hardware enable/tail. Requires sparse RAM.
+ * Unposted all-zero RX slots are ignored; caller must validate posted data tails.
  */
 int loom_iavf_prepare_physical_admin(VFIODevice *, bool arq, bool enabling,
                                     uint64_t base, unsigned count,

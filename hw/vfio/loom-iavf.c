@@ -1060,14 +1060,32 @@ static int physical_prepare_rx_queue(VFIODevice *dev, LoomIAVFQueues *s,
     for (unsigned n = 0; n < q->rx_count; n++) {
         uint64_t address = ldq_le_p(desc + n * 32);
 
-        if (!address || ldq_le_p(desc + n * 32 + 8) ||
+        /*
+         * Native startup leaves an unposted zero slot (DESC_UNUSED is N-1).
+         * Do not invent a DMA address for it. The BAR adapter must separately
+         * validate every slot exposed by a data tail before forwarding it.
+         */
+        if (!address) {
+            if (ldq_le_p(desc + n * 32 + 8) ||
+                ldq_le_p(desc + n * 32 + 16) ||
+                ldq_le_p(desc + n * 32 + 24)) {
+                return -ENOTSUP;
+            }
+            continue;
+        }
+        if (ldq_le_p(desc + n * 32 + 8) ||
             address > UINT64_MAX - q->rx_buffer_size ||
             payload_intersects_descriptors(s, address, q->rx_buffer_size)) {
             return -ENOTSUP;
         }
     }
     for (unsigned n = 0; n < q->rx_count; n++) {
-        ret = physical_stage(dev, ldq_le_p(desc + n * 32), q->rx_buffer_size);
+        uint64_t address = ldq_le_p(desc + n * 32);
+
+        if (!address) {
+            continue;
+        }
+        ret = physical_stage(dev, address, q->rx_buffer_size);
         if (ret) {
             return ret;
         }
