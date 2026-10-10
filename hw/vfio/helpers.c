@@ -253,16 +253,21 @@ uint64_t vfio_region_read(void *opaque,
     } buf;
     uint64_t data = 0;
 
-    if (!vfio_loom_sync(vbasedev, false)) {
-        return UINT64_MAX;
-    }
-
     if (pread(vbasedev->fd, &buf, size, region->fd_offset + addr) != size) {
         error_report("%s(%s:region%d+0x%"HWADDR_PRIx", %d) failed: %m",
                      __func__, vbasedev->name, region->nr,
                      addr, size);
         return (uint64_t)-1;
     }
+    /*
+     * Observe hardware completion/status before publishing its DMA writes.
+     * Sampling a queue head after the snapshot could otherwise expose work
+     * whose descriptors were not yet copied into guest RAM.
+     */
+    if (!vfio_loom_sync(vbasedev, false)) {
+        return UINT64_MAX;
+    }
+
     switch (size) {
     case 1:
         data = buf.byte;
