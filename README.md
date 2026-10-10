@@ -507,3 +507,24 @@ to-device 同步 2742 次、平均 1317 us（10 秒窗口，时长含 DSM，不�
 6.113/0.516/0.527 MiB/s，连接差异仍大，因此不能称为解决瓶颈。
 下一步需继续检查 ring/有效 DMA 范围，避免每次数据路径访问都同步所有 pool；
 guest 驱动与 HPET 不修改，真实双卡吞吐目标仍未完成。
+
+新版本硬件回归：两端旧 QEMU 正常退出 0，新实例启动/root 登录，两张原生 iavf
+VF 收发通过，clocksource 仍为 hpet。随后用标准 ethtool 设置每卡 combined=2、
+RX/TX ring=128；单轮同一 TCP 诊断分别为 Garen 34.619 MiB/s、
+Ezreal 20.106 MiB/s、双卡四 worker 11.227 MiB/s。数据内容/长度均由 receiver
+校验通过，guest NIC rx_discards/tx_discards/tx_errors 均为 0；
+Tcp RetransSegs 总计 2，TCP 校验错误为 0。较小 ring 的结果仍不支持线性扩展。
+这里同时变化了复制路径、重启后的 DSM 布局和 ring 配置，
+不能将吞吐变化全部归因于那 11 行复制优化。
+
+计时结束后只读检查，Garen/Ezreal 分别有 390/452 个 staging buffer，
+1597440/1851392 字节，均有缓存 pool 地址；不能仅从 ring 长度推算实际映射总数。
+双盘四 worker 的 6 秒 O_DIRECT 只读内容校验通过，短时约 3184 MiB/s，
+不作为新的正式磁盘吞吐基线。TCP sink 已退出，不保留后台实验服务或文件。
+
+后续重点是按有效 DMA 范围缩小同步，并检查原生驱动轮询完成描述符时的
+可见性边界：当前 from-device 交换由 MMIO/IRQ 触发，未实现独立的 DMA 更新
+发布机制。该边界可能影响 IRQ 屏蔽期间的 NAPI/完成轮询，尚未证明是低吞吐根因。
+不能为了减少扫描直接跳过完成回写。现有 iavf 寄存器将 QTX/QRX tail 与
+VFINT_DYN_CTL 等中断控制分开，而当前 VFIO 写回调统一执行提交同步；
+需要按实际设备协议验证其优化空间，未知设备保持正确的通用路径。
