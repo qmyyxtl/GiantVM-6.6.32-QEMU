@@ -55,6 +55,7 @@ struct LoomVFIODMA {
     bool skip_redundant_zero;
     bool cache_publication;
     bool pin_publication;
+    bool ordered_publication;
     bool publication_failed;
 };
 
@@ -289,6 +290,8 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
         const char *pin = getenv("LOOM_VFIO_PUBLICATION_PIN");
         /* Requires a kernel with atomic, lock-free DSM unpin. */
         bc->loom_dma->pin_publication = pin && !strcmp(pin, "1");
+        const char *ordered = getenv("LOOM_VFIO_ORDERED_PUBLICATION");
+        bc->loom_dma->ordered_publication = ordered && !strcmp(ordered, "1");
         const char *buffers = getenv("LOOM_VFIO_BUFFER_RECYCLE");
         bc->loom_dma->recycle_buffers =
             !buffers || strcmp(buffers, "0");
@@ -511,9 +514,8 @@ static bool publication_has_four_runs(const uint8_t *snapshot,
  * The cache still writes only changed runs, with normal dirty/TB accounting.
  * No kernel lock is needed to unpin on the supported atomic-unpin kernels.
  */
-static int publication_pin(VFIOContainerBase *bc, MemoryRegionCache *cache,
-                            const uint8_t *snapshot, const uint8_t *baseline,
-                            uint64_t pos, uint64_t size, bool *pinned)
+static int publication_acquire(VFIOContainerBase *bc, MemoryRegionCache *cache,
+                                uint64_t size, bool *pinned)
 {
     MachineState *ms;
     uint8_t *host;
@@ -522,8 +524,7 @@ static int publication_pin(VFIOContainerBase *bc, MemoryRegionCache *cache,
 
     *pinned = false;
     if (!bc->loom_dma->pin_publication || cache->ptr || !kvm_enabled() ||
-        qemu_real_host_page_size() != 4096 || size > 4096 ||
-        !publication_has_four_runs(snapshot, baseline, pos, size)) {
+        qemu_real_host_page_size() != 4096 || !size || size > 4096) {
         return 0;
     }
     ms = MACHINE(qdev_get_machine());
@@ -549,6 +550,18 @@ static int publication_pin(VFIOContainerBase *bc, MemoryRegionCache *cache,
     cache->ptr = host;
     *pinned = true;
     return 0;
+}
+
+static int publication_pin(VFIOContainerBase *bc, MemoryRegionCache *cache,
+                            const uint8_t *snapshot, const uint8_t *baseline,
+                            uint64_t pos, uint64_t size, bool *pinned)
+{
+    *pinned = false;
+    if (!bc->loom_dma->pin_publication || cache->ptr ||
+        !publication_has_four_runs(snapshot, baseline, pos, size)) {
+        return 0;
+    }
+    return publication_acquire(bc, cache, size, pinned);
 }
 
 static int publication_unpin(VFIOContainerBase *bc, MemoryRegionCache *cache)
@@ -1540,6 +1553,146 @@ int loom_vfio_dma_publish_snapshot(VFIOContainerBase *bc, hwaddr iova,
         bytes += len;
     }
     return 0;
+}
+
+/*
+ * Three ordered ranges of an immutable X710 32-byte RX writeback. Payload has
+ * already been published by the caller. The byte at offset 8 contains DD and
+ * must not become visible until both metadata ranges are complete.
+ */
+static const uint8_t rx_publication_start[] = { 0, 9, 8 };
+static const uint8_t rx_publication_end[] = { 8, 32, 9 };
+
+static bool rx_publication_has_three_runs(const uint8_t *snapshot,
+                                          const uint8_t *baseline)
+{
+    unsigned runs = 0;
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(rx_publication_start); i++) {
+        uint64_t pos = rx_publication_start[i], end = rx_publication_end[i];
+
+        while (pos < end) {
+            uint64_t start;
+
+            pos = skip_matching_bytes(snapshot, baseline, pos, end, true);
+            start = pos;
+            pos = skip_matching_bytes(snapshot, baseline, pos, end, false);
+            if (pos == start) {
+                break;
+            }
+            if (++runs == 3) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static int publish_rx_cached(MemoryRegionCache *cache, LoomDMABuffer *b,
+                              const uint8_t *snapshot)
+{
+    for (unsigned i = 0; i < G_N_ELEMENTS(rx_publication_start); i++) {
+        uint64_t pos = rx_publication_start[i], end = rx_publication_end[i];
+
+        if (i == 2) {
+            smp_wmb();
+        }
+        while (pos < end) {
+            uint64_t start;
+
+            pos = skip_matching_bytes(snapshot, b->baseline, pos, end, true);
+            start = pos;
+            pos = skip_matching_bytes(snapshot, b->baseline, pos, end, false);
+            if (pos == start) {
+                break;
+            }
+            if (address_space_write_cached(cache, start, snapshot + start,
+                                            pos - start) != MEMTX_OK) {
+                return -EIO;
+            }
+            address_space_cache_invalidate(cache, start, pos - start);
+            memcpy(b->baseline + start, snapshot + start, pos - start);
+        }
+    }
+    return 0;
+}
+
+static int publish_rx_uncached(VFIOContainerBase *bc, hwaddr iova,
+                                const uint8_t *snapshot)
+{
+    int ret = loom_vfio_dma_publish_snapshot(bc, iova, snapshot, 8);
+
+    if (!ret) {
+        ret = loom_vfio_dma_publish_snapshot(bc, iova + 9, snapshot + 9, 23);
+    }
+    if (!ret) {
+        smp_wmb();
+        ret = loom_vfio_dma_publish_snapshot(bc, iova + 8, snapshot + 8, 1);
+    }
+    return ret;
+}
+
+/*
+ * Share one short-lived translation/DSM lease across the ordered writeback.
+ * No pointer or registration is retained across BQL/RCU boundaries. Unsupported
+ * layouts keep the original three publications; pin failure never falls back
+ * to writing without ownership. Only changed bytes are copied in either path.
+ */
+int loom_vfio_dma_publish_rx_descriptor(VFIOContainerBase *bc, hwaddr iova,
+                                        const void *snapshot)
+{
+    MemoryRegionCache cache = { 0 };
+    LoomDMABuffer *b, part;
+    bool pinned = false;
+    int ret;
+
+    if (!bc || !bc->loom_dma) {
+        return -ENODEV;
+    }
+    if (!snapshot || iova > UINT64_MAX - 32) {
+        return -EINVAL;
+    }
+    if (bc->loom_dma->publication_failed) {
+        return -EIO;
+    }
+    if (!bc->loom_dma->ordered_publication || !bc->loom_physical ||
+        !bc->loom_dma->cache_publication || !bql_locked() || (iova & 31)) {
+        return publish_rx_uncached(bc, iova, snapshot);
+    }
+    b = buffer_at(bc->loom_dma, iova);
+    if (!b || b->direction == 1 || iova - b->iova > b->size ||
+        32 > b->size - (iova - b->iova)) {
+        return publish_rx_uncached(bc, iova, snapshot);
+    }
+    part = buffer_view(b, iova - b->iova, 32);
+    if (!memcmp(snapshot, part.baseline, 32)) {
+        return 0;
+    }
+    rcu_read_lock();
+    if (address_space_cache_init(&cache, &address_space_memory, part.gpa,
+                                  32, true) != 32 ||
+        !memory_access_is_direct(cache.mrs.mr, true)) {
+        address_space_cache_destroy(&cache);
+        rcu_read_unlock();
+        return publish_rx_uncached(bc, iova, snapshot);
+    }
+    ret = 0;
+    if (rx_publication_has_three_runs(snapshot, part.baseline)) {
+        ret = publication_acquire(bc, &cache, 32, &pinned);
+    }
+    if (!ret) {
+        ret = publish_rx_cached(&cache, &part, snapshot);
+    }
+    if (pinned) {
+        int release_ret = publication_unpin(bc, &cache);
+
+        if (release_ret) {
+            ret = release_ret;
+        }
+    }
+    address_space_cache_destroy(&cache);
+    rcu_read_unlock();
+    return ret;
 }
 
 /*

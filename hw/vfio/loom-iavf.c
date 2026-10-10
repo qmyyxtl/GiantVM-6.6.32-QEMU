@@ -1024,22 +1024,9 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
             uint64_t descriptor = q->rx_iova + slot * 32ULL;
             uint8_t *snapshot = c->rx_snapshot + slot * 32;
 
-            /*
-             * merge_buffer writes changed byte runs independently. Publish
-             * metadata/length before the byte containing DD, so a concurrent
-             * guest cannot see completion with an old length or RSS field.
-             */
-            ret = loom_vfio_dma_publish_snapshot(dev->bcontainer,
-                                                  descriptor, snapshot, 8);
-            if (!ret) {
-                ret = loom_vfio_dma_publish_snapshot(dev->bcontainer,
-                                         descriptor + 9, snapshot + 9, 23);
-            }
-            if (!ret) {
-                smp_wmb();
-                ret = loom_vfio_dma_publish_snapshot(dev->bcontainer,
-                                         descriptor + 8, snapshot + 8, 1);
-            }
+            /* Payload is complete; this API preserves metadata-before-DD. */
+            ret = loom_vfio_dma_publish_rx_descriptor(dev->bcontainer,
+                                                       descriptor, snapshot);
             if (ret) {
                 return ret;
             }
