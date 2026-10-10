@@ -675,6 +675,78 @@ static LoomDMABuffer *buffer_slice(LoomDMABuffer *b, uint64_t offset,
  * Publish device writes before dropping staging memory. A range invalidation
  * may cover multiple mappings, or split one mapping into two surviving parts.
  */
+/*
+ * Preserve page-index lookup and allocation recycling for bounded batched
+ * invalidations. Preflight every map and publish all baselines in the general
+ * path's newest-registration-first order before modifying either live list.
+ */
+static int unmap_native_pages(VFIOContainerBase *bc, hwaddr iova,
+                               uint64_t size, bool *handled)
+{
+    LoomVFIODMA *ctx = bc->loom_dma;
+    LoomDMABuffer *buffers[16];
+    LoomDMAMap *maps[16];
+    unsigned pages, count = 0;
+    int ret;
+
+    *handled = false;
+    if (!ctx->page_indexed || (iova & 4095) || !size ||
+        (size & 4095) || size > 16 * 4096ULL) {
+        return 0;
+    }
+    pages = size / 4096;
+    for (unsigned i = 0; i < pages; i++) {
+        hwaddr address = iova + i * 4096ULL;
+        LoomDMABuffer *b = buffer_at(ctx, address);
+        LoomDMAMap *m = map_at(ctx, address);
+
+        if (m && !map_is_page(m)) {
+            return 0;
+        }
+        maps[i] = m;
+        if (b) {
+            unsigned n = count++;
+
+            while (n && buffers[n - 1]->registration_sequence <
+                         b->registration_sequence) {
+                buffers[n] = buffers[n - 1];
+                n--;
+            }
+            buffers[n] = b;
+        }
+    }
+    *handled = true;
+    for (unsigned i = 0; i < count; i++) {
+        ret = sync_buffer(bc, buffers[i], false);
+        if (ret) {
+            return ret;
+        }
+    }
+    loom_iavf_dma_invalidate_container(bc, iova, size);
+    for (unsigned i = 0; i < count; i++) {
+        LoomDMABuffer *b = buffers[i];
+
+        if (ctx->buffers_tail == b->link) {
+            ctx->buffers_tail = b->link->prev;
+        }
+        g_hash_table_remove(ctx->page_buffers, page_key(b->iova));
+        ctx->buffers = g_list_delete_link(ctx->buffers, b->link);
+        buffer_retire(ctx, b);
+    }
+    for (unsigned i = 0; i < pages; i++) {
+        LoomDMAMap *m = maps[i];
+
+        if (m) {
+            pool_retire_page(ctx, m);
+            map_index_remove(ctx, m);
+            ctx->maps = g_list_delete_link(ctx->maps, m->link);
+            g_free(m);
+        }
+    }
+    ctx->epoch++;
+    return 0;
+}
+
 int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
 {
     LoomVFIODMA *ctx = bc->loom_dma;
@@ -688,35 +760,11 @@ int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
     if (!size || (iova + size < iova && iova + size != 0)) {
         return -EINVAL;
     }
-    LoomDMAMap *single = ctx->page_indexed ? map_at(ctx, iova) : NULL;
-    if (ctx->page_indexed && !(iova & 4095) && size == 4096 &&
-        (!single || map_is_page(single))) {
-        LoomDMABuffer *b = buffer_at(ctx, iova);
-        LoomDMAMap *m = map_at(ctx, iova);
+    bool handled;
 
-        if (b) {
-            ret = sync_buffer(bc, b, false);
-            if (ret) {
-                return ret;
-            }
-        }
-        loom_iavf_dma_invalidate_container(bc, iova, size);
-        if (b) {
-            if (ctx->buffers_tail == b->link) {
-                ctx->buffers_tail = b->link->prev;
-            }
-            g_hash_table_remove(ctx->page_buffers, page_key(iova));
-            ctx->buffers = g_list_delete_link(ctx->buffers, b->link);
-            buffer_retire(ctx, b);
-        }
-        if (m) {
-            pool_retire_page(ctx, m);
-            map_index_remove(ctx, m);
-            ctx->maps = g_list_delete_link(ctx->maps, m->link);
-            g_free(m);
-        }
-        ctx->epoch++;
-        return 0;
+    ret = unmap_native_pages(bc, iova, size, &handled);
+    if (handled) {
+        return ret;
     }
     /* A valid invalidation may extend to the end of the address space. */
     end = iova + size ? iova + size : UINT64_MAX;

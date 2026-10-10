@@ -39,6 +39,7 @@
 #include "hw/i386/apic_internal.h"
 #include "kvm/kvm_i386.h"
 #include "migration/vmstate.h"
+#include "migration/misc.h"
 #include "trace.h"
 
 /* context entry operations */
@@ -1559,10 +1560,70 @@ static int vtd_dev_to_context_entry(IntelIOMMUState *s, uint8_t bus_num,
     return 0;
 }
 
+typedef struct VTDShadowNotify {
+    IOMMUMemoryRegion *iommu;
+    IOMMUTLBEvent pending[32];
+    unsigned count;
+    bool coalesce;
+} VTDShadowNotify;
+
+static void vtd_shadow_notify_flush(VTDShadowNotify *ctx)
+{
+    for (unsigned i = 0; i < ctx->count; i++) {
+        memory_region_notify_iommu(ctx->iommu, 0, ctx->pending[i]);
+    }
+    ctx->count = 0;
+}
+
+/*
+ * Only batch invalid, zero-translation entries, outside migration. Combine
+ * equal-sized buddy ranges so every notification keeps a canonical mask.
+ * MAP/replacement/unknown entries are ordering barriers. Pending notifications
+ * never outlive this walk, even if the walk fails. No hardware unmap is skipped.
+ */
 static int vtd_sync_shadow_page_hook(const IOMMUTLBEvent *event,
                                      void *private)
 {
-    memory_region_notify_iommu(private, 0, *event);
+    VTDShadowNotify *ctx = private;
+    const IOMMUTLBEntry *entry = &event->entry;
+    uint64_t size = entry->addr_mask + 1;
+
+    if (!ctx->coalesce || event->type != IOMMU_NOTIFIER_UNMAP ||
+        entry->perm != IOMMU_NONE || entry->translated_addr ||
+        !size || size > 64 * KiB || (size & (size - 1)) ||
+        (entry->iova & (size - 1)) ||
+        entry->iova > UINT64_MAX - size) {
+        vtd_shadow_notify_flush(ctx);
+        memory_region_notify_iommu(ctx->iommu, 0, *event);
+        return 0;
+    }
+    if (ctx->count) {
+        const IOMMUTLBEntry *last = &ctx->pending[ctx->count - 1].entry;
+
+        if (last->target_as != entry->target_as ||
+            last->iova + last->addr_mask + 1 != entry->iova) {
+            vtd_shadow_notify_flush(ctx);
+        }
+    }
+    if (ctx->count == G_N_ELEMENTS(ctx->pending)) {
+        vtd_shadow_notify_flush(ctx);
+    }
+    ctx->pending[ctx->count++] = *event;
+    while (ctx->count > 1) {
+        IOMMUTLBEntry *left = &ctx->pending[ctx->count - 2].entry;
+        IOMMUTLBEntry *right = &ctx->pending[ctx->count - 1].entry;
+        uint64_t length = left->addr_mask + 1;
+
+        if (left->target_as != right->target_as ||
+            left->addr_mask != right->addr_mask ||
+            length > 32 * KiB ||
+            left->iova + length != right->iova ||
+            (left->iova & (2 * length - 1))) {
+            break;
+        }
+        left->addr_mask = 2 * length - 1;
+        ctx->count--;
+    }
     return 0;
 }
 
@@ -1585,16 +1646,23 @@ static int vtd_sync_shadow_page_table_range(VTDAddressSpace *vtd_as,
                                             hwaddr addr, hwaddr size)
 {
     IntelIOMMUState *s = vtd_as->iommu_state;
+    VTDShadowNotify notify = {
+        .iommu = &vtd_as->iommu,
+        .coalesce = s->loom_unmap_coalesce && migration_is_idle(),
+    };
     vtd_page_walk_info info = {
         .hook_fn = vtd_sync_shadow_page_hook,
-        .private = (void *)&vtd_as->iommu,
+        .private = &notify,
         .notify_unmap = true,
         .aw = s->aw_bits,
         .as = vtd_as,
         .domain_id = vtd_get_domain_id(s, ce, vtd_as->pasid),
     };
 
-    return vtd_page_walk(s, ce, addr, addr + size, &info, vtd_as->pasid);
+    int ret = vtd_page_walk(s, ce, addr, addr + size, &info, vtd_as->pasid);
+
+    vtd_shadow_notify_flush(&notify);
+    return ret;
 }
 
 static int vtd_address_space_sync(VTDAddressSpace *vtd_as)
@@ -4444,6 +4512,20 @@ static void vtd_set_qi_pair_read(Object *obj, bool enabled, Error **errp)
     s->loom_qi_pair_read = enabled;
 }
 
+static bool vtd_get_unmap_coalesce(Object *obj, Error **errp)
+{
+    return INTEL_IOMMU_DEVICE(obj)->loom_unmap_coalesce;
+}
+
+static void vtd_set_unmap_coalesce(Object *obj, bool enabled, Error **errp)
+{
+    if (enabled && !loom_iommu_enabled()) {
+        error_setg(errp, "unmap coalescing requires owner IOMMU");
+        return;
+    }
+    INTEL_IOMMU_DEVICE(obj)->loom_unmap_coalesce = enabled;
+}
+
 static void vtd_realize(DeviceState *dev, Error **errp)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
@@ -4479,6 +4561,9 @@ static void vtd_realize(DeviceState *dev, Error **errp)
 
     s->loom_notify_context_cache = loom_iommu_enabled() &&
         g_strcmp0(getenv("LOOM_VTD_NOTIFY_CONTEXT_CACHE"), "0") != 0;
+
+    s->loom_unmap_coalesce = loom_iommu_enabled() &&
+        g_strcmp0(getenv("LOOM_VTD_UNMAP_COALESCE"), "1") == 0;
 
     s->loom_qi_pair_read = loom_iommu_enabled() &&
         g_strcmp0(getenv("LOOM_VTD_QI_PAIR_READ"), "1") == 0;
@@ -4521,6 +4606,8 @@ static void vtd_realize(DeviceState *dev, Error **errp)
     /* Pseudo address space under root PCI bus. */
     x86ms->ioapic_as = vtd_host_dma_iommu(bus, s, Q35_PSEUDO_DEVFN_IOAPIC);
     qemu_add_machine_init_done_notifier(&vtd_machine_done_notify);
+    object_property_add_bool(OBJECT(s), "loom-unmap-coalesce",
+                             vtd_get_unmap_coalesce, vtd_set_unmap_coalesce);
     object_property_add_bool(OBJECT(s), "loom-qi-pair-read",
                              vtd_get_qi_pair_read, vtd_set_qi_pair_read);
     object_property_add_bool(OBJECT(s), "loom-notify-context-cache",

@@ -1917,3 +1917,35 @@ dirty tracking、通知顺序、错误处理和QI完成语义，不能缓存失�
 memfd及采样/tracepoint进程全部结束，Jinx接收端和临时地址已清理；
 最终10秒两端watchdog/成功GET_STATS各5次，检查错误为空，HPET=hpet，
 discard/tx_errors快照为0，Garen已有libvirt VM未改，两端巨虚保持运行。
+
+## Owner IOMMU 同步内 unmap 合并（默认关闭）
+
+新增 `LOOM_VTD_UNMAP_COALESCE=1` 和intel-iommu QMP属性
+`loom-unmap-coalesce`。仅owner IOMMU可启用，每次shadow page walk独立
+缓冲通知，返回前（含错误返回）全部flush。migration非idle时保持原通知路径。
+仅合并type=UNMAP、perm=NONE、translated_addr=0、同一target AS、
+连续且等大小buddy范围，保持canonical power-of-two mask与对齐，
+每条最大64KiB。MAP、替换映射的非零translation、间隙和未知状态均为屏障。
+通知缓存有界32条，满时按顺序flush；不跨walk/QI完成边界，不省略硬件unmap。
+
+为保留现有分配复用，DMA清理扩展native page-index路径到1–16个完整4KiB页：
+先检查全部map无大型映射覆盖，按最新注册优先发布全部buffer baseline，
+成功后才失效队列缓存、删索引/链表并回收buffer/staging page，
+最后推进epoch。失败保持live链表；部分、未对齐、大型映射及超范围
+继续通用路径。实际VFIO硬件unmap仍由container-base先执行。
+
+ASan/UBSan memfd测试提取实际通知helper：2000个随机通知流逐4KiB展开，
+与原序列比较覆盖、字段及顺序；另覆盖MAP屏障、target/translation/
+间隙、越界、默认关闭、64KiB上限和缓冲flush。
+实际native清理helper通过1–16页、空洞、范围外相邻映射保留、注册顺序、
+发布失败不改链表、large-map/未对齐/超范围回退、尾指针/生命周期测试。
+这些使用硬件/同步stub，不取代真实VFIO与性能验证。
+
+实现前PID过滤24秒探针，以当前二进制DWARF确认event/entry offset，
+记录259350次shadow walk，577950 MAP和577950 UNMAP，全部UNMAP为4KiB，
+实际legacy host unmap也为577950次；87206次walk包含多条unmap，
+448275个连续相邻边、256734对相邻等大小且合并后对齐。
+walk无错误，探针外hook/physical unmap为0。该统计未额外检查zero translation，
+只证明几何合并机会，不是已实现收益。发送113.84/109.26/107.62 MiB/s
+且内容/字节通过，强探针开销明显，不作无探针性能基线。
+当前尚需两端部署、实测开关与host unmap减少、健康/退出及同启动吞吐。
