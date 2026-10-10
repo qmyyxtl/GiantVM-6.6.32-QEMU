@@ -2169,3 +2169,52 @@ DSM/RDMA 函数族 722（24.0%）、其他内核代码 285（9.5%）。
 而部分范围/多节点范围保留原路径。
 还未修改该路径；需要先确认精确匹配的占比并验证通知、范围删除与节点寿命语义。
 本轮未修改 guest、HPET、host 模块或设备处理代码；本地 BAR 合并加锁保持关闭。
+
+
+### 精确 shadow UNMAP 的重复范围查找（默认关闭实验）
+
+`LOOM_VTD_EXACT_UNMAP_REMOVE=1` 或 Intel IOMMU 的 QMP 布尔属性
+`loom-exact-unmap-remove=true` 开启；默认关闭，setter 要求 owner IOMMU。
+仅 owner shadow 通知遍历、migration idle 使用，replay/普通 DMA 翻译不使用。
+在 UNMAP 中，若先前找到的唯一映射与本次 IOVA/范围完全相同，
+直接使用栈上的 target key 调用 GTree 删除，省去范围 helper 的重复查找及结束查找。
+部分范围、多节点范围、缺失映射保持原行为。MAP 替换会先调用 notifier hook，
+可能改变树中节点的寿命，所以该分支继续使用原范围删除路径。
+不缓存映射或节点指针，不改变通知与完成顺序、DMA publication 或 hardware unmap。
+
+原实现的 22 秒计数窗口中，491899 次范围删除全部是单节点精确 4 KiB 删除，
+内部有 983798 次额外查找，读取无错误。
+初始探针挂 iova_tree_find 包装函数却未命中，出现不可信的“全部为空”；
+反汇编确认包装调用已内联，该次结果丢弃。
+改挂实际执行的 libglib g_tree_lookup 返回入口后才得到上述有效计数。
+
+实际 util/iova-tree 与新旧 vtd_page_walk_one 的 ASan/UBSan 差分验证
+50000 个操作通过，含 ON/OFF、精确/部分/多节点范围、缺失映射、
+MAP 替换、hook 失败、hook 删除旧节点。
+用例实际进入新路径 625 次，其中 588 次为大于 4 KiB 的精确范围，
+比较树的完整内容以及通知、返回错误和事件恢复状态。
+两端 QEMU 编译与 diff 检查通过，代码提交 `718970dcb8`。
+
+开启后的实机作用域计数：Garen 493802 次精确删除，全部 4 KiB，
+GTree 删除成功 493802 次、删除内部 lookup 0 次；
+Ezreal 428114 次、成功 428114 次、lookup 0 次。
+两个窗口均无读取或删除错误，range fallback 次数为 0。
+这里减少的是每次精确删除原有的两次额外 lookup，
+caller 的初次查找和 GTree 删除自身的树搜索仍然存在。
+计数窗口带探针，吞吐不作为性能对照。
+
+全部探针移除后，同次启动、四 CPU 在线，Garen CPU0/1 两个 TCP worker
+通过单 VF 发往 Jinx，OFF/ON 交替六组、每轮六秒：
+OFF `[190.812,194.984,210.108,169.335,160.196,155.166]` MiB/s；
+ON `[190.653,202.211,195.793,159.964,146.438,165.665]` MiB/s。
+中位数 180.074 → 178.159 MiB/s（-1.1%），只有两组 ON 更快，
+两种状态在后半段均下降。没有证明吞吐改善，所以保持默认关闭，
+不把查找减少等同于带宽提升。接收字节数和内容检查全部通过；
+其他配置保持，包括 HPET、guest #26、leaf batch、host batch unmap、
+QEMU coalesce、CQ events、stage cache 1024；本地 BAR 合并加锁关闭。
+
+开启时，两张 VF 各由 owner 本地 CPU 发送，接收字节数和内容校验通过；
+两块既有 raw 盘的 O_DIRECT 读取完成长度/错误检查通过，仅用于功能回归，
+没有重做磁盘读写聚合性能比较。
+四 CPU 在线、HPET 保持，guest dmesg error 级别为空，两卡 discard/tx error 为 0。
+两端开启状态正常关机退出 0，VFIO IOMMU 模块引用均回到 0。
