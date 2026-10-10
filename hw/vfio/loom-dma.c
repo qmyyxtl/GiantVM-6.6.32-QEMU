@@ -45,6 +45,9 @@ struct LoomVFIODMA {
     bool recycle_pages;
     unsigned free_page_count;
     uint8_t *free_pages[64];
+    bool recycle_buffers;
+    unsigned free_buffer_count;
+    LoomDMABuffer *free_buffers[64];
 };
 
 /*
@@ -235,6 +238,9 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
         const char *recycle = getenv("LOOM_VFIO_POOL_RECYCLE");
         bc->loom_dma->recycle_pages = qemu_real_host_page_size() == 4096 &&
                                      (!recycle || strcmp(recycle, "0"));
+        const char *buffers = getenv("LOOM_VFIO_BUFFER_RECYCLE");
+        bc->loom_dma->recycle_buffers =
+            !buffers || strcmp(buffers, "0");
         bc->loom_dma->page_indexed = sizeof(uintptr_t) == 8 &&
                                     qemu_real_host_page_size() == 4096;
         if (bc->loom_dma->page_indexed) {
@@ -322,12 +328,17 @@ static int buffer_pool_copy(LoomVFIODMA *ctx, LoomDMABuffer *b,
  * and scratch in one allocation; only metadata needs zero initialization.
  * Borrowed buffer_view() values never own or release this storage.
  */
-static LoomDMABuffer *buffer_new(uint64_t size)
+static LoomDMABuffer *buffer_new(LoomVFIODMA *ctx, uint64_t size)
 {
     LoomDMABuffer *b;
 
     assert(size && size <= 64 * MiB);
-    b = g_malloc(sizeof(*b) + 2 * size);
+    if (ctx && ctx->recycle_buffers && size == 4096 &&
+        ctx->free_buffer_count) {
+        b = ctx->free_buffers[--ctx->free_buffer_count];
+    } else {
+        b = g_malloc(sizeof(*b) + 2 * size);
+    }
     memset(b, 0, sizeof(*b));
     b->baseline = (uint8_t *)(b + 1);
     b->scratch = b->baseline + size;
@@ -337,6 +348,22 @@ static LoomDMABuffer *buffer_new(uint64_t size)
 static void buffer_free(gpointer data)
 {
     g_free(data);
+}
+
+/*
+ * Cache allocation storage only, after completion publication, queue
+ * invalidation and removal from the live buffer index/list. A fresh
+ * registration resets all metadata and reads a new baseline through DSM.
+ * General/partial unmaps and borrowed slices keep their original lifetime.
+ */
+static void buffer_retire(LoomVFIODMA *ctx, LoomDMABuffer *b)
+{
+    if (ctx->recycle_buffers && b->size == 4096 &&
+        ctx->free_buffer_count < G_N_ELEMENTS(ctx->free_buffers)) {
+        ctx->free_buffers[ctx->free_buffer_count++] = b;
+    } else {
+        buffer_free(b);
+    }
 }
 
 void loom_vfio_dma_free(VFIOContainerBase *bc)
@@ -353,6 +380,9 @@ void loom_vfio_dma_free(VFIOContainerBase *bc)
     }
     for (unsigned i = 0; i < bc->loom_dma->free_page_count; i++) {
         munmap(bc->loom_dma->free_pages[i], 4096);
+    }
+    for (unsigned i = 0; i < bc->loom_dma->free_buffer_count; i++) {
+        buffer_free(bc->loom_dma->free_buffers[i]);
     }
     g_list_free(bc->loom_dma->maps);
     g_list_free(bc->loom_dma->large_maps);
@@ -622,7 +652,7 @@ int loom_vfio_dma_sync_to_device_range(VFIOContainerBase *bc, hwaddr iova,
 static LoomDMABuffer *buffer_slice(LoomDMABuffer *b, uint64_t offset,
                                    uint64_t size)
 {
-    LoomDMABuffer *part = buffer_new(size);
+    LoomDMABuffer *part = buffer_new(NULL, size);
 
     *part = *b;
     part->iova += offset;
@@ -677,7 +707,7 @@ int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
             }
             g_hash_table_remove(ctx->page_buffers, page_key(iova));
             ctx->buffers = g_list_delete_link(ctx->buffers, b->link);
-            buffer_free(b);
+            buffer_retire(ctx, b);
         }
         if (m) {
             pool_retire_page(ctx, m);
@@ -941,7 +971,7 @@ int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
             return -EBUSY;
         }
     }
-    b = buffer_new(size);
+    b = buffer_new(ctx, size);
     b->iova = iova;
     b->gpa = gpa;
     b->size = size;

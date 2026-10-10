@@ -1507,3 +1507,18 @@ map/buffer 元数据的分配与索引成本，以及已发布失效描述符的
 DSM 访问语义，不能以继续保留失效映射换取吞吐。
 临时探针/采样与接收进程均已结束、memfd 已释放、Jinx 临时地址已删除；
 最终 CPU 0–3 在线、hpet，所检查 BUG/DMA fault/TX timeout 类错误为空。
+
+## 4 KiB DMA buffer 分配块复用
+
+owner 本地原生 4 KiB buffer 在完成写回、队列失效并从 live index/list
+移除后，最多缓存 64 个分配块（每块 metadata + 8 KiB baseline/scratch）。
+只复用存储：下一次注册重置完整 metadata，重新通过 DSM 读取 baseline，
+重新设置 pool、注册顺序和 generation；实际硬件 map/unmap 保持原路径。
+部分/通用 unmap、切片、错误清理保留原释放方式，容器销毁释放所有缓存块。
+设置 `LOOM_VFIO_BUFFER_RECYCLE=0` 关闭，独立于 staging page 的复用开关。
+
+实际源码提取的 ASan/UBSan 测试通过：10000 次循环只分配一次、元数据清零、
+64 块上限与溢出释放、关闭回退、容器隔离、错误释放后的再次分配、切片
+baseline/pointer 生命周期、最终分配/释放平衡。另行核查缓存只进入已完成
+失效且移除索引的原生页级成功 unmap 路径。构建和真实 VF 部署结果另行记录，
+此处不宣称吞吐收益。
