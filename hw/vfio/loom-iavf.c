@@ -69,7 +69,7 @@ static LoomIAVFQueues *queues_get(VFIODevice *dev)
     return s;
 }
 
-/* virtchnl v1: 8-byte header, followed by 64-byte TX/RX queue pairs. */
+/* virtchnl v1 also retains a legacy extra queue-pair-sized trailing slot. */
 static bool queues_parse(LoomIAVFQueues *s, const uint8_t *msg, size_t len)
 {
     unsigned pairs;
@@ -80,7 +80,7 @@ static bool queues_parse(LoomIAVFQueues *s, const uint8_t *msg, size_t len)
     }
     vsi = lduw_le_p(msg);
     pairs = lduw_le_p(msg + 2);
-    if (!pairs || pairs > VF_QUEUE_COUNT || len != 8 + pairs * 64) {
+    if (!pairs || pairs > VF_QUEUE_COUNT || (len != 8 + pairs * 64 && len != 72 + pairs * 64)) {
         return false;
     }
     for (unsigned i = 0; i < pairs; i++) {
@@ -135,7 +135,7 @@ static void observe_request(VFIODevice *dev, LoomIAVFQueues *s,
         unsigned len = lduw_le_p(desc + 4);
         uint64_t addr = (uint64_t)ldl_le_p(desc + 24) << 32 |
                         ldl_le_p(desc + 28);
-        uint8_t msg[8 + VF_QUEUE_COUNT * 64];
+        uint8_t msg[72 + VF_QUEUE_COUNT * 64];
 
         if (s->pending || s->ambiguous) {
             queues_invalidate(s);
