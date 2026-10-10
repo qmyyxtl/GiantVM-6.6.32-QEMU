@@ -853,3 +853,48 @@ O_RDONLY/O_DIRECT 只读回归 3222 MiB/s。未进行同条件多轮
 无 WARNING/BUG/DMA fault/QI error/TX timeout，clocksource=hpet。
 收发进程、observer、临时探针已退出/清理。自己的 QEMU 保留运行，
 host PF up；Garen 原 libvirt VM、host 内核、Lux 未动。
+
+### RX ring 深度对照与下一步约束（2026-10-10）
+
+当前 QEMU 功能版本 415f82aca9、guest #26 不变，2 个 queue，
+TX ring 固定 128，仅 RX ring 在 128/256 间调整。
+每轮双端同时接收各 4 MiB、内容/长度验证；每配置 3 轮。
+同步/BAR uprobe 在 receiver ready 后开始计数、sender 完成后读取，
+不把配置/reset 时间计入。计数窗口仍有少量空闲控制请求，
+耗时包含 DSM/调度/探针开销，不是纯 CPU 成本。先测 256、
+再恢复 128，流量使用不同 TCP 源端口/RSS 队列，样本不足以
+声称统计显著性能变化。更早的宽窗口 128 试测不纳入三轮汇总。
+
+| RX ring | owner0 三轮 rx_discards 增量 | owner1 三轮增量 |
+| --- | --- | --- |
+| 128 | 141, 0, 0 | 42, 59, 0 |
+| 256 | 266, 0, 0 | 0, 67, 0 |
+
+所有内容校验通过。两配置每端每轮 RX tail 写入约 181–184 次，
+加深 ring 没有降低该通知数。guest 源码 iavf.h 的
+IAVF_RX_BUFFER_WRITE=16，iavf_clean_rx_irq 在累计 16 项时补充
+descriptor，iavf_release_rx_desc 经 wmb 后 writel 新 tail。
+约 4 MiB / 1448 字节 / 16 与观测通知数量吻合，不能用 ring 深度
+推导通知批次增大。
+
+三轮同步累计耗时中位数（提交/完成，毫秒，包含 DSM 等待）：
+128：Garen 145.4/112.3，Ezreal 65.6/94.5；
+256：Garen 117.3/122.1，Ezreal 147.7/144.2。
+丢包、耗时仍有波动，不能宣称 256 稳定更优，现已恢复 RX/TX
+128/128；guest/HPET/host 内核不改。
+
+下一步应评估 QEMU 在 RX tail 上按队列提交范围同步，而非
+再次增加 ring 或仅根据 DMA permission 跳过 payload。
+目前 VFIO 路径没有解析 virtchnl 队列配置，不能直接安全启用：
+需从 AdminQ 的 CONFIG_VSI_QUEUES 请求/成功回复建立
+queue id、ring IOVA/长度、RX buffer 大小及代际；RX tail
+0x2000+4*queue_id 给出新增 descriptor 范围（含回绕）。
+提交应覆盖这些 descriptor 及其重新交给设备的 payload，
+维持完成发布与 tail 的顺序；配置失败、reset、disable、部分
+unmap、未知格式必须失效或回退全量同步。完成侧仍保持现有
+快照/发布顺序。此队列路径尚未实现，也不据此声称通用 VFIO 优化。
+
+恢复配置后 10 秒，两 adapter 各 5 次 watchdog/5 个成功统计
+回复；无 WARNING/BUG/DMA fault/QI error/TX timeout。
+临时 BPF/guest probes、receiver/sender/observer 均已清理。
+两端自己的 QEMU 保留运行，host PF up，无新增实验文件。
