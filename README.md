@@ -3624,3 +3624,71 @@ data vectors按名称绑定0/1/2/3，error级guest dmesg为空。
 Jinx source正常STOP退出、两个临时IP已删除、49162无监听，
 perf/所有流量任务已结束、memfd关闭；没有实验文件或新磁盘。
 Garen无关worker-g4 PID6122保持，没有host reboot。
+
+## 2026-10-11：一次物理 DMA 发布内复用 RAM 地址翻译
+
+代码 commit `8be831297b`。只修改 QEMU `hw/vfio/loom-dma.c`，
+不改 guest/host kernel，不调整 HPET。针对前述 RX 完成 metadata 中多个
+changed-byte run 重复调用 address_space_write/flatview_translate 的成本。
+
+merge_buffer 的第一次 changed run 仍走旧路径；第二段起，只有
+loom_physical、BQL 已持有且开关开启时，创建一次临时 MemoryRegionCache。
+仅缓存完整覆盖当前 buffer 的普通可写 RAM；短映射、MMIO、RAMDevice 等回退。
+缓存仅活到此次 merge 结束，持有 RCU/MemoryRegion/FlatView 引用，
+不会保存在 DMA registration 中。错误出口也销毁缓存并解锁。
+每段仍只写与 baseline 不同的字节，成功后才更新该段 baseline；
+不扩大 metadata/payload 范围，不改变 payload→metadata→最后 DD 的顺序。
+直接 RAM 写走 cache_invalidate，保留 dirty/TB accounting。
+本树 address_space_cache_init 在 RDMA DSM 模式清空 cache.ptr，
+因此 cached_slow 仍走 KVM_DSM_MEMCPY，不能绕过 DSM 获取裸指针写副本。
+
+默认开启；对照时在 QEMU 进程环境设置
+`LOOM_VFIO_PUBLICATION_CACHE=0` 关闭或 `=1` 开启。
+gvm-device-vfio-node.py 外层 env 可传递该开关；容器创建时读取。
+此前提交快照和 TX type batching 保持开启。
+
+验证：
+- Ezreal/Garen 编译通过、diff --check 通过。
+- 抽取实际 skip_matching_bytes/merge_buffer，外部内存与 cache 接口用测试替身，
+  memfd 编译 ASAN/UBSAN，43,200 案例 PASS。覆盖未对齐/0/短/4KiB范围、
+  并发 CPU 改过但 producer 未变的字节保留、每段失败和 baseline部分提交、
+  默认/关闭/非物理/BQL未持有/短映射/非RAM/模拟DSM慢路径/设备方向、
+  cache引用与RCU在失败时释放。替身测试不证明真实内存接口本身正确。
+- 真实普通VM关闭→开启→关闭，仅改变上述环境变量，使用同一新 binary；
+  普通VM仍是本树 QEMU 的全本地4CPU模式，未换 upstream QEMU/KVM模块。
+  guest #26、4GiB/两NUMA/HPET、X710 VF 0c:02.0、2队列、
+  RX512/TX128、RPS/XPS0、接收CPU0、data IRQ按名称绑CPU0/1保持。
+  三次正常poweroff/QEMU EXIT0、VF恢复iavf后才重启。
+  Jinx198.18.10.3→enp0s7单连接，每轮256MiB，7轮，
+  source8MiB×32、guest recv最多64KiB，固定字节模式/计数/source elapsed均正确。
+
+| 模式，MiB/s | r0 | r1 | r2 | r3 | r4 | r5 | r6 | median |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OFF | 274.630 | 251.125 | 295.185 | 264.111 | 290.390 | 278.975 | 261.121 | 274.630 |
+| ON | 279.705 | 338.512 | 353.683 | 323.002 | 321.323 | 367.657 | 359.902 | 338.512 |
+| OFF_RESTORED | 298.742 | 317.501 | 254.172 | 344.843 | 260.636 | 345.582 | 288.876 | 298.742 |
+
+开启中位数高于前后关闭组，方向一致；不能宣称固定13%或23%端到端收益。
+host线程/内存落点、guest启动状态未严格锁定，关闭组自身也漂移；
+固定模式/短测试不是长时间标准benchmark，不能与先前直接DMA组混算。
+第一次关闭组执行器误把中途IRQ配置标记当完成，输出未完整采集；
+确认 guest已回到root prompt后修正标记重跑，表格只使用完整7轮。
+关闭组/恢复巨虚启动或关机仍出现hrtimer耗时warning，未改变HPET；
+原有FAT warning也仍在，未做fsck。
+
+最后恢复巨虚Garen4057385（session47327）、Ezreal753023（session70039），
+同一代码/default cache开启。guest正常login、CPU0–3在线、HPET、
+两NIC UP、两个既有1GiB数据盘枚举。
+两卡同时各接收256MiB：G5.251914s/E6.268068s，数据均PASS。
+发送功能每卡2workers×6秒，G591.068/E471.540/双卡总355.062MiB/s，
+每种仅1轮，8条流接收计数/内容全部PASS，不能当作优化前后的性能收益。
+TCP累计重传仍有，两NIC错误/丢包计数0、guest error级dmesg空。
+首次发送的临时服务因exec在函数局部命名空间导致time/stop NameError，
+服务断开连接；定位并结束这两个测试进程、确认端口关闭、修正执行命名空间后
+重试成功。这次失败不作为设备路径故障或性能证据。
+
+Jinx source/sink均已停止、两个临时IP删除、49161/49162无监听；
+所有测试仅stdin/memfd，没有实验文件/新盘。Garen worker-g4 PID6122保持。
+后续需进一步采样真实DSM路径的完成开销、验证缓存收益与退化情况，
+并继续处理长时间DMA映射生命周期、reset恢复及其验证；
+整体“除DSM以外开销尽可能低”目标仍未完成。
