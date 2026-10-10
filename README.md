@@ -3692,3 +3692,85 @@ Jinx source/sink均已停止、两个临时IP删除、49161/49162无监听；
 后续需进一步采样真实DSM路径的完成开销、验证缓存收益与退化情况，
 并继续处理长时间DMA映射生命周期、reset恢复及其验证；
 整体“除DSM以外开销尽可能低”目标仍未完成。
+
+## 2026-10-11：地址缓存后的巨虚 RX 调用粒度审计
+
+运行 binary 代码 `8be831297b`、README HEAD `8a8b8435a6`，
+Garen4057385/Ezreal753023仍在运行；本轮未修改程序代码或内核。
+上一轮属于实质进展（代码/测试/实机对照），本轮继续用新证据确定下一步。
+
+同一 #26/HPET/4CPU/两NUMA，data IRQ仍0/1/2/3。
+Jinx→Garen guest enp0s7，接收CPU0、parent0/1，单连接256MiB循环约28秒，
+13次计数/模式验证PASS；source与guest计时相符。
+perf仅采Garen QEMU主机CPU，cpu-clock:H 99Hz/DWARF8192，
+memfd、no-buildid-cache、实时binary inode/evlist exclude_guest=1核实，
+24秒record、2122样本/21.434343秒CPU权重、bad0/script stderr空。
+启动相对traffic存在错位、尾部可能含空闲，不是严格稳态成本比例。
+首次traffic拼接脚本多出一个括号，未产生有效负载；
+确认guest返回root后结束专属串口执行器、修正并先compile验证。
+首次perf任务正常结束但无合格负载，不用作此轮结果；表述只用后一次。
+
+按原探针“函数名优先匹配”的互斥分类：
+VFIO48.916%、DSM名称26.673%、OTHER23.327%、RPC1.084%，unknown叶6.880%。
+VFIO分类分项占全部被采主机CPU：
+完成同步37.936%、prepare6.079%、materialize2.026%、完整sync1.178%。
+**这不表示37.936%是纯QEMU或完全排除了DSM开销。**
+原分类仅识别kvm_dsm/ivy_kvm_dsm名称，不包括
+kvm_vm_ioctl_dsm等封装，以及其外侧系统调用入口/退出。
+真实栈中这些封装会落在VFIO类。不能把分类数字解释成逻辑上的
+“DSM全部成本”和“所有非DSM成本”；也不含guestCPU/阻塞等待/外部kernel worker。
+不能用与之前不同负载的百分比相减宣称cache优化收益。
+
+关键新证据：完成发布仍频繁调用KVM_DSM_MEMCPY。
+perf同时看到旧address_space_write与新的address_space_write_cached_slow，
+后者确实经flatview_write_continue_step→kvm_vm_ioctl进入内核，
+验证临时地址缓存并没有绕过真实DSM协议。
+出现ioctl、syscall_enter_from_user_mode、mutex_lock/unlock、
+copy_from_user等叶热点；地址缓存不减少changed-byte run数量。
+
+另一次独立接收负载，BCC kprobe/kretprobe kvm_dsm_memcpy，
+只过滤Garen QEMU tgid4057385，24秒计数，探针随后完全卸载。
+参数按实际源码第4项length、第5项write，return非0记error。
+没有BPF map dropped/pending，所有已统计条目error0。
+
+| 统计项 | 值 |
+| --- | ---: |
+| write calls | 12,750,497 |
+| write calls中长度≤8字节 | 12,739,338（99.912%） |
+| write总bytes | 32,164,759 |
+| 平均每次write bytes | 2.523 |
+| 窗口平均write calls/s | 531,270.708 |
+| read calls | 1,471,090 |
+| read总bytes | 2,167,131,744 |
+
+write各长度主要为：1字节4,960,003次、2字节3,933,388次、
+3字节1,093,171次、4字节1,478,650次、8字节1,201,300次。
+此计数含这个QEMU内所有DSM memcpy，不是只含RX descriptor；
+可能包括packet header、TX ACK ring、其他RAM访问，尚未做逐发布来源归因。
+不能声称每个packet/descriptor精确对应多少次调用。
+
+kprobe明显扰动性能，采样时256MiB大多约3.36–3.47秒，
+探针结束后的轮次约1.85–2.11秒；这两个数字不能用于报告系统带宽收益。
+latency ns也包括等待、并发线程和探针成本，不能当CPU时间或简单累加成墙钟。
+10轮流量内容/计数均PASS，探针目标是确定调用数量与粒度。
+
+对源码的核实：每个KVM_DSM_MEMCPY重新copy参数、进SRCU，
+查询hvaslot，对shared页加全局dsm_lock及page lock、检查/取得所有权、
+执行copy并解锁。即使页已本地，也反复支付这条路径；
+这比继续只减少地址翻译更具体。
+下一步应评估批量提交同页的changed spans，而非复制整页：
+保留变化字节与baseline部分提交、载荷先于metadata/最后DD，
+同页所有权可在多个片段之间复用，发生错误须明确完成了哪些片段。
+可以研究有界瞬时MEMPIN后直接改变化字节（现有unpin release路径），
+或新增有界scatter-copy ioctl；**均未实现/部署，也未证明安全或收益**。
+瞬时pin必须核实正在运行kernel的实现、限制单页避免部分pin回滚、
+处理pin/unpin失败，不使用address_space_map当前忽略pin失败的接口。
+scatter ioctl需要检查ABI能力、旧kernel回退、条目预检查与部分失败语义；
+这些是host/QEMU侧改动，不要求guest OS变化。
+不能把真正的RDMA page transfer、ownership等待等直接归入可消除的调用开销。
+
+所有perf/BCC/traffic进程结束、memfd关闭、source STOP正常退出、
+Jinx临时10.3/11.3 IP已删、49162无监听。
+巨虚继续运行，guest error级dmesg空、CPU0–3/HPET保持，
+Garen worker-g4 PID6122未动，没有host reboot或实验文件。
+整体目标仍未完成，双卡线性吞吐、长时间mapping生命周期及reset恢复仍缺证据。
