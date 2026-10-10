@@ -274,7 +274,8 @@ static void directory_read(unsigned owner, unsigned offset,
     }
 }
 
-static void snapshot(LoomPCIDescriptor *src, LoomPCIDescriptor *dst)
+static void snapshot_bytes(LoomPCIDescriptor *src, LoomPCIDescriptor *dst,
+                           size_t length)
 {
     unsigned owner, offset;
     bool locked = bql_locked();
@@ -287,7 +288,7 @@ static void snapshot(LoomPCIDescriptor *src, LoomPCIDescriptor *dst)
     if (!locked) {
         bql_lock();
     }
-    *dst = *src;
+    memcpy(dst, src, length);
     if (owner != local_node) {
         if (qatomic_load_acquire(&directory_control_active)) {
             unsigned index = (offset - offsetof(LoomPCINode, devices)) /
@@ -306,12 +307,13 @@ static void snapshot(LoomPCIDescriptor *src, LoomPCIDescriptor *dst)
                 qemu_mutex_unlock(&directory_lock);
                 fatal_error("missing owner control snapshot");
             }
-            *dst = incoming_directory[owner].devices[index];
+            memcpy(dst, &incoming_directory[owner].devices[index], length);
             qemu_mutex_unlock(&directory_lock);
         } else {
-            directory_read(owner, offset, dst, LOOM_DESCRIPTOR_PREFIX);
+            directory_read(owner, offset, dst,
+                           MIN(length, LOOM_DESCRIPTOR_PREFIX));
         }
-        *src = *dst;
+        memcpy(src, dst, length);
     }
     if (!locked) {
         bql_unlock();
@@ -319,6 +321,17 @@ static void snapshot(LoomPCIDescriptor *src, LoomPCIDescriptor *dst)
     if (dst->sequence & 1) {
         fatal_error("device reset snapshot unavailable; aggregate must stop");
     }
+}
+
+static void snapshot(LoomPCIDescriptor *src, LoomPCIDescriptor *dst)
+{
+    snapshot_bytes(src, dst, sizeof(*dst));
+}
+
+/* BAR routing needs metadata only; configuration remains on control paths. */
+static void snapshot_bars(LoomPCIDescriptor *src, LoomPCIDescriptor *dst)
+{
+    snapshot_bytes(src, dst, offsetof(LoomPCIDescriptor, config));
 }
 
 /* These functions execute on the independent receive/control path. */
@@ -599,7 +612,7 @@ static uint64_t remote_bar_read(void *opaque, hwaddr offset, unsigned size)
     typeof(((LoomRemotePCI *)0)->bar_context[0]) *ctx = opaque;
     LoomRemotePCI *s = ctx->device;
     LoomPCIDescriptor current;
-    snapshot(descriptor(s->device_id), &current);
+    snapshot_bars(descriptor(s->device_id), &current);
     if (current.bars[ctx->bar].address == PCI_BAR_UNMAPPED ||
         current.bars[ctx->bar].address !=
         s->parent_obj.io_regions[ctx->bar].addr) {
@@ -622,7 +635,7 @@ static void remote_bar_write(void *opaque, hwaddr offset,
     typeof(((LoomRemotePCI *)0)->bar_context[0]) *ctx = opaque;
     LoomRemotePCI *s = ctx->device;
     LoomPCIDescriptor current;
-    snapshot(descriptor(s->device_id), &current);
+    snapshot_bars(descriptor(s->device_id), &current);
     if (current.bars[ctx->bar].address == PCI_BAR_UNMAPPED ||
         current.bars[ctx->bar].address !=
         s->parent_obj.io_regions[ctx->bar].addr) {
@@ -952,7 +965,7 @@ static bool bar_access_owner(unsigned owner, hwaddr addr, bool io,
 
     for (index = 0; index < directory[owner].count; index++) {
         LoomPCIDescriptor d;
-        snapshot(&directory[owner].devices[index], &d);
+        snapshot_bars(&directory[owner].devices[index], &d);
         for (bar = 0; bar < PCI_NUM_REGIONS; bar++) {
             LoomBAR *b = &d.bars[bar];
             LoomPCIRequest req;

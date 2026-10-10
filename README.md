@@ -249,3 +249,22 @@ host 线程固定到 RDMA 卡所在 NUMA node 1 的不同物理核，只使双�
 当前仍需处理或测量：非 PCI 实际设备转发、本地目录扫描/队列成本、
 无需 guest DMA bridge 的真实网卡 DMA 路径及双网卡并行吞吐。
 本轮仍未挂网卡，尚未完成“除 DSM 外尽可能降低开销”的整体目标。
+
+### BAR 路由描述符复制优化（2026-10-10）
+
+BAR 地址查找和远端 BAR 回调只读取 generation、BAR 地址/大小等前 192 字节，
+不再每次复制包含 PCI 配置的 4288 字节完整描述符。控制路径仍使用完整
+snapshot；接收缓存锁、reset 奇数 sequence 等待、generation 校验和失效机制保留。
+未改 guest 内核或驱动，HPET 配置保持不变。
+
+两端编译和 checkpatch 通过；CPU0/2 对两端 EDU 的 BAR 移动、memory enable
+关闭/恢复、旧地址失效、并发重配置通过。原磁盘读测试三轮中位数：
+Garen 单盘双 worker 1783.9、Ezreal 单盘双 worker 1722.9、
+双盘四 worker 2933.9 MiB/s。双盘与优化前 2935.0 基本持平，
+没有证据证明吞吐提高；不能把复制字节数下降当成实测性能收益。
+运行实例仍为四 vCPU、两节点各两 CPU、4 GiB、owner IOThread、MSI-X。
+
+正常关闭上一版实例时，master 返回 0，slave 返回 SIGSEGV；
+两端已重新启动并通过上述检查。退出异常尚未定位，不能宣称正常退出已验证。
+当前 VFIO staging 路径仍依赖 guest DMA bridge；透明真实网卡支持和
+双网卡吞吐目标尚未完成。
