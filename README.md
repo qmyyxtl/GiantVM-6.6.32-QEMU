@@ -1079,3 +1079,27 @@ LOOM_IAVF_RX_SCOPED=0 可在 QEMU 启动时强制原有完整提交，用于对�
 既有队列 enable/失效、范围提交、生命周期、64 KiB GPA 批次和
 24种完成交错检查均通过。真实设备命中率、健康及性能另行记录，
 不能将普通 RAM 检查当作真实吞吐提升证明。
+
+8c86a83026 两端构建并部署后的真实 VF 检查：两卡各接收 4 MiB，
+内容校验均通过。20 秒只读 BPF 窗口内，Garen 的 181 次 RX tail
+提交中 180 次范围同步、1 次首次回退；Ezreal 的 183 次中 182 次
+范围同步、1 次首次回退，rx_error 均 0。因此该窗口明确避免
+180/182 次原本的全量 CPU→device 提交扫描，不仅是观察器就绪。
+
+范围 API 调用及请求字节分别为 Garen 3262/4517280、
+Ezreal 3298/4567472；CPU 描述符读取请求分别为 202/92160、
+204/93184。字节数是请求范围累计，不等于实际改变/复制的字节数。
+其他控制/TX 通知仍有 100/114 次完整提交，完成方向仍有
+629/697 次同步调用，下一阶段必须继续削减这两部分扫描。
+
+本轮 owner0/owner1 RX discards 为 78/14、host TCP 重传为 78/14，
+没有证明丢包问题已解决。10 秒 AdminQ 检查两卡各 4 次成功
+GET_STATS、watchdog 各5次，未发现定义的 WARNING/BUG/DMA fault/
+QI error/TX timeout，HPET=hpet。未挂探针的短回归双网卡
+四 worker 发送 29.34 MiB/s，四流内容校验通过、total_retrans
+均为0；双 raw 盘四 worker、每 worker QD8 的 O_RDONLY/O_DIRECT
+读取 3168.04 MiB/s。单轮结果没有交替关闭快路径的同条件对照，
+不能据此断言吞吐提升幅度或线性扩展。
+
+guest #26、HPET、host 内核不改；全部临时 probes、sender、
+receiver、TCP sink、serial observer 已退出，无新增实验文件。
