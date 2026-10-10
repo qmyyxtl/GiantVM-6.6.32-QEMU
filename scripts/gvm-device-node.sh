@@ -23,6 +23,17 @@ case ${GVM_IOMMU:-0} in
         ;;
     *) echo 'GVM_IOMMU must be 0 or 1' >&2; exit 2 ;;
 esac
+case ${GVM_OWNER_IOMMU:-0} in
+    0) ;;
+    1)
+        if [[ ${GVM_IOMMU:-0} != 1 ]]; then
+            echo 'GVM_OWNER_IOMMU=1 requires GVM_IOMMU=1' >&2
+            exit 2
+        fi
+        export LOOM_OWNER_IOMMU=1
+        ;;
+    *) echo 'GVM_OWNER_IOMMU must be 0 or 1' >&2; exit 2 ;;
+esac
 args=(
     -enable-kvm -machine "$machine,kernel-irqchip=split" -smp 4 -m 4G
     -display none -monitor none
@@ -32,7 +43,7 @@ args=(
     -device ide-hd,drive=rootfs,id=rootfs
     -device "edu,id=edu-owner-$node,addr=0$((5 + node)).0,loom-aggregate=on,loom-numa-node=$node"
 )
-# This enables the standard master vIOMMU only. Remote DMA is not mirrored yet.
+# Owner mode gives each peer its own unit; ordinary mode uses the master unit.
 if [[ ${GVM_IOMMU:-0} == 1 ]]; then
     args+=(-device intel-iommu,caching-mode=on,intremap=off)
 fi

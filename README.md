@@ -24,6 +24,8 @@
   这些是代码保留的参数名，未在仓库迁移时重命名。
 - 跨端 PCI 配置和设备访问由现有设备转发逻辑处理；
   QEMU 对 guest RAM 的相关访问经过 DSM，DMA pin 遵守内核所有权协议。
+- 可选 owner IOMMU 模式通过标准 ACPI DMAR 按设备归属提供控制单元；
+  已验证两单元启用及本地控制访问，VFIO 标准映射生命周期接入仍未完成。
 - 已验证跨端独立 raw 数据盘读写、flush、跨端回读；
   VFIO 网卡有独立启动/测试工具，当前带宽回归未挂网卡，
   不能将本轮结果解读为真实网卡聚合吞吐测试。
@@ -337,3 +339,29 @@ CLB 的 map_page 输出错误地写到 res_fis_is_dsm，lst_is_dsm 始终为 fal
 两端已编译，guest 内核/驱动和 host KVM 未修改，HPET 保留。
 下一步评估按 owner 报告独立 DMAR 控制窗口和设备 scope，避免本地 DMA 映射
 必须经过 master；该 owner IOMMU 路径及真实双网卡吞吐尚未实现。
+
+### Owner 本地 IOMMU 控制路径（2026-10-10）
+
+LOOM_OWNER_IOMMU=1 为每个 owner 提供独立的标准 VT-d 寄存器窗口，
+地址为 0xfed90000 + owner * 4096。master 的 ACPI DMAR 表按设备 BDF 归属
+生成多个 DRHD；非聚合设备和 IOAPIC 属于节点 0。每个窗口只由对应 owner
+的 Intel IOMMU 模型处理，拥有独立 root table 和 queued-invalidation 状态。
+本地访问直接 dispatch；远端访问使用现有释放 BQL 后等待的 owner RPC。
+不是将同一队列复制给多端消费。启动目录同时校验各节点的 owner-IOMMU 模式。
+
+在 Garen/Ezreal 两节点实测，未修改的 guest Linux 识别 dmar0/dmar1：
+05.0、09.0、根盘 AHCI 属于 dmar0；06.0、0a.0 属于 dmar1。
+两端 dmar_enabled/qi_enabled 均为 true，root 分别为 0x4bee000/0x4bec000。
+CPU0/2 分别读取两个单元各 64 次，版本均为 0x10。
+探针显示 Garen 本地 CPU0 dispatch 64 次、Ezreal 本地 CPU2 dispatch 64 次；
+仅跨 owner 读取各产生 64 次 RPC。完成一次完整 system_reset 并重新登录后，
+两个单元的 GSTS 均为 0xc4000000，TE/QIES 保持启用，四组读取检查再次通过。
+双盘四 worker 短时只读校验通过；该轮不作为新的吞吐基线。
+
+启动器增加 GVM_OWNER_IOMMU=1（默认 0），要求 GVM_MACHINE=q35、
+GVM_IOMMU=1；两端使用相同设置，并保留现有 NUMA、owner IOThread 和
+clocksource=hpet 配置。该模式目前要求 intremap=off、pasid=off、
+device-iotlb=off，未验证三/四节点运行。
+
+本轮已实现 owner 本地的 IOMMU 控制基础，但 VFIO 标准 MAP/UNMAP 通知还没有
+自动接入 staging buffer 注册/回写生命周期；真实双网卡验证和性能目标仍未完成。

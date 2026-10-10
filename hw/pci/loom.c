@@ -23,7 +23,7 @@
 
 #define TYPE_LOOM_REMOTE_PCI "loom-remote-pci"
 #define LOOM_MAX_DEVICES 64
-#define LOOM_MAX_NODES 4
+#define LOOM_MAX_NODES LOOM_IOMMU_MAX_NODES
 #define LOOM_DIRECTORY_MAGIC 0x4c4f4f4d50434931ULL
 #define LOOM_DIRECTORY_VERSION 3
 
@@ -86,6 +86,7 @@ static unsigned owned_reset_depth[LOOM_MAX_DEVICES];
 static PCIBus *root_bus;
 static unsigned local_node, node_count, owned_count;
 static uint32_t config_address;
+static bool owner_iommu_present;
 
 G_STATIC_ASSERT(sizeof(LoomPCIDescriptor) == 4288);
 /* Only this prefix changes BAR mappings. Extended config reads use owner RPC. */
@@ -98,6 +99,41 @@ bool loom_pci_enabled(void)
 {
     const char *value = getenv("LOOM_DEVICE_AGGREGATION");
     return value && !strcmp(value, "1");
+}
+
+bool loom_iommu_enabled(void)
+{
+    const char *value = getenv("LOOM_OWNER_IOMMU");
+
+    return loom_pci_enabled() && value && !strcmp(value, "1");
+}
+
+void loom_iommu_register(void)
+{
+    owner_iommu_present = true;
+}
+
+hwaddr loom_iommu_address(unsigned owner)
+{
+    assert(owner < LOOM_IOMMU_MAX_NODES);
+    return LOOM_IOMMU_BASE + owner * LOOM_IOMMU_STRIDE;
+}
+
+unsigned loom_iommu_nodes(void)
+{
+    return node_count;
+}
+
+unsigned loom_pci_device_owner(PCIDevice *dev)
+{
+    LoomRemotePCI *remote;
+
+    if (object_dynamic_cast(OBJECT(dev), TYPE_LOOM_REMOTE_PCI)) {
+        remote = (LoomRemotePCI *)dev;
+        return remote->device_id / LOOM_MAX_DEVICES;
+    }
+    /* Nonaggregated devices retain their master-owned control/DMA path. */
+    return dev->loom_aggregate ? local_node : 0;
 }
 
 bool loom_pci_intx_requires_proxy(PCIDevice *dev)
@@ -519,6 +555,9 @@ void loom_pci_prepare(void)
         ms->qemu_nums > LOOM_MAX_NODES) {
         fatal_error("requires between two and four nodes with explicit CPU ownership");
     }
+    if (loom_iommu_enabled() && !owner_iommu_present) {
+        fatal_error("owner IOMMU mode requires an Intel IOMMU on every node");
+    }
     local_node = ms->local_cpu_start_index / ms->local_cpus;
     node_count = ms->qemu_nums;
     if (local_node >= node_count) {
@@ -535,6 +574,7 @@ void loom_pci_prepare(void)
     incoming_directory = g_new0(LoomPCINode, node_count);
     directory[local_node].magic = LOOM_DIRECTORY_MAGIC;
     directory[local_node].version = LOOM_DIRECTORY_VERSION;
+    directory[local_node].reserved = loom_iommu_enabled() ? 1 : 0;
     pci_for_each_device_under_bus(root_bus, collect_device, NULL);
     directory[local_node].count = owned_count;
     directory[local_node].heartbeat = 1;
@@ -731,6 +771,8 @@ void loom_pci_bootstrap(void)
         }
         if (directory[owner].magic != LOOM_DIRECTORY_MAGIC ||
             directory[owner].version != LOOM_DIRECTORY_VERSION ||
+            directory[owner].reserved !=
+                (loom_iommu_enabled() ? 1 : 0) ||
             directory[owner].count > LOOM_MAX_DEVICES) {
             fatal_error("incompatible device directory");
         }
@@ -817,6 +859,40 @@ void loom_pci_bootstrap(void)
     }
 }
 
+static void iommu_dispatch(const LoomPCIRequest *req, LoomPCIResponse *resp)
+{
+    bool locked = bql_locked();
+    uint8_t data[8];
+    bool write = req->operation == LOOM_IOMMU_WRITE;
+
+    *resp = (LoomPCIResponse) { .status = -EINVAL };
+    if (!loom_iommu_enabled() || !owner_iommu_present ||
+        req->device_id != local_node * LOOM_MAX_DEVICES ||
+        req->generation || req->bar || req->reserved ||
+        !(req->size == 4 || req->size == 8) ||
+        req->offset >= LOOM_IOMMU_STRIDE ||
+        req->size > LOOM_IOMMU_STRIDE - req->offset ||
+        req->offset % req->size) {
+        return;
+    }
+    if (!locked) {
+        bql_lock();
+    }
+    stq_le_p(data, req->value);
+    resp->status = address_space_rw(
+        &address_space_memory,
+        loom_iommu_address(local_node) + req->offset,
+        MEMTXATTRS_UNSPECIFIED, data, req->size, write) == MEMTX_OK ? 0 : -EIO;
+    if (!write && !resp->status) {
+        resp->value = 0;
+        memcpy(&resp->value, data, req->size);
+        resp->value = le64_to_cpu(resp->value);
+    }
+    if (!locked) {
+        bql_unlock();
+    }
+}
+
 void loom_pci_dispatch(const LoomPCIRequest *req, LoomPCIResponse *resp)
 {
     unsigned index = req->device_id % LOOM_MAX_DEVICES;
@@ -824,6 +900,11 @@ void loom_pci_dispatch(const LoomPCIRequest *req, LoomPCIResponse *resp)
     bool locked = bql_locked();
     uint8_t data[8];
     LoomPCIDescriptor *d = descriptor(req->device_id);
+    if (req->operation == LOOM_IOMMU_READ ||
+        req->operation == LOOM_IOMMU_WRITE) {
+        iommu_dispatch(req, resp);
+        return;
+    }
     *resp = (LoomPCIResponse) { .status = -EINVAL };
     if (!d || req->device_id / LOOM_MAX_DEVICES != local_node ||
         index >= owned_count ||
@@ -1083,5 +1164,29 @@ bool loom_pci_handle_pio(uint16_t port, MemTxAttrs attrs, void *data,
 bool loom_pci_handle_mmio(hwaddr addr, MemTxAttrs attrs, uint8_t *data,
                           unsigned size, bool write)
 {
+    if (directory && loom_iommu_enabled() && addr >= LOOM_IOMMU_BASE &&
+        addr - LOOM_IOMMU_BASE < node_count * LOOM_IOMMU_STRIDE) {
+        unsigned owner = (addr - LOOM_IOMMU_BASE) / LOOM_IOMMU_STRIDE;
+        LoomPCIRequest req = {
+            .operation = write ? LOOM_IOMMU_WRITE : LOOM_IOMMU_READ,
+            .device_id = owner * LOOM_MAX_DEVICES,
+            .offset = addr - loom_iommu_address(owner), .size = size,
+        };
+        LoomPCIResponse resp;
+
+        if (!(size == 4 || size == 8)) {
+            fatal_error("unsupported IOMMU access width");
+        }
+        if (write) {
+            memcpy(&req.value, data, size);
+            req.value = le64_to_cpu(req.value);
+        }
+        execute(owner, &req, &resp);
+        if (!write) {
+            uint64_t value = cpu_to_le64(resp.value);
+            memcpy(data, &value, size);
+        }
+        return true;
+    }
     return bar_access(addr, false, data, size, write);
 }

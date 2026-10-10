@@ -26,6 +26,7 @@
 #include "hw/sysbus.h"
 #include "intel_iommu_internal.h"
 #include "hw/pci/pci.h"
+#include "hw/pci/loom.h"
 #include "hw/pci/pci_bus.h"
 #include "hw/qdev-properties.h"
 #include "hw/i386/pc.h"
@@ -4329,12 +4330,28 @@ static void vtd_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    if (loom_iommu_enabled() &&
+        (ms->local_cpus <= 0 || ms->qemu_nums < 2 ||
+         ms->qemu_nums > LOOM_IOMMU_MAX_NODES ||
+         x86_iommu_ir_supported(x86_iommu) || s->pasid ||
+         x86_iommu->dt_supported)) {
+        error_setg(errp, "owner IOMMU requires two to four nodes, "
+                   "intremap=off, pasid=off and device-iotlb=off");
+        return;
+    }
+
     QLIST_INIT(&s->vtd_as_with_notifiers);
     qemu_mutex_init(&s->iommu_lock);
     memory_region_init_io(&s->csrmem, OBJECT(s), &vtd_mem_ops, s,
                           "intel_iommu", DMAR_REG_SIZE);
-    memory_region_add_subregion(get_system_memory(),
-                                Q35_HOST_BRIDGE_IOMMU_ADDR, &s->csrmem);
+    memory_region_add_subregion(
+        get_system_memory(),
+        loom_iommu_enabled() ?
+            loom_iommu_address(ms->local_cpu_start_index / ms->local_cpus) :
+            Q35_HOST_BRIDGE_IOMMU_ADDR, &s->csrmem);
+    if (loom_iommu_enabled()) {
+        loom_iommu_register();
+    }
 
     /* Create the shared memory regions by all devices */
     memory_region_init(&s->mr_nodmar, OBJECT(s), "vtd-nodmar",

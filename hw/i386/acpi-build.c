@@ -60,6 +60,7 @@
 #include "hw/i386/fw_cfg.h"
 #include "hw/i386/pc.h"
 #include "hw/pci/pci_bus.h"
+#include "hw/pci/loom.h"
 #include "hw/pci-host/i440fx.h"
 #include "hw/pci-host/q35.h"
 #include "hw/i386/x86-iommu.h"
@@ -2116,6 +2117,54 @@ dmar_host_bridges(Object *obj, void *opaque)
     return 0;
 }
 
+static void insert_owner_scope(PCIBus *bus, PCIDevice *dev, void *opaque)
+{
+    GArray **scopes = opaque;
+    unsigned owner = loom_pci_device_owner(dev);
+
+    assert(owner < loom_iommu_nodes());
+    insert_scope(bus, dev, scopes[owner]);
+}
+
+static int dmar_owner_bridges(Object *obj, void *opaque)
+{
+    if (object_dynamic_cast(obj, TYPE_PCI_HOST_BRIDGE)) {
+        PCIBus *bus = PCI_HOST_BRIDGE(obj)->bus;
+
+        if (bus && !pci_bus_bypass_iommu(bus)) {
+            pci_for_each_device_under_bus(bus, insert_owner_scope, opaque);
+        }
+    }
+    return 0;
+}
+
+static void build_dmar_unit(GArray *table_data, GArray *scope_blob,
+                           uint64_t address, bool ioapic)
+{
+    const size_t ioapic_scope_size = 8;
+
+    build_append_int_noprefix(table_data, 0, 2); /* DRHD type */
+    build_append_int_noprefix(table_data,
+                             16 + (ioapic ? ioapic_scope_size : 0) +
+                             scope_blob->len, 2);
+    build_append_int_noprefix(table_data, 0, 1); /* Explicit device scopes */
+    build_append_int_noprefix(table_data, 0, 1); /* Reserved */
+    build_append_int_noprefix(table_data, 0, 2); /* PCI segment */
+    build_append_int_noprefix(table_data, address, 8);
+    if (ioapic) {
+        build_append_int_noprefix(table_data, 0x03, 1);
+        build_append_int_noprefix(table_data, ioapic_scope_size, 1);
+        build_append_int_noprefix(table_data, 0, 2);
+        build_append_int_noprefix(table_data, ACPI_BUILD_IOAPIC_ID, 1);
+        build_append_int_noprefix(table_data, Q35_PSEUDO_BUS_PLATFORM, 1);
+        build_append_int_noprefix(table_data,
+                                 PCI_SLOT(Q35_PSEUDO_DEVFN_IOAPIC), 1);
+        build_append_int_noprefix(table_data,
+                                 PCI_FUNC(Q35_PSEUDO_DEVFN_IOAPIC), 1);
+    }
+    g_array_append_vals(table_data, scope_blob->data, scope_blob->len);
+}
+
 /*
  * Intel ® Virtualization Technology for Directed I/O
  * Architecture Specification. Revision 3.3
@@ -2127,9 +2176,6 @@ build_dmar_q35(GArray *table_data, BIOSLinker *linker, const char *oem_id,
 {
     uint8_t dmar_flags = 0;
     uint8_t rsvd10[10] = {};
-    /* Root complex IOAPIC uses one path only */
-    const size_t ioapic_scope_size = 6 /* device scope structure */ +
-                                     2 /* 1 path entry */;
     X86IOMMUState *iommu = x86_iommu_get_default();
     IntelIOMMUState *intel_iommu = INTEL_IOMMU_DEVICE(iommu);
     GArray *scope_blob = g_array_new(false, true, 1);
@@ -2156,34 +2202,24 @@ build_dmar_q35(GArray *table_data, BIOSLinker *linker, const char *oem_id,
     build_append_int_noprefix(table_data, dmar_flags, 1); /* Flags */
     g_array_append_vals(table_data, rsvd10, sizeof(rsvd10)); /* Reserved */
 
-    /* 8.3 DMAR Remapping Hardware Unit Definition structure */
-    build_append_int_noprefix(table_data, 0, 2); /* Type */
-    /* Length */
-    build_append_int_noprefix(table_data,
-                              16 + ioapic_scope_size + scope_blob->len, 2);
-    /* Flags */
-    build_append_int_noprefix(table_data, 0 /* Don't include all pci device */ ,
-                              1);
-    build_append_int_noprefix(table_data, 0 , 1); /* Reserved */
-    build_append_int_noprefix(table_data, 0 , 2); /* Segment Number */
-    /* Register Base Address */
-    build_append_int_noprefix(table_data, Q35_HOST_BRIDGE_IOMMU_ADDR , 8);
+    if (loom_iommu_enabled()) {
+        GArray *scopes[LOOM_IOMMU_MAX_NODES] = { 0 };
+        unsigned nodes = loom_iommu_nodes();
 
-    /* Scope definition for the root-complex IOAPIC. See VT-d spec
-     * 8.3.1 (version Oct. 2014 or later). */
-    build_append_int_noprefix(table_data, 0x03 /* IOAPIC */, 1); /* Type */
-    build_append_int_noprefix(table_data, ioapic_scope_size, 1); /* Length */
-    build_append_int_noprefix(table_data, 0, 2); /* Reserved */
-    /* Enumeration ID */
-    build_append_int_noprefix(table_data, ACPI_BUILD_IOAPIC_ID, 1);
-    /* Start Bus Number */
-    build_append_int_noprefix(table_data, Q35_PSEUDO_BUS_PLATFORM, 1);
-    /* Path, {Device, Function} pair */
-    build_append_int_noprefix(table_data, PCI_SLOT(Q35_PSEUDO_DEVFN_IOAPIC), 1);
-    build_append_int_noprefix(table_data, PCI_FUNC(Q35_PSEUDO_DEVFN_IOAPIC), 1);
-
-    /* Add scope found above */
-    g_array_append_vals(table_data, scope_blob->data, scope_blob->len);
+        for (unsigned owner = 0; owner < nodes; owner++) {
+            scopes[owner] = g_array_new(false, true, 1);
+        }
+        object_child_foreach_recursive(object_get_root(),
+                                       dmar_owner_bridges, scopes);
+        for (unsigned owner = 0; owner < nodes; owner++) {
+            build_dmar_unit(table_data, scopes[owner],
+                            loom_iommu_address(owner), owner == 0);
+            g_array_free(scopes[owner], true);
+        }
+    } else {
+        build_dmar_unit(table_data, scope_blob,
+                        Q35_HOST_BRIDGE_IOMMU_ADDR, true);
+    }
     g_array_free(scope_blob, true);
 
     if (iommu->dt_supported) {

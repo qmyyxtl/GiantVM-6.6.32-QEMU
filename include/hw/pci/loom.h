@@ -13,6 +13,8 @@ enum {
     LOOM_PCI_BAR_WRITE,
     LOOM_PCI_INTX,
     LOOM_PCI_RESET,
+    LOOM_IOMMU_READ,
+    LOOM_IOMMU_WRITE,
 };
 
 /* Same-version peers; fixed-width requests contain no host pointers. */
@@ -32,6 +34,15 @@ typedef struct LoomPCIResponse {
     uint32_t generation;
     uint64_t value;
 } LoomPCIResponse;
+
+#define LOOM_IOMMU_MAX_NODES 4
+#define LOOM_IOMMU_BASE UINT64_C(0xfed90000)
+#define LOOM_IOMMU_STRIDE 4096
+bool loom_iommu_enabled(void);
+void loom_iommu_register(void);
+hwaddr loom_iommu_address(unsigned owner);
+unsigned loom_iommu_nodes(void);
+unsigned loom_pci_device_owner(PCIDevice *dev);
 
 bool loom_pci_enabled(void);
 void loom_pci_prepare(void);
