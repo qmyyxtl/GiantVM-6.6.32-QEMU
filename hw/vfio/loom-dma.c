@@ -19,6 +19,7 @@ typedef struct LoomDMAMap {
     uint64_t size;
     uint8_t *pool;
     bool readonly;
+    GList *link;
 } LoomDMAMap;
 
 typedef struct LoomDMABuffer {
@@ -28,13 +29,70 @@ typedef struct LoomDMABuffer {
     uint8_t *baseline, *scratch, *pool;
     bool snapshot_ready;
     struct LoomDMABuffer *snapshot_next;
+    GList *link;
+    uint64_t registration_sequence;
 } LoomDMABuffer;
 
 struct LoomVFIODMA {
     GList *maps, *buffers, *buffers_tail;
     uint8_t *read_buffer;
     uint64_t epoch;
+    bool page_indexed;
+    GHashTable *page_maps, *page_buffers;
+    uint64_t registration_sequence;
 };
+
+/*
+ * Native guest VT-d notifications describe disjoint 4 KiB pages. Keep point
+ * indexes for that proven layout; any non-page registration permanently
+ * returns this container to the general ordered-list implementation.
+ */
+static gpointer page_key(hwaddr iova)
+{
+    return (gpointer)(uintptr_t)(iova / 4096);
+}
+
+static void page_index_disable(LoomVFIODMA *ctx)
+{
+    ctx->page_indexed = false;
+    g_clear_pointer(&ctx->page_maps, g_hash_table_destroy);
+    g_clear_pointer(&ctx->page_buffers, g_hash_table_destroy);
+}
+
+static void page_index_layout(LoomVFIODMA *ctx, hwaddr iova, uint64_t size)
+{
+    if (ctx->page_indexed && ((iova & 4095) || size != 4096)) {
+        page_index_disable(ctx);
+    }
+}
+
+static LoomDMAMap *map_at(LoomVFIODMA *ctx, hwaddr iova)
+{
+    if (ctx->page_indexed) {
+        return g_hash_table_lookup(ctx->page_maps, page_key(iova));
+    }
+    for (GList *p = ctx->maps; p; p = p->next) {
+        LoomDMAMap *m = p->data;
+        if (iova >= m->iova && iova - m->iova < m->size) {
+            return m;
+        }
+    }
+    return NULL;
+}
+
+static LoomDMABuffer *buffer_at(LoomVFIODMA *ctx, hwaddr iova)
+{
+    if (ctx->page_indexed) {
+        return g_hash_table_lookup(ctx->page_buffers, page_key(iova));
+    }
+    for (GList *p = ctx->buffers; p; p = p->next) {
+        LoomDMABuffer *b = p->data;
+        if (iova >= b->iova && iova - b->iova < b->size) {
+            return b;
+        }
+    }
+    return NULL;
+}
 
 /* Linux enum dma_data_direction: bidirectional=0, to-device=1, from-device=2. */
 bool loom_vfio_dma_enabled(void)
@@ -57,8 +115,21 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
     }
     if (!bc->loom_dma) {
         bc->loom_dma = g_new0(LoomVFIODMA, 1);
+        bc->loom_dma->page_indexed = sizeof(uintptr_t) == 8 &&
+                                    qemu_real_host_page_size() == 4096;
+        if (bc->loom_dma->page_indexed) {
+            bc->loom_dma->page_maps = g_hash_table_new(g_direct_hash,
+                                                     g_direct_equal);
+            bc->loom_dma->page_buffers = g_hash_table_new(g_direct_hash,
+                                                        g_direct_equal);
+        }
     }
-    for (GList *p = bc->loom_dma->maps; p; p = p->next) {
+    page_index_layout(bc->loom_dma, iova, size);
+    if (bc->loom_dma->page_indexed && map_at(bc->loom_dma, iova)) {
+        return -EBUSY;
+    }
+    for (GList *p = bc->loom_dma->page_indexed ? NULL : bc->loom_dma->maps;
+         p; p = p->next) {
         m = p->data;
         if (iova < m->iova + m->size && m->iova < iova + size) {
             return -EBUSY;
@@ -75,6 +146,10 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
     m->size = size;
     m->readonly = readonly;
     bc->loom_dma->maps = g_list_prepend(bc->loom_dma->maps, m);
+    m->link = bc->loom_dma->maps;
+    if (bc->loom_dma->page_indexed) {
+        g_hash_table_insert(bc->loom_dma->page_maps, page_key(iova), m);
+    }
     bc->loom_dma->epoch++;
     *vaddr = m->pool;
     return 0;
@@ -84,16 +159,8 @@ static int pool_copy(LoomVFIODMA *ctx, hwaddr iova, uint8_t *buf,
                      uint64_t size, bool write)
 {
     while (size) {
-        LoomDMAMap *m = NULL;
+        LoomDMAMap *m = map_at(ctx, iova);
         uint64_t len;
-        for (GList *p = ctx->maps; p; p = p->next) {
-            LoomDMAMap *candidate = p->data;
-            if (iova >= candidate->iova &&
-                iova - candidate->iova < candidate->size) {
-                m = candidate;
-                break;
-            }
-        }
         if (!m) {
             return -EFAULT;
         }
@@ -154,6 +221,7 @@ void loom_vfio_dma_free(VFIOContainerBase *bc)
     g_list_free(bc->loom_dma->maps);
     g_list_free_full(bc->loom_dma->buffers, buffer_free);
     g_free(bc->loom_dma->read_buffer);
+    page_index_disable(bc->loom_dma);
     g_free(bc->loom_dma);
     bc->loom_dma = NULL;
 }
@@ -315,6 +383,16 @@ bool loom_vfio_dma_range_covered(VFIOContainerBase *bc, hwaddr iova,
         return false;
     }
     end = iova + size;
+    if (bc->loom_dma->page_indexed) {
+        for (pos = iova; pos < end; ) {
+            LoomDMABuffer *b = buffer_at(bc->loom_dma, pos);
+            if (!b) {
+                return false;
+            }
+            pos = MIN(end, b->iova + b->size);
+        }
+        return true;
+    }
     for (pos = iova; pos < end; ) {
         hwaddr covered = pos;
 
@@ -350,6 +428,41 @@ int loom_vfio_dma_sync_to_device_range(VFIOContainerBase *bc, hwaddr iova,
     end = iova + size;
     if (!loom_vfio_dma_range_covered(bc, iova, size)) {
         return -ENOENT;
+    }
+    /*
+     * Keep the general path's newest-registration-first publication order,
+     * including failure behavior and distinct IOVAs aliasing one guest page.
+     * Small native ranges need only a bounded stack array; larger ranges use
+     * the existing list rather than allocate a temporary sorting structure.
+     */
+    if (ctx->page_indexed && (end - 1) / 4096 - iova / 4096 < 16) {
+        LoomDMABuffer *selected[16];
+        unsigned count = 0;
+
+        for (hwaddr pos = iova; pos < end; ) {
+            LoomDMABuffer *b = buffer_at(ctx, pos);
+            unsigned n = count++;
+
+            while (n && selected[n - 1]->registration_sequence <
+                        b->registration_sequence) {
+                selected[n] = selected[n - 1];
+                n--;
+            }
+            selected[n] = b;
+            pos = MIN(end, b->iova + b->size);
+        }
+        for (unsigned n = 0; n < count; n++) {
+            LoomDMABuffer *b = selected[n];
+            hwaddr start = MAX(iova, b->iova);
+            hwaddr stop = MIN(end, b->iova + b->size);
+            LoomDMABuffer part = buffer_view(b, start - b->iova, stop - start);
+
+            ret = sync_buffer(bc, &part, true);
+            if (ret) {
+                return ret;
+            }
+        }
+        return 0;
     }
     for (GList *p = ctx->buffers; p; p = p->next) {
         LoomDMABuffer *b = p->data;
@@ -405,6 +518,34 @@ int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
     }
     if (!size || (iova + size < iova && iova + size != 0)) {
         return -EINVAL;
+    }
+    if (ctx->page_indexed && !(iova & 4095) && size == 4096) {
+        LoomDMABuffer *b = buffer_at(ctx, iova);
+        LoomDMAMap *m = map_at(ctx, iova);
+
+        if (b) {
+            ret = sync_buffer(bc, b, false);
+            if (ret) {
+                return ret;
+            }
+        }
+        loom_iavf_dma_invalidate_container(bc, iova, size);
+        if (b) {
+            if (ctx->buffers_tail == b->link) {
+                ctx->buffers_tail = b->link->prev;
+            }
+            g_hash_table_remove(ctx->page_buffers, page_key(iova));
+            ctx->buffers = g_list_delete_link(ctx->buffers, b->link);
+            buffer_free(b);
+        }
+        if (m) {
+            munmap(m->pool, m->size);
+            g_hash_table_remove(ctx->page_maps, page_key(iova));
+            ctx->maps = g_list_delete_link(ctx->maps, m->link);
+            g_free(m);
+        }
+        ctx->epoch++;
+        return 0;
     }
     /* A valid invalidation may extend to the end of the address space. */
     end = iova + size ? iova + size : UINT64_MAX;
@@ -464,11 +605,16 @@ int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
             ctx->buffers = g_list_insert_before(ctx->buffers, p,
                 buffer_slice(b, stop - b->iova, b->iova + b->size - stop));
         }
+        if (ctx->buffers_tail == p) {
+            ctx->buffers_tail = p->prev;
+        }
+        if (ctx->page_indexed) {
+            g_hash_table_remove(ctx->page_buffers, page_key(b->iova));
+        }
         ctx->buffers = g_list_delete_link(ctx->buffers, p);
         buffer_free(b);
     }
     ctx->epoch++;
-    ctx->buffers_tail = g_list_last(ctx->buffers);
     for (p = ctx->maps; p; p = next) {
         LoomDMAMap *m = p->data;
         hwaddr start = MAX(iova, m->iova);
@@ -491,6 +637,9 @@ int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
         if (start > m->iova) {
             m->size = start - m->iova;
         } else {
+            if (ctx->page_indexed) {
+                g_hash_table_remove(ctx->page_maps, page_key(m->iova));
+            }
             ctx->maps = g_list_delete_link(ctx->maps, p);
             g_free(m);
         }
@@ -623,7 +772,18 @@ int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
         return -EINVAL;
     }
     ctx = bc->loom_dma;
-    for (GList *p = ctx->buffers; p; p = p->next) {
+    page_index_layout(ctx, iova, size);
+    if (ctx->page_indexed) {
+        b = buffer_at(ctx, iova);
+        if (b) {
+            if (b->direction != direction || b->gpa != gpa) {
+                return -EINVAL;
+            }
+            b->references++;
+            return 0;
+        }
+    }
+    for (GList *p = ctx->page_indexed ? NULL : ctx->buffers; p; p = p->next) {
         b = p->data;
         if (b->iova == iova && b->size == size) {
             if (b->direction != direction || b->gpa != gpa) {
@@ -652,14 +812,9 @@ int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
         buffer_free(b);
         return -EIO;
     }
-    for (GList *p = ctx->maps; p; p = p->next) {
-        LoomDMAMap *m = p->data;
-
-        if (iova >= m->iova && size <= m->size &&
-            iova - m->iova <= m->size - size) {
-            b->pool = m->pool + iova - m->iova;
-            break;
-        }
+    LoomDMAMap *m = map_at(ctx, iova);
+    if (m && size <= m->size && iova - m->iova <= m->size - size) {
+        b->pool = m->pool + iova - m->iova;
     }
     ret = buffer_pool_copy(ctx, b, 0, b->baseline, size, true);
     if (ret) {
@@ -669,6 +824,15 @@ int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
     loom_iavf_dma_invalidate_container(bc, iova, size);
     ctx->epoch++;
     ctx->buffers = g_list_prepend(ctx->buffers, b);
+    b->link = ctx->buffers;
+    if (ctx->registration_sequence == UINT64_MAX) {
+        page_index_disable(ctx);
+    } else {
+        b->registration_sequence = ++ctx->registration_sequence;
+    }
+    if (ctx->page_indexed) {
+        g_hash_table_insert(ctx->page_buffers, page_key(iova), b);
+    }
     if (!ctx->buffers_tail) {
         ctx->buffers_tail = ctx->buffers;
     }
@@ -692,7 +856,15 @@ int loom_vfio_dma_command(VFIOContainerBase *bc, unsigned command,
         return loom_vfio_dma_register(bc, iova, iova, size, direction);
     }
     ctx = bc->loom_dma;
-    for (GList *p = ctx->buffers; p; p = p->next) {
+    if (ctx->page_indexed) {
+        b = buffer_at(ctx, iova);
+        if (b && ((b->iova == iova && b->size == size) ||
+            ((command == LOOM_DMA_SYNC_CPU || command == LOOM_DMA_SYNC_DEVICE) &&
+             size <= b->size && iova - b->iova <= b->size - size))) {
+            entry = b->link;
+        }
+    }
+    for (GList *p = ctx->page_indexed ? NULL : ctx->buffers; p; p = p->next) {
         b = p->data;
         if (b->iova == iova && b->size == size) {
             entry = p;
@@ -700,7 +872,7 @@ int loom_vfio_dma_command(VFIOContainerBase *bc, unsigned command,
         }
     }
     /* Range sync requests may cover a subsection of a streaming mapping. */
-    if (!entry && (command == LOOM_DMA_SYNC_CPU ||
+    if (!ctx->page_indexed && !entry && (command == LOOM_DMA_SYNC_CPU ||
                    command == LOOM_DMA_SYNC_DEVICE)) {
         for (GList *p = ctx->buffers; p; p = p->next) {
             b = p->data;
@@ -726,6 +898,9 @@ int loom_vfio_dma_command(VFIOContainerBase *bc, unsigned command,
             ctx->epoch++;
             if (ctx->buffers_tail == entry) {
                 ctx->buffers_tail = entry->prev;
+            }
+            if (ctx->page_indexed) {
+                g_hash_table_remove(ctx->page_buffers, page_key(b->iova));
             }
             ctx->buffers = g_list_delete_link(ctx->buffers, entry);
             buffer_free(b);
@@ -765,17 +940,8 @@ int loom_vfio_dma_read_cpu(VFIOContainerBase *bc, hwaddr iova,
         return -EINVAL;
     }
     while (size) {
-        LoomDMABuffer *found = NULL;
+        LoomDMABuffer *found = buffer_at(bc->loom_dma, iova);
         uint64_t offset, len;
-
-        for (GList *p = bc->loom_dma->buffers; p; p = p->next) {
-            LoomDMABuffer *b = p->data;
-
-            if (iova >= b->iova && iova - b->iova < b->size) {
-                found = b;
-                break;
-            }
-        }
         if (!found) {
             return -ENOENT;
         }
@@ -805,17 +971,8 @@ int loom_vfio_dma_read_baseline(VFIOContainerBase *bc, hwaddr iova,
         return -EINVAL;
     }
     while (size) {
-        LoomDMABuffer *found = NULL;
+        LoomDMABuffer *found = buffer_at(bc->loom_dma, iova);
         uint64_t offset, len;
-
-        for (GList *p = bc->loom_dma->buffers; p; p = p->next) {
-            LoomDMABuffer *b = p->data;
-
-            if (iova >= b->iova && iova - b->iova < b->size) {
-                found = b;
-                break;
-            }
-        }
         if (!found) {
             return -ENOENT;
         }

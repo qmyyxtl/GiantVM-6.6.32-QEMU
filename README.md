@@ -1155,3 +1155,39 @@ WARNING/BUG/DMA fault/QI error/TX timeout；HPET=hpet。
 guest #26、host内核和HPET未改，无新增实验文件。
 后续仍需削减完成方向扫描和范围查找成本，并进行受控性能对照；
 提交快路径命中不能证明总体目标完成或线性扩展。
+
+
+### Native 4 KiB DMA indexing (host-side, guest unchanged)
+
+A host-userspace-only CPU profile of a 12-second dual-NIC TX workload
+(cpu-clock:uH, excluding guest execution, host kernel time and blocked DSM
+waits) found substantial costs outside DSM. On Ezreal, self samples included
+completion memcmp 32.52%, DMA unmap 14.14%, coverage lookup 7.54%, map 4.52%,
+and registration 3.30%. These are sampled CPU proportions, not proportions of
+workload elapsed time. Inclusive call-tree percentages overlap and must not be
+added. The profile is diagnostic evidence, not a controlled throughput A/B.
+
+DMA containers now maintain page-to-map and page-to-buffer hash indexes while
+all successful mappings/registrations use aligned, disjoint 4 KiB IOVA pages on
+a 64-bit host with 4 KiB pages. Any other layout permanently falls back to the
+general ordered lists for that container. Mapping conflicts, references and
+final unregisters retain their existing semantics. Cached list links allow
+native single-page unmaps without whole-list searches or tail recomputation.
+Device writes are published before removal; publication failures preserve the
+mapping and index for retry. General partial unmaps retain slice positions.
+
+Coverage, CPU/baseline reads and small submission-range lookups use the index.
+Submission ranges touching at most 16 pages use a bounded stack array sorted
+by registration sequence, preserving newest-registration-first publication
+and failure order even when IOVA order differs or GPAs alias. Larger ranges
+retain the general ordered traversal. Completion snapshot and publication
+order remain unchanged; completion still scans registered buffers.
+
+Build and actual-source in-memory checks cover IOVA zero, duplicate/conflicting
+registrations, references, final unregister, failed unmap and retry, multi-page
+unmap, IOVA reuse with another GPA, GPA aliases, range publication order on
+failure, invalid sub-page invalidation, and fallback with partial-map splits.
+Existing RX/TX reuse, wrap, preflight/error, late-DMA completion, batching and
+BAR doorbell-order regressions pass. Runtime rollout and real-device validation
+of this revision are tracked separately; no scaling improvement is claimed
+from these source checks. Guest and HPET are unchanged.
