@@ -26,10 +26,11 @@ typedef struct LoomDMABuffer {
     unsigned direction, references;
     uint8_t *baseline, *scratch, *pool;
     bool snapshot_ready;
+    struct LoomDMABuffer *snapshot_next;
 } LoomDMABuffer;
 
 struct LoomVFIODMA {
-    GList *maps, *buffers;
+    GList *maps, *buffers, *buffers_tail;
     uint8_t *read_buffer;
 };
 
@@ -203,6 +204,7 @@ static int snapshot_from_device(VFIOContainerBase *bc, LoomDMABuffer *b)
     int ret;
 
     b->snapshot_ready = false;
+    b->snapshot_next = NULL;
     if (b->direction == 1) {
         return 0;
     }
@@ -258,6 +260,8 @@ static LoomDMABuffer *buffer_slice(LoomDMABuffer *b, uint64_t offset,
     }
     part->baseline = g_memdup2(b->baseline + offset, size);
     part->scratch = g_malloc(size);
+    part->snapshot_ready = false;
+    part->snapshot_next = NULL;
     return part;
 }
 
@@ -339,6 +343,7 @@ int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
         ctx->buffers = g_list_delete_link(ctx->buffers, p);
         buffer_free(b);
     }
+    ctx->buffers_tail = g_list_last(ctx->buffers);
     for (p = ctx->maps; p; p = next) {
         LoomDMAMap *m = p->data;
         hwaddr start = MAX(iova, m->iova);
@@ -371,6 +376,8 @@ int loom_vfio_dma_unmap(VFIOContainerBase *bc, hwaddr iova, uint64_t size)
 int loom_vfio_dma_sync(VFIOContainerBase *bc, bool to_device)
 {
     int ret;
+    LoomDMABuffer *ready = NULL;
+
     if (!bc || !bc->loom_dma) {
         return 0;
     }
@@ -441,18 +448,27 @@ int loom_vfio_dma_sync(VFIOContainerBase *bc, bool to_device)
      * a descriptor after publishing its payload can expose a newly completed
      * descriptor whose DMA payload arrived after that payload's scan.
      */
-    for (GList *p = g_list_last(bc->loom_dma->buffers); p; p = p->prev) {
-        ret = snapshot_from_device(bc, p->data);
+    /*
+     * Snapshot oldest first, prepend changed buffers, then publish newest
+     * first. Publication visits only changed snapshots without allocation.
+     */
+    for (GList *p = bc->loom_dma->buffers_tail; p; p = p->prev) {
+        LoomDMABuffer *b = p->data;
+
+        ret = snapshot_from_device(bc, b);
         if (ret) {
             return ret;
         }
-    }
-    for (GList *p = bc->loom_dma->buffers; p; p = p->next) {
-        LoomDMABuffer *b = p->data;
-
-        if (!b->snapshot_ready) {
-            continue;
+        if (b->snapshot_ready) {
+            b->snapshot_next = ready;
+            ready = b;
         }
+    }
+    while (ready) {
+        LoomDMABuffer *b = ready;
+
+        ready = b->snapshot_next;
+        b->snapshot_next = NULL;
         b->snapshot_ready = false;
         ret = merge_buffer(bc, b, b->scratch, false);
         if (ret) {
@@ -526,6 +542,9 @@ int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
         return ret;
     }
     ctx->buffers = g_list_prepend(ctx->buffers, b);
+    if (!ctx->buffers_tail) {
+        ctx->buffers_tail = ctx->buffers;
+    }
     return 0;
 }
 
@@ -576,6 +595,9 @@ int loom_vfio_dma_command(VFIOContainerBase *bc, unsigned command,
             return ret;
         }
         if (!--b->references) {
+            if (ctx->buffers_tail == entry) {
+                ctx->buffers_tail = entry->prev;
+            }
             ctx->buffers = g_list_delete_link(ctx->buffers, entry);
             buffer_free(b);
         }
