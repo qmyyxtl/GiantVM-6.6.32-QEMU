@@ -2695,3 +2695,82 @@ Garen worker-g4 PID6122保留，host/guest内核和模块参数保持。
 同一master的本地网卡和远端MMIO可能竞争BQL，需要实际等待证据。
 先区分服务端排队/执行与传输/唤醒，再选择可保持HPET的通用路由优化，
 不以本次睡眠比例推断带宽损失，也不把架构RPC开销全归因DSM。
+
+### 2026-10-11：master MMIO 分解与稳定 BAR miss 快速排除
+
+原代码运行PID3836434/TID3836731，22秒探针窗口，
+仅在handler消息type2范围记录函数累计墙钟（可嵌套，不相加）。
+MMIO handler25198次/2953.435ms；loom_pci_handle_mmio25198次/2113.178ms；
+HPET地址address_space_rw25193次/494.399ms；
+hpet_ram_read25193次/75.157ms；rdma_send_msg25196次/173.654ms；
+范围内bql_lock_impl201584次/1994.325ms（约每完成请求8次）。
+同线程各阶段无嵌套冲突。边界跨probe attach/detach计数差，
+以及uprobes对所有本地热BQL调用的扰动使吞吐降到67..74MiB/s，
+本窗口不能当实际延迟/吞吐基线或用其占比估算性能收益。
+
+源码解释：HPET也先走loom_pci_handle_mmio→bar_access，
+分别对3个本地设备snapshot_bars、refresh_remote_mappings、
+3个远端设备snapshot_bars，均可能获取BQL；
+确认不属于PCI后，再经address_space_rw获取BQL读HPET。
+回复发送已在address_space_rw释放BQL之后，不持BQL等待发送CQ。
+
+代码9cfe76fc2c新增默认关闭的
+`qom-set path=/machine property=loom-bar-negative-filter value=true/false`。
+两端分别设置。稳定miss前置检查持一段BQL和directory_lock，
+使用本地真实prefix与远端已发布incoming prefix直接检查BAR范围，
+无新地址缓存、无配置快照复制、无新远端RPC。
+只有确认不可能命中才直接返回false，随后照常访问原MMIO设备。
+BAR命中仍走原snapshot/generation/execute路径；不改变HPET设备或时钟。
+目录控制未激活、missing prefix、odd reset sequence，或directory_epoch
+不等于applied_directory_epoch（代理映射尚待应用）都回到原完整扫描。
+后者避免跳过更新映射导致访问仍映射的旧BAR。
+BQL→directory_lock顺序与现有snapshot相同；已有BQL保持，不释放调用方锁。
+
+实际bar_access_may_match源码memfd ASan/UBSan测试6046案例通过：
+本地/远端BAR和边界、I/O vs MMIO、overflow、未知/odd prefix、
+迁移待应用与应用后的旧/新地址、锁获取与恢复、3000随机配置。
+外部状态和锁为stub，测试不等同真实设备热拔插/迁移全流程验证。
+两端ninja/diffcheck通过，正常guest poweroff两端EXIT0、
+VF恢复iavf/refcnt0后新版本启动，原#26/4CPU/HPET，owner pings均3/3。
+
+同一次启动六组交替OFF/ON，两个owner各2本地CPU worker、6秒到Jinx；
+Garen先、Ezreal后，不是并行聚合；无BCC/perf性能窗口。
+24次卡测试/48条流字节及内容校验全部通过。
+
+| 吞吐 MiB/s | OFF中位数 | ON中位数 | 变化 | ON胜出 |
+|---|---:|---:|---:|---:|
+| Garen卡 | 218.241 | 212.504 | -2.63% | 3/6 |
+| Ezreal卡 | 184.670 | 187.230 | 1.39% | 2/6 |
+
+配对原始值（pair/ON/G/E）：
+```
+0 0 203.573 170.971
+0 1 220.937 187.908
+1 1 199.912 186.552
+1 0 227.023 191.684
+2 0 234.783 191.282
+2 1 243.784 181.153
+3 1 214.493 174.621
+3 0 235.224 178.058
+4 0 206.924 156.925
+4 1 210.514 207.919
+5 1 195.520 195.468
+5 0 209.458 206.311
+```
+
+独立操作计数探针窗口12秒/模式，用真实handler数据过滤type2和HPET地址，
+统计每个完成handler范围的BQL进入次数；
+全部探针attach完成后才打开记录开关，先冻结记录再detach：
+OFF11111次请求/88888次BQL，每次min=max=8；
+ON17364次请求/34728次BQL，每次min=max=2。
+即本范围实际75%更少获取，但请求次数不同，不能比较原始总数或将75%
+解释为吞吐提升。每窗口Garen另跑一轮6秒TX内容验证，带探针吞吐不作基线。
+初次仅detach后读取记录出现边界请求min0，已废弃该初次读数，
+改用明确记录开关冻结重测得到上面的完整范围计数。
+
+操作减少成立，稳定吞吐收益未证明，不默认或运行时启用：两端已OFF读回。
+CQ短轮询仍0。guest错误级dmesg为空，CPU0-3/HPET保持，
+Jinx临时IP和收发进程正常清理，没有实验脚本/日志/新磁盘文件。
+当前巨虚正常运行，Garen另一个worker-g4保持，不使用Lux。
+下一步仍需区分剩余BQL排队、设备DMA/vIOMMU处理及DSM，
+不能由本次减少操作推断全部竞争已消失。
