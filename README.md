@@ -1665,7 +1665,7 @@ Lost Samples=0、memfd 1.160 MB，调用栈明确为 recv_thread_func。
 最终 CPU 0–3 在线、hpet，两端 QMP pair=false，所检查 BUG/DMA/QI/TX timeout
 错误为空；采样进程、memfd、Jinx 接收端/临时地址已清理，host 未重启。
 
-## RDMA 请求接收 CQ 事件等待（默认关闭，待真实 RDMA 验证）
+## RDMA 请求接收 CQ 事件等待（默认关闭）
 
 `LOOM_RDMA_RECV_CQ_EVENTS=1` 仅为专用请求接收连接创建非阻塞 completion
 channel。同步响应 CQ 与发送完成 CQ 保留原来的单消费者轮询语义，
@@ -1696,3 +1696,68 @@ stop/超时、notify/poll/get 错误回退、错误 CQ 的 ack 与旧轮询分�
 Ezreal 构建通过；两端运行中的 QEMU 仍为旧代码 `6af87e7c27`，
 没有启用新的事件路径。下一步完成两端构建与部署，核实实际模式、
 真实消息和 shutdown、idle/active CPU，再测单卡吞吐，不能提前宣称收益。
+
+## RDMA CQ 事件模式真实验证（2026-10-10）
+
+两端源码和运行版本均为 `e423ada678`，通过 sudo env 显式设置
+`LOOM_RDMA_RECV_CQ_EVENTS=1`。两端启动日志确认 receive CQ 为 events；
+Garen 接收线程的实际 poll 参数为两个 fd、100 ms 超时，fd 分别指向
+infinibandevent 与 eventfd，确认走到事件等待。guest #26、HPET、规格、
+context 缓存、buffer reuse 保持不变，QI 成对读取关闭。
+
+24 秒活动窗口 /proc 监测：接收线程 host CPU 0.42 秒、
+33767 次 voluntary context switch；旧轮询诊断窗口分别为 4.96 秒、
+1848245 次。新窗口有发送测试但没有 perf/BPF；旧窗口还有 perf 采样，
+两次启动及负载不同。这些数值说明观测到的接收线程固定成本下降，
+不作为严格同启动性能收益百分比。24 秒无测试流量窗口还有 guest
+后台消息，接收线程 CPU 0.18 秒、12033 次 voluntary context switch，
+poll wchan 占 468/473 个快照。
+
+无监测单 VF→第三方 Jinx、两个 CPU0/1 worker、每轮6秒、三轮：
+155.19/152.30/131.00 MiB/s，中位数152.30，接收字节和内容校验通过。
+单卡主要差距仍在；此版本没有证明稳定吞吐提升。TCP 重传修复仍暂停。
+10 秒健康窗口两端 watchdog/GET_STATS 分别5/4次，
+检查的 BUG、DMA/QI 错误及 TX timeout 为空，HPET 为 hpet。
+
+随后实际正常 guest poweroff：两端 QEMU 均 EXIT0；针对真实进程的
+rdma_router_cleanup 入口/返回探针在每端各计数一次，证实 cleanup 返回，
+没有卡在 join 或 CQ 清理。该证据不代表旧连接所有资源回收均已完善。
+测试接收进程、探针、memfd 和 Jinx 临时地址已清理，之后重新启动事件模式。
+公平的同启动 poll/events 吞吐对照尚未实现；当前开关只在初始化读取，
+不能把两次启动的数值当成严格 A/B。
+
+## 事件模式下远端 CPU offline 单卡/单盘对照（2026-10-10）
+
+按用户要求，在上述 CQ events 模式同一次启动内，A 全部在线→B guest CPU2/3
+offline→A2 恢复全部在线。运行代码 `e423ada678`，未改 guest/host 内核、
+QEMU 代码、HPET、4 GiB 两 NUMA 节点及 host 线程 mask。仅改变 CPU online
+配置；两个发送/读取 worker 固定 guest CPU0/1，设备均为 Garen owner0。
+
+| 项目（MiB/s，中位数） | A CPU0–3 | B CPU0–1 | A2 CPU0–3 |
+| --- | ---: | ---: | ---: |
+| 单 VF→第三方 Jinx | 135.17 | 188.33 | 153.56 |
+| 1 GiB raw 单盘读 | 1807.97 | 1877.53 | 1788.16 |
+
+网卡每状态三轮各6秒，所有接收字节/内容校验通过：
+A 134.48/140.53/135.17，B 173.70/188.33/205.86，
+A2 152.28/153.56/170.93。B 比 A 高39.33%，比A2高22.64%。
+这是远端 CPU 活动有额外成本的信号；短窗口与顺序波动仍存在，
+尚不能区分 DSM、远端中断与其他共享路径，也没有消除主要单卡差距。
+CPU offline 不移除远端内存，不能据此声称 DSM 已被排除。
+
+单盘只读，使用仓库脚本的 Linux AIO ABI/磁盘 serial、容量校验定义，
+在内存中构造两个 worker、O_RDONLY|O_DIRECT、1 MiB、每 worker QD4，
+分别循环读取各512 MiB范围；每状态2秒预热、三轮各8秒，不写盘。
+缓冲区由对应本地 CPU first-touch。所有 AIO completion 为完整1 MiB、无错误：
+A 1816.51/1722.79/1807.97，B 1890.89/1746.32/1877.53，
+A2 1788.16/1687.61/1819.47。B 比 A/A2 高3.85%/5.00%，样本重叠，
+不能认定稳定读带宽提升；未进行本轮写测试或大数据集持续介质测试。
+
+CPU2/3 已恢复。恢复后重新设 NIC owner-local IRQ，CPU2和3各经远端 NIC
+ping3次，均成功；实际有效 IRQ 本地37/38/39为0/0/1，
+远端40/41/42为2/3/2，再测A2。测试进程全部结束，Jinx临时198.18.10.3
+地址已删除，没有创建实验文件。巨虚保持CPU0–3在线和events模式运行，
+Garen已有libvirt VM未改。
+
+最终10秒健康窗口两端 watchdog 和成功 GET_STATS 各5次；所检查错误为空，
+HPET为hpet，两张NIC的discard/tx_errors均为0（非整个历史无丢包证明）。
