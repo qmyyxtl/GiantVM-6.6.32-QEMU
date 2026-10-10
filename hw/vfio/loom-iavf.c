@@ -261,8 +261,9 @@ static LoomIAVFQueues *queues_get(VFIODevice *dev)
 {
     LoomIAVFQueues *s;
 
-    if (!dev->loom_iavf_irq_control ||
-        !dev->bcontainer || !dev->bcontainer->loom_dma) {
+    /* Physical queue bases are programmed before their first active pool. */
+    if (!dev->loom_iavf_irq_control || !dev->bcontainer ||
+        (!dev->bcontainer->loom_dma && !dev->bcontainer->loom_ram)) {
         return NULL;
     }
     if (!dev->loom_iavf_queues) {

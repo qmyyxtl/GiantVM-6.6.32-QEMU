@@ -2937,3 +2937,47 @@ guest 内核、HPET 和运行中巨虚配置保持不变。
 NIC 所有字节/内容验证通过；读 completion 长度正确。
 最后 CPU0-3 恢复、中断请求亲和性恢复错误列表为空、guest 错误级 dmesg 为空；
 Jinx 临时接收端/地址已清理，不使用 Lux、不改 guest、不生成实验文件。
+
+
+### 2026-10-11：保留稀疏页首次注册前后的队列配置
+
+接入前源码核对发现两处 bootstrap 不兼容：
+queues_get 原来要求已经存在 loom_dma，因而第一块 pool 创建前的
+AdminQ base/count 写入不会被记录；register 完成初始化时原有
+loom_iavf_dma_invalidate_container 又会在页与 ring 相交时 reset，
+清空之前已观察的 base/count。稀疏模式若照搬此顺序无法可靠启动。
+
+现在允许已存在合法 RAM 授权对象（loom_ram）但尚无 active pool 的
+已识别 X710 VF 创建观察状态；普通非 staging/无授权路径保持原检查。
+materialize 完整预检且只映射未拥有的新页时设置 BQL 内部 materializing 标志，
+registration_invalidate 仅在这个新页初始化阶段保留观察状态。
+不省略 ordinary translated registration、unmap/revoke 和失败回滚的失效；
+失败内层 map_full 自身清理也仍失效，新页失败不能保留可运行假象。
+成功及失败均退出 materializing，嵌套 materialize 返回 EBUSY。
+已覆盖且身份/权限一致的暖页请求在完整预检后直接返回，
+不分配 rollback array；有缺页时仅为缺页数分配。
+
+memfd GCC ASan/UBSan 检查当前实际 core/map_full/map_iommu/
+registration_invalidate，并校验生产 register 只使用该 hook：
+4000 步状态操作及定向检查共 348856 次断言 PASS。
+新增检查覆盖新页初始化保留观察状态、scope 外失效、失败/撤销继续失效、
+scope 清理/重入拒绝、暖页与失败预检不发生 g_new 分配。
+外部 CPU/pool/hardware map/unmap 与失效回调仍是模拟边界，
+不把此测试称为真实 VFIO 或完整 register 的硬件测试。
+另抽取当前实际 iavf 类型、queues_get/observe_write/reset/
+queues_invalidate 函数，外部 DMA baseline/request 回调模拟：
+14 项 bootstrap 检查 PASS，确认第一块 pool 前可记录 ASQ/ARQ base/count，
+pool 出现后保留状态，原非授权路径仍需要 loom_dma，reset 清除配置。
+QEMU 编译与 git diff --check 通过。
+
+读取当前未改动 guest drivers/net/ethernet/intel/iavf/iavf_adminq.c
+iavf_config_asq_regs/config_arq_regs 的实际顺序：
+head/tail 清0 → 写 LEN enable → 写 BAL low → 写 BAH high；
+ARQ 最后再写 tail=count-1，ASQ 日后提交时写 tail。
+所以“只在 tail 时 materialize，但之前完全原样转发 enable”
+尚不足以证明首次硬件访问的安全顺序。
+后续要完整处理 guest-visible queue 配置、实际硬件启用的先后关系，
+以及重配置/reset/拒绝未知状态，不能在 base/count 尚不完整时猜 GPA。
+这仍是启动接入前的修正，没有 MemoryListener 授权入口、
+没有物理 DMA 启动开关，运行巨虚仍是原 vIOMMU 路径；
+不宣称当前带宽改善或原型已能启动，不改 guest 或 HPET。

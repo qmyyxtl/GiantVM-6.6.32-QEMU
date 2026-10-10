@@ -56,6 +56,7 @@ struct LoomVFIODMA {
 };
 
 static void loom_vfio_ram_free(VFIOContainerBase *bc);
+static bool loom_vfio_ram_materializing(VFIOContainerBase *bc);
 
 /*
  * Native guest VT-d buffers describe disjoint 4 KiB pages. Index these pages
@@ -1016,6 +1017,20 @@ int loom_vfio_dma_sync(VFIOContainerBase *bc, bool to_device)
 }
 
 /*
+ * The first physical page registration cannot replace a previous DMA lifetime:
+ * materialize preflights the whole request and skips every already-owned page.
+ * Preserve queue bases/counts discovered before their first active pool exists.
+ * Ordinary translated registration, rollback and revocation retain invalidation.
+ */
+static void registration_invalidate(VFIOContainerBase *bc, hwaddr iova,
+                                     uint64_t size)
+{
+    if (!loom_vfio_ram_materializing(bc)) {
+        loom_iavf_dma_invalidate_container(bc, iova, size);
+    }
+}
+
+/*
  * Guest physical memory and device-visible IOVA need not be identical.
  * Standard IOMMU notifications can register the translated GPA here; the
  * legacy bridge remains an identity-address caller until it is retired.
@@ -1082,7 +1097,7 @@ int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
         buffer_free(b);
         return ret;
     }
-    loom_iavf_dma_invalidate_container(bc, iova, size);
+    registration_invalidate(bc, iova, size);
     ctx->epoch++;
     b->generation = ctx->epoch;
     ctx->buffers = g_list_prepend(ctx->buffers, b);
@@ -1337,8 +1352,13 @@ typedef struct LoomRAMRange {
 
 struct LoomVFIORAM {
     GList *ranges;
-    bool failed;
+    bool failed, materializing;
 };
+
+static bool loom_vfio_ram_materializing(VFIOContainerBase *bc)
+{
+    return bc->loom_ram && bc->loom_ram->materializing;
+}
 
 static void loom_vfio_ram_free(VFIOContainerBase *bc)
 {
@@ -1442,7 +1462,7 @@ int loom_vfio_ram_materialize(VFIOContainerBase *bc, hwaddr addr, uint64_t size,
                               bool device_writes)
 {
     hwaddr start, end, page, *created;
-    unsigned count = 0;
+    unsigned count = 0, needed = 0;
     int ret = 0;
     VFIOIOMMUClass *vioc;
 
@@ -1458,6 +1478,9 @@ int loom_vfio_ram_materialize(VFIOContainerBase *bc, hwaddr addr, uint64_t size,
     if (!size || size > 64 * MiB || addr > UINT64_MAX - size ||
         addr + size > UINT64_MAX - 4095) {
         return -EINVAL;
+    }
+    if (bc->loom_ram->materializing) {
+        return -EBUSY;
     }
     start = addr & ~UINT64_C(4095);
     end = (addr + size + 4095) & ~UINT64_C(4095);
@@ -1477,10 +1500,17 @@ int loom_vfio_ram_materialize(VFIOContainerBase *bc, hwaddr addr, uint64_t size,
                 b->direction != (r->readonly ? 1 : 0) || b->pool != m->pool) {
                 return -ESTALE;
             }
+        } else {
+            needed++;
         }
     }
+    /* A warm queue reuses its physical pages without allocating rollback state. */
+    if (!needed) {
+        return 0;
+    }
     vioc = VFIO_IOMMU_GET_CLASS(bc);
-    created = g_new(hwaddr, (end - start) / 4096);
+    created = g_new(hwaddr, needed);
+    bc->loom_ram->materializing = true;
     for (page = start; page < end; page += 4096) {
         LoomRAMRange *r = ram_range_at(bc, page);
 
@@ -1495,9 +1525,11 @@ int loom_vfio_ram_materialize(VFIOContainerBase *bc, hwaddr addr, uint64_t size,
         }
         created[count++] = page;
     }
+    bc->loom_ram->materializing = false;
     g_free(created);
     return 0;
 rollback:
+    bc->loom_ram->materializing = false;
     while (count) {
         page = created[--count];
         if (vioc->dma_unmap(bc, page, 4096, NULL) ||
