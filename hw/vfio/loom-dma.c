@@ -54,6 +54,8 @@ struct LoomVFIODMA {
     LoomDMABuffer *free_buffers[64];
     bool skip_redundant_zero;
     bool cache_publication;
+    bool pin_publication;
+    bool publication_failed;
 };
 
 static void loom_vfio_ram_free(VFIOContainerBase *bc);
@@ -284,6 +286,9 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
         const char *publication = getenv("LOOM_VFIO_PUBLICATION_CACHE");
         bc->loom_dma->cache_publication =
             !publication || strcmp(publication, "0");
+        const char *pin = getenv("LOOM_VFIO_PUBLICATION_PIN");
+        /* Requires a kernel with atomic, lock-free DSM unpin. */
+        bc->loom_dma->pin_publication = pin && !strcmp(pin, "1");
         const char *buffers = getenv("LOOM_VFIO_BUFFER_RECYCLE");
         bc->loom_dma->recycle_buffers =
             !buffers || strcmp(buffers, "0");
@@ -473,15 +478,112 @@ static uint64_t skip_matching_bytes(const uint8_t *a, const uint8_t *b,
     return pos;
 }
 
+/*
+ * Amortize the DSM syscall boundary only for fragmented, single-page writes.
+ * Keep the first changed run on the established path. At least four remaining
+ * runs justify the two pin/unpin ioctls; counting stops once that bound is met.
+ */
+static bool publication_has_four_runs(const uint8_t *snapshot,
+                                       const uint8_t *baseline,
+                                       uint64_t pos, uint64_t size)
+{
+    unsigned runs = 0;
+
+    while (pos < size) {
+        uint64_t start;
+
+        pos = skip_matching_bytes(snapshot, baseline, pos, size, true);
+        start = pos;
+        pos = skip_matching_bytes(snapshot, baseline, pos, size, false);
+        if (pos == start) {
+            break;
+        }
+        if (++runs == 4) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * A successful, single-page write pin acquires the DSM owner before exposing
+ * a temporary direct RAM pointer. Single-page bounds avoid partial pin rollback.
+ * The cache still writes only changed runs, with normal dirty/TB accounting.
+ * No kernel lock is needed to unpin on the supported atomic-unpin kernels.
+ */
+static int publication_pin(VFIOContainerBase *bc, MemoryRegionCache *cache,
+                            const uint8_t *snapshot, const uint8_t *baseline,
+                            uint64_t pos, uint64_t size, bool *pinned)
+{
+    MachineState *ms;
+    uint8_t *host;
+    struct kvm_dsm_mempin pin;
+    int ret;
+
+    *pinned = false;
+    if (!bc->loom_dma->pin_publication || cache->ptr || !kvm_enabled() ||
+        qemu_real_host_page_size() != 4096 || size > 4096 ||
+        !publication_has_four_runs(snapshot, baseline, pos, size)) {
+        return 0;
+    }
+    ms = MACHINE(qdev_get_machine());
+    if (ms->local_cpus == ms->smp.cpus || ms->shm_path) {
+        return 0;
+    }
+    host = qemu_map_ram_ptr(cache->mrs.mr->ram_block, cache->xlat);
+    if (!host || ((uintptr_t)host & 4095) + size > 4096) {
+        return 0;
+    }
+    pin = (struct kvm_dsm_mempin) {
+        .write = true, .host_virt_addr = (uintptr_t)host, .length = size,
+    };
+    ret = kvm_vm_ioctl(kvm_state, KVM_DSM_MEMPIN, &pin);
+    if (ret) {
+        return ret < 0 ? ret : -EIO;
+    }
+    cache->ptr = host;
+    *pinned = true;
+    return 0;
+}
+
+static int publication_unpin(VFIOContainerBase *bc, MemoryRegionCache *cache)
+{
+    struct kvm_dsm_mempin pin = {
+        .write = true, .unpin = true,
+        .host_virt_addr = (uintptr_t)cache->ptr, .length = cache->len,
+    };
+    int ret;
+
+    /* All changed bytes and baseline/dirty updates precede release. */
+    smp_wmb();
+    ret = kvm_vm_ioctl(kvm_state, KVM_DSM_MEMPIN, &pin);
+    cache->ptr = NULL;
+    if (ret) {
+        /*
+         * Keep the device staging mappings intact. Subsequent publications
+         * must fail too: a failed release cannot be treated as normal success.
+         * Existing VFIO callers stop the VM on publication errors.
+         */
+        bc->loom_dma->publication_failed = true;
+        error_report("Loom DMA publication unpin failed: %s",
+                     strerror(ret < 0 ? -ret : EIO));
+        return ret < 0 ? ret : -EIO;
+    }
+    return 0;
+}
+
 static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b,
                          uint8_t *snapshot, bool to_device)
 {
     MemoryRegionCache cache = { 0 };
     uint64_t pos = 0;
     unsigned runs = 0;
-    bool cached = false, locked = false;
+    bool cached = false, locked = false, pinned = false;
     int ret = 0;
 
+    if (bc->loom_dma->publication_failed) {
+        return -EIO;
+    }
     if (!memcmp(snapshot, b->baseline, b->size)) {
         return 0;
     }
@@ -503,8 +605,9 @@ static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b,
              * RAM publication, translate once from the second run onward.
              * This cache lives only for this merge, under BQL and RCU: no RAM
              * topology or DMA registration can outlive its invocation.
-             * DSM caches have a NULL direct pointer and use the existing
-             * KVM_DSM_MEMCPY slow path; never bypass replica ownership.
+             * DSM caches normally use KVM_DSM_MEMCPY. An optional bounded
+             * write pin may supply a direct pointer only after acquiring the
+             * owner, and must release it before this invocation returns.
              */
             if (++runs == 2 && bc->loom_physical &&
                 bc->loom_dma->cache_publication && bql_locked()) {
@@ -514,6 +617,13 @@ static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b,
                             &address_space_memory, b->gpa, b->size, true)
                             == b->size &&
                          memory_access_is_direct(cache.mrs.mr, true);
+                if (cached) {
+                    ret = publication_pin(bc, &cache, snapshot, b->baseline,
+                                           start, b->size, &pinned);
+                    if (ret) {
+                        break;
+                    }
+                }
                 if (!cached) {
                     address_space_cache_destroy(&cache);
                     rcu_read_unlock();
@@ -539,6 +649,13 @@ static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b,
             break;
         }
         memcpy(b->baseline + start, snapshot + start, pos - start);
+    }
+    if (pinned) {
+        int release_ret = publication_unpin(bc, &cache);
+
+        if (release_ret) {
+            ret = release_ret;
+        }
     }
     if (locked) {
         address_space_cache_destroy(&cache);
