@@ -842,3 +842,14 @@ word 仍逐字节寻找精确边界。XOR 的零字节检测判断是否存在�
 未变化字节保留目标中的独立更新；map/unmap 生命周期、错误重试、
 GPA 批次及 24 种完成交错检查通过。不包含 DSM，不构成端到端
 性能提升证明；真实设备部署结果另行补充。
+
+415f82aca9 已在两端构建并正常重启自己的 QEMU；guest #26/HPET
+不变。两 VF 的队列重配/ping 通过，各 4 MiB RX 内容/长度通过，
+rx_discards 增量 69/39，仍有丢包。双卡四 worker TX 内容/长度
+通过，短时 25.62 MiB/s，连接重传 0/1/0/1；双盘四 worker
+O_RDONLY/O_DIRECT 只读回归 3222 MiB/s。未进行同条件多轮
+正式基线，不把这些波动解释为优化带来的吞吐提升。
+负载后 10 秒两 adapter 各 5 次 watchdog/5 个成功 GET_STATS，
+无 WARNING/BUG/DMA fault/QI error/TX timeout，clocksource=hpet。
+收发进程、observer、临时探针已退出/清理。自己的 QEMU 保留运行，
+host PF up；Garen 原 libvirt VM、host 内核、Lux 未动。
