@@ -1949,3 +1949,54 @@ walk无错误，探针外hook/physical unmap为0。该统计未额外检查zero 
 只证明几何合并机会，不是已实现收益。发送113.84/109.26/107.62 MiB/s
 且内容/字节通过，强探针开销明显，不作无探针性能基线。
 当前尚需两端部署、实测开关与host unmap减少、健康/退出及同启动吞吐。
+
+## Unmap 合并真实验证及硬件 flush 边界（2026-10-10）
+
+两端构建/运行 `2d95e06d8c`，guest#26、4CPU/4GiB、HPET和IRQ配置不变。
+同一次启动两端QMP反复关闭/开启并读回确认；CQ events开启、QI pair关闭。
+
+独立12秒强探针窗口，Garen单VF CPU0/1→Jinx，含一次6秒发送：
+OFF 200486条guest 4KiB UNMAP→200486次legacy unmap，
+实际byte覆盖821190656，恰为200486*4096。
+ON 173721条guest 4KiB UNMAP→52991次legacy unmap，
+实际byte覆盖711561216，恰为173721*4096；合并后的实际请求size为
+4KiB 23363次、8KiB 9299次、16KiB 7718次、32KiB 12611次。
+按每条guest unmap归一化，legacy调用由1降到0.305（约减少69.5%）。
+两窗口流量不同，不直接比较调用总数；walk无错误、无scope外调用，
+发送内容/字节通过。探针影响很大，不用窗口吞吐证明收益。
+
+无探针同启动，交替OFF/ON、ON/OFF、OFF/ON，每样本6秒、两CPU0/1 worker：
+OFF 133.00/115.16/121.59，中位数121.59 MiB/s；
+ON 155.67/120.00/123.59，中位数123.59 MiB/s。
+样本重叠，观察约+1.64%，未证明稳定吞吐收益；所有内容/字节校验通过。
+
+为区分ioctl与硬件失效，另在两个12秒窗口，PID过滤同时计数实际legacy
+unmap和内核intel_iommu_tlb_sync：
+| 模式 | legacy调用 | unmap覆盖字节/4096 | TLB sync |
+| --- | ---: | ---: | ---: |
+| OFF | 219952 | 219952 | 219952 |
+| ON | 69146 | 235143 | 235143 |
+
+TLB sync entry/return计数一致；受探针影响的累计时长分别0.456853/
+0.481387秒，不能作为无探针性能对照。实证：每4KiB仍有一次硬件sync，
+虽ioctl约减少70.6%，硬件失效并未合并。
+host源码vfio_dma_do_unmap逐vfio_dma对象执行vfio_unmap_unpin；
+后者每对象独立iotlb_gather，vfio_sync_unpin先sync再释放该对象的页。
+因此QEMU通知合并只是前提，不能宣称已经实现跨DMA对象的flush批处理。
+
+开启状态10秒控制健康通过；随后正常guest poweroff，两端QEMU EXIT0，
+没有unmap、CQ join或退出卡住。关机后Garen vfio_iommu_type1 refcnt=0，
+既有libvirt VM PID6122仍运行；仅观察模块，未卸载/替换host模块。
+两端随后重新启动本版本，补做Ezreal owner1网卡功能验证：
+开启合并，worker CPU2/3、enp0s8→第三方Jinx198.18.11.3，
+一次6秒约183.20 MiB/s，接收端源IP198.18.11.2，字节/内容校验通过。
+此功能脚本沿用了case名Garen，实际interface/CPU/IP确定设备owner1；
+单样本不作为Ezreal性能基线。
+
+最终合并恢复OFF（源码默认OFF），CQ events保持ON。CPU0–3在线，
+HPET未改，实验接收端、所有probe/memfd和Jinx临时地址均清理。
+下一步评估host VFIO同一次请求内共享gather、flush后才unpin的方案；
+先完成源代码审查/测试和模块构建，再考虑部署，保留DMA隔离与失败回退。
+
+重启后最终10秒两端watchdog/成功GET_STATS各5次，检查错误为空，
+HPET=hpet，discard/tx_errors=0（不代表整个历史无丢包）。两端运行正常。
