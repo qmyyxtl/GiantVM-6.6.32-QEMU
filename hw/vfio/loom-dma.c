@@ -20,7 +20,7 @@ typedef struct LoomDMAMap {
 } LoomDMAMap;
 
 typedef struct LoomDMABuffer {
-    hwaddr iova;
+    hwaddr iova, gpa;
     uint64_t size;
     unsigned direction, references;
     uint8_t *baseline, *scratch;
@@ -155,7 +155,7 @@ static int sync_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
         return 0;
     }
     if (to_device) {
-        if (address_space_read(&address_space_memory, b->iova,
+        if (address_space_read(&address_space_memory, b->gpa,
                                MEMTXATTRS_UNSPECIFIED, b->scratch, b->size)
             != MEMTX_OK) {
             return -EIO;
@@ -188,7 +188,7 @@ static int sync_buffer(VFIOContainerBase *bc, LoomDMABuffer *b, bool to_device)
             ret = pool_copy(bc->loom_dma, b->iova + start,
                              b->scratch + start, pos - start, true);
         } else {
-            ret = address_space_write(&address_space_memory, b->iova + start,
+            ret = address_space_write(&address_space_memory, b->gpa + start,
                                        MEMTXATTRS_UNSPECIFIED,
                                        b->scratch + start, pos - start)
                   == MEMTX_OK ? 0 : -EIO;
@@ -220,6 +220,64 @@ int loom_vfio_dma_sync(VFIOContainerBase *bc, bool to_device)
     return 0;
 }
 
+/*
+ * Guest physical memory and device-visible IOVA need not be identical.
+ * Standard IOMMU notifications can register the translated GPA here; the
+ * legacy bridge remains an identity-address caller until it is retired.
+ */
+int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
+                           uint64_t size, unsigned direction)
+{
+    LoomVFIODMA *ctx;
+    LoomDMABuffer *b;
+    int ret;
+
+    if (!bc || !bc->loom_dma) {
+        return -ENODEV;
+    }
+    if (!size || size > 64 * MiB || iova + size < iova ||
+        gpa + size < gpa || direction > 2) {
+        return -EINVAL;
+    }
+    ctx = bc->loom_dma;
+    for (GList *p = ctx->buffers; p; p = p->next) {
+        b = p->data;
+        if (b->iova == iova && b->size == size) {
+            if (b->direction != direction || b->gpa != gpa) {
+                return -EINVAL;
+            }
+            b->references++;
+            return 0;
+        }
+        /* Conflicting translations must not share device-visible bytes. */
+        if (iova < b->iova + b->size && b->iova < iova + size &&
+            gpa - iova != b->gpa - b->iova) {
+            return -EBUSY;
+        }
+    }
+    b = g_new0(LoomDMABuffer, 1);
+    b->iova = iova;
+    b->gpa = gpa;
+    b->size = size;
+    b->direction = direction;
+    b->references = 1;
+    b->baseline = g_malloc(size);
+    b->scratch = g_malloc(size);
+    if (address_space_read(&address_space_memory, gpa,
+                           MEMTXATTRS_UNSPECIFIED, b->baseline, size)
+        != MEMTX_OK) {
+        buffer_free(b);
+        return -EIO;
+    }
+    ret = pool_copy(ctx, iova, b->baseline, size, true);
+    if (ret) {
+        buffer_free(b);
+        return ret;
+    }
+    ctx->buffers = g_list_prepend(ctx->buffers, b);
+    return 0;
+}
+
 int loom_vfio_dma_command(VFIOContainerBase *bc, unsigned command,
                          hwaddr iova, uint64_t size, unsigned direction)
 {
@@ -233,6 +291,9 @@ int loom_vfio_dma_command(VFIOContainerBase *bc, unsigned command,
     if (!size || size > 64 * MiB || iova + size < iova || direction > 2) {
         return -EINVAL;
     }
+    if (command == LOOM_DMA_REGISTER) {
+        return loom_vfio_dma_register(bc, iova, iova, size, direction);
+    }
     ctx = bc->loom_dma;
     for (GList *p = ctx->buffers; p; p = p->next) {
         b = p->data;
@@ -240,36 +301,6 @@ int loom_vfio_dma_command(VFIOContainerBase *bc, unsigned command,
             entry = p;
             break;
         }
-    }
-    if (command == LOOM_DMA_REGISTER) {
-        if (entry) {
-            b = entry->data;
-            if (b->direction != direction) {
-                return -EINVAL;
-            }
-            b->references++;
-            return 0;
-        }
-        b = g_new0(LoomDMABuffer, 1);
-        b->iova = iova;
-        b->size = size;
-        b->direction = direction;
-        b->references = 1;
-        b->baseline = g_malloc(size);
-        b->scratch = g_malloc(size);
-        if (address_space_read(&address_space_memory, iova,
-                               MEMTXATTRS_UNSPECIFIED, b->baseline, size)
-            != MEMTX_OK) {
-            buffer_free(b);
-            return -EIO;
-        }
-        ret = pool_copy(ctx, iova, b->baseline, size, true);
-        if (ret) {
-            buffer_free(b);
-            return ret;
-        }
-        ctx->buffers = g_list_prepend(ctx->buffers, b);
-        return 0;
     }
     /* Range sync requests may cover a subsection of a streaming mapping. */
     if (!entry && (command == LOOM_DMA_SYNC_CPU ||

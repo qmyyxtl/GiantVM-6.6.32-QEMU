@@ -11,6 +11,8 @@ bool loom_vfio_dma_enabled(void);
 int loom_vfio_dma_map(VFIOContainerBase *, hwaddr, uint64_t, void **, bool);
 void loom_vfio_dma_unmap(VFIOContainerBase *, hwaddr, uint64_t);
 void loom_vfio_dma_free(VFIOContainerBase *);
+int loom_vfio_dma_register(VFIOContainerBase *bc, hwaddr iova, hwaddr gpa,
+                           uint64_t size, unsigned direction);
 int loom_vfio_dma_command(VFIOContainerBase *, unsigned, hwaddr, uint64_t, unsigned);
 int loom_vfio_dma_sync(VFIOContainerBase *, bool);
 uint64_t loom_vfio_dma_count(VFIOContainerBase *);

@@ -313,3 +313,27 @@ GVM_IOMMU=0|1（默认 0，开启时要求 q35），便于继续验证；本轮�
 保留 IOVA、GPA、权限和映射生命周期；失效确认前必须完成 owner 的 DMA 回写。
 不能让 slave 独立消费同一失效队列并提前发布完成，也不能假设现有 staging
 中 IOVA=GPA 的约定适用于翻译后的 DMA 地址。HPET 不作调整。
+
+### 非恒等 DMA 地址与 AHCI 映射标记（2026-10-10）
+
+staging buffer 现在分别保存 IOVA 和 GPA；pool_copy 使用 IOVA，
+guest RAM 读写使用 GPA。新增 loom_vfio_dma_register(bc, iova, gpa, size, direction)，
+为标准 IOMMU 翻译通知提供入口。旧 bridge REGISTER 仍以 GPA=IOVA 调用，
+不会因此自动接入标准 IOMMU。重复注册到不同 GPA、冲突的重叠翻译以及地址溢出被拒绝。
+
+在未修改的 guest 中，通过 Python stdin 分配并锁定一页内存，在 QEMU 中用
+临时空 container 调用实际 staging 函数，IOVA=0x4000000000、GPA=0x089a8000。
+验证初始拷贝、device-to-CPU 修改 0xbc、CPU-to-pool 修改 0xcd、未修改字节保持 0xa5，
+以及注销前将 0xde 写回 guest；guest 直接检查最终内容通过。
+旧 identity REGISTER 的重复引用、两次 UNREGISTER、最终 buffer count=0 也通过。
+这是 staging 同步函数验证，未通过 VFIO ioctl 映射真实网卡，也未验证跨节点 IOMMU 通知。
+
+Q35 重启过程中另发现根盘 AHCI 超时并最终 VFS panic。源码/运行现场显示：
+CLB 的 map_page 输出错误地写到 res_fis_is_dsm，lst_is_dsm 始终为 false，
+命令头路径因此跳过已有的 DSM pin/unpin。修正为写入 lst_is_dsm 后，新实例
+正常启动、root 登录，并通过双盘四 worker 短时只读校验。不能凭一次启动
+断言 Q35/AHCI 的所有问题均已排除。
+
+两端已编译，guest 内核/驱动和 host KVM 未修改，HPET 保留。
+下一步评估按 owner 报告独立 DMAR 控制窗口和设备 scope，避免本地 DMA 映射
+必须经过 master；该 owner IOMMU 路径及真实双网卡吞吐尚未实现。
