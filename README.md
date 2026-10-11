@@ -6806,7 +6806,7 @@ HPET和guest保持，既有host dirty-page warning未修复。
 下一步据已确认的共享HPET锁/缓存DSM机制评估剩余QEMU非DSM成本，
 不再将RPC累计总耗时直接作为纯非DSM损失；整体目标仍未完成。
 
-### 2026-10-11：同步 MMIO 小消息使用栈缓冲（待运行实例验证）
+### 2026-10-11：同步 MMIO 小消息使用栈缓冲
 
 mmio_forwarding 的 KVM 1–8 字节请求使用栈缓冲，较大请求继续走堆分配；
 字段改用 memcpy 打包，保留原有字段宽度、顺序、原生字节序与消息长度。
@@ -6830,3 +6830,33 @@ Ezreal 18.228/7.602 ms。1–8 字节本地打包和 mock 调用约少 10 ns/次
 本节记录源码和微测试；运行实例仍为此前功能版本。
 需正常重启实验巨虚后验证启动、两端网卡收发，再更新运行结论。
 guest、HPET、内核及已有 worker-g4 不变。整体优化目标仍未完成。
+
+#### 新版本运行验证补充
+
+02fd3bf635 已推送 origin/device-aggregation，两端 fast-forward、编译通过。
+Garen 也使用实际源码与实际 MemTxAttrs 完成 ASAN+UBSAN/O2 各30000项检查。
+正常 guest poweroff 后两端旧实验 QEMU 退出，重新启动：
+Garen PID146011，Ezreal PID43226；/proc/PID/exe SHA256 分别
+cd1ac9a7b842c269bbf91c3fa62a9cc48d8df8590dc270004e706f3438df18ae、
+f9bcc80fe17e9263f9e34640f1d3c2395b1fd03d01d8b59f9a9c3e008230b16f。
+guest 登录成功，仍为 6.12.0-vanilla-vfio #26、HPET、CPU0-3；
+两卡 NUMA0/1、每卡2队列、本地CPU IRQ/RSS/XPS配置恢复。
+QMP两端确认local BAR route/negative filter/lock batch全部OFF，
+SSE2 ON、RPC spin0、receive CQ events ON。
+
+两端4个本地worker同时向Jinx发送变化内容，6秒功能流全部校验通过；
+两卡rx/tx errors/drop增量均0。此短测约549.1 MiB/s只作功能观察，
+没有同规格旧版本重复对照，不宣称吞吐增益。
+Jinx到两卡每卡32MiB接收内容校验通过；
+随后明确记录前后计数重复接收，error/drop增量均0。
+Garen enp33s0累计rx_dropped为141，两次读取保持141，
+Ezreal卡累计drop0；首次接收未记录基线，
+不能把141归因于启动或首次RX，也不声称累计零丢包。
+guest错误级dmesg为空，host旧warning未修复；
+host断链-32日志出现在正常旧实例关闭阶段，未因此重启host。
+
+Jinx两个临时地址和49161/49162监听已清除、服务退出0；
+没有新实验文件、新盘、磁盘/Lux测试，worker-g4 PID6969保留。
+本次只消除约10ns/次的本地打包分配开销；
+后续优先评估远端同步RPC的唤醒/等待及master设备目录/BQL开销，
+区分这些开销与已确认的HPET共享页DSM争用，不改guest或HPET。
