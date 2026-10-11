@@ -4850,3 +4850,46 @@ native/read-only/direction变体、非indexed/BQL未持有、pool mismatch/null�
 空container/output/overflow；native ready实际lookup2+2→1+1，DD0仍1+1。
 DMA硬件变化由barrier hook模拟，不是完整硬件等价证明。
 Ezreal build PASS，Garen同步/构建与实机性能待后续记录。source默认OFF。
+
+### 2026-10-11 RX descriptor 实机验证与远端 CPU offline 对照
+
+代码6dcd4d5b80、e1e40cb1cd两端同步构建PASS；e1关闭开关时保持原caller
+scalar调用。两端实际caller+helper GLib索引差分ASAN/UBSAN30005 cases
+每mode OFF/ON/invalid均PASS。实机ON计数：DD0 75098、DD1 186952次，
+每次恰好1 map_at+1 buffer_at、原scalar子调用0、read errors0；
+active/dropped0，probe正常清理。仅证明lookup减少，不证明净CPU收益。
+
+无probe同binary三次启动OFF→ON→OFF恢复，每阶段9次256MiB内容+ACK校验：
+RX中位281.132→251.272→259.008 MiB/s；
+owner QEMU host CPU (user+system-guest)10.02→10.55→10.29s，
+4.349→4.579→4.466 ms/MiB。跨启动有漂移，ON没有证明稳定收益，
+RX_DESC_READ_PAIR source默认及当前runtime都OFF。ADMIN_SCOPED=1、
+ADMIN_WRITE_SCOPED=0保留；guest内核#26、HPET不改。
+ON九轮硬件rx_discards0→23；热ring重配置会清计数，不能宣称修复丢包。
+ON两卡各自/并发TX内容校验PASS，RX512→256→512热重配置、IRQ恢复PASS，
+重配置后双卡各256MiB并发接收PASS(2.753/4.761s)。
+这些功能测试不证明线性聚合；Jinx两个IP共用一个10G物理口。
+
+用户要求的远端CPU offline在ON原型同一次启动中单独对照，
+先四CPU在线→CPU2/3 offline→恢复。NIC和磁盘worker都固定CPU0/1，
+本地owner网卡enp0s7向Jinx发送2 workers、每轮6s、每阶段3轮，
+内容/字节数校验PASS；本地vda 1GiB raw O_DIRECT读，1MiB、
+每worker QD4、2 workers、预热2s/测量8s、每阶段3轮。
+三阶段网卡发送样本MiB/s：
+923.510,771.135,924.512 / 888.622,944.462,968.823 /
+932.263,715.469,762.499；
+中位923.510→944.462→762.499。
+磁盘中位1987.375→2005.375→2009.625 MiB/s。
+offline磁盘对初始+0.91%、对恢复-0.21%，没有明显收益；
+NIC对初始+2.27%、对恢复+23.86%，在线样本波动大，不能当稳定提升证明。
+该轮未测DSM fault数量，CPU offline不停止slave QEMU/DSM服务，
+不能排除DSM，也不能把所有波动归因DSM。仅读盘，未做该条件下写盘结论。
+本轮不改源代码/guest OS/HPET，仅guest在线状态及IRQ配置。
+
+测试后正常guest关机、两QEMU退出0，再按关闭原型配置启动；
+当前Garen154340/Ezreal820039，四CPU在线、HPET、两卡UP、
+两数据盘各1GiB；guest error级dmesg空、当前boot网卡error/drop0。
+Jinx source/sinks STOPLOOM/EXIT0，测试alias及监听清理；
+未动Lux或Garen worker-g4，未创建实验文件。
+下一步需要对单卡的数据处理、DMA同步及DSM成本作可区分的测量，
+不再以减少lookup次数直接推断带宽提升。
