@@ -6904,3 +6904,57 @@ mode2 SEND完成和RECV回复均使用CQ事件。
 实验巨虚两端及worker-g4 PID6969仍运行。
 下一步应优先评估减少PCI目录路径的BQL获取及接收侧调度，
 不能把纯链路等待改善等同整体DSM/网卡扩展性改善；整体目标未完成。
+
+### 2026-10-11：本地 BAR 扫描 BQL 合并的当前 NUMA/native-VFIO 对照
+
+本轮不改功能源码，运行02fd3bf635，Garen PID146011/Ezreal PID43226，
+同guest #26/4CPU/HPET、native VFIO路径及已恢复IRQ/RSS/XPS。
+仅切换两端已有loom-local-bar-lock-batch；
+local-bar-route与negative-filter一直OFF，SSE2 ON、RPC spin0、
+接收CQ事件ON，两端QMP设置及读回通过，最后均恢复OFF。
+
+先单独用三个uprobes统计master handle_incoming_message范围内、
+type2/flags0/地址0xfed000f0的HPET读取：
+OFF 90519项，每项bql_lock_impl入口8次；
+ON 90253项，每项6次。
+两窗口entry==return统计数、nested/read_errors/inflight均0，
+探针cleanup完成后才进行性能对照。
+它证明获取次数减少，不证明等待时长或带宽改善。
+探针窗口流量全部验证，仅作机制检查，不当性能样本。
+首次QMP辅助程序仅替换了一处ENABLED导致读回NameError，
+设置False已执行；随后修正为显式变量、两端重新设置并成功读回False，
+没有把失败的辅助程序当PASS。
+
+无探针6组OFF/ON交替，E单卡2个本地CPU worker，
+每项6秒向第三方Jinx发送变化内容，12项/24条连接全部验证，
+每项两卡rx/tx error/drop增量0：
+| pair | OFF MiB/s | ON MiB/s | OFF hostCPU秒 | ON hostCPU秒 |
+|---|---:|---:|---:|---:|
+| 0 | 691.700 | 667.431 | 9.150 | 9.140 |
+| 1 | 687.128 | 667.585 | 9.380 | 9.100 |
+| 2 | 668.189 | 657.881 | 9.310 | 9.060 |
+| 3 | 688.733 | 694.888 | 9.330 | 9.430 |
+| 4 | 687.389 | 686.400 | 7.560 | 7.780 |
+| 5 | 709.793 | 666.851 | 9.530 | 9.420 |
+
+吞吐median OFF688.061 / ON667.508 MiB/s，ON低2.99%，仅1/6组更高；
+两端hostCPU累计median OFF9.320 / ON9.120秒，低2.15%。
+hostCPU由/proc/PID/stat的utime+stime-guest_time读取，
+计数窗6.807–7.225秒包含启动/分配/收尾及DSM，
+不能当纯设备CPU或按精确payload窗计算CPU/MiB。
+锁合并可能改变排队/交错，但未联合测持锁和DSM延迟，
+不能据吞吐回退证明具体因果。不启用该候选，不声称性能提升。
+
+进一步核对无锁目录负向索引的失效条件：
+directory_epoch目前只在loom_pci_directory_update_dispatch接收远端前缀时增加；
+本地loom_pci_publish不增加它，普通配置写在pci_dev->config_write之后才publish，
+reset另有begin/end odd sequence与generation。
+因此仅缓存directory_epoch并移除BQL不足以保护本地BAR重配置/重置。
+未来方案须同时覆盖本地与远端控制更新，并在更改开始前失效；
+未应用/缺失/odd前缀必须退回现有路径，不能直接把HPET地址硬编码排除。
+本轮没有实施此索引，仅记录明确的源码约束。
+
+BCC探针及Jinx receiver退出0、临时地址/49161清除，
+guest错误级dmesg为空、CPU0-3/HPET保持，
+巨虚和worker-g4 PID6969运行；host既有warning未修复。
+没有新实验文件、新盘、磁盘/Lux测试；整体目标仍未完成。
