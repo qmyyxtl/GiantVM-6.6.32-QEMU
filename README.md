@@ -5807,3 +5807,81 @@ iavf_virtchnl.c把PF返回的tx_discards映射到netdev->stats.tx_dropped；
 本轮只更新README记录；设备NUMA拓扑代码和guest源码均未修改。
 整体目标仍未完成，后续需继续量化真实DMA复制/扫描/队列处理的
 非DSM成本，再选择有证据支持的QEMU优化。
+
+### Native 单页 staging 读取复用注册地址
+
+功能提交68e1ecf5a7：loom_vfio_dma_read_pool原先先range_covered查buffer，
+再pool_copy查map；native page-indexed且请求完整落在同一4KiB页内时，
+改为一次buffer_at查询，检查注册边界并复用注册对象现有pool指针。
+仍保留读取前后两个smp_rmb；跨页、非索引、无缓存pool指针等情况
+走原来的完整预检与复制路径。缺少注册仍ENOENT，不复制任何数据；
+没有缓存额外的硬件地址，没有改变DSM、DMA注册或失效协议。
+源码检查native/general unmap均先退役相应buffer再释放pool存储；
+新读取没有让指针跨越一次调用。该不变式仍依赖现有调用方的注册锁定范围。
+
+实际新旧函数和buffer_at/map_at/pool_copy/range_covered提取编译，
+真实GLib hash/list、随机缺失注册/映射、无pool缓存、非索引部分注册、
+跨页、零长/超限/溢出/空参数；比较返回值、完整目标哨兵及屏障次数。
+两host各ASAN/UBSAN和-O2版本，同一组60000案例全部PASS：
+52386错误、1239出错前已部分复制的案例也保持旧路径行为；
+2687个快路径成功案例从两个hash lookup变成一个。
+另验证移除注册后ENOENT、无DMA上下文ENODEV。
+该harness不覆盖完整QEMU并发失效或真实DSM，运行验证另列。
+
+第一版隔离计时保留hash lookup及屏障计数器，数值不当生产路径CPU结论。
+随后移除这两个计数器，使用qemu/atomic.h对应compiler barrier及
+__atomic_thread_fence(ACQUIRE)，实际GLib、16页/64KiB staging集合、
+host CPU40、CLOCK_THREAD_CPUTIME_ID、每轮200000次、七组交替、-O2：
+两host所有大小均7/7组新函数更快，中位数如下（ns/次）。
+这仍是缓存命中的局部合成测试，不覆盖生产工作集、DSM及完整设备路径。
+
+|size|G旧|G新|E旧|E新|
+|---:|---:|---:|---:|---:|
+|8|25.942|14.342|26.818|14.036|
+|32|25.495|14.191|26.249|13.494|
+|2048|47.049|38.274|47.449|38.775|
+|4096|85.266|76.043|85.636|75.655|
+
+Ezreal/Garen完整编译及diff --check通过，origin同步。
+原guest正常poweroff，两端旧QEMU退出0；没有host重启。
+新Garen PID405757（session63257）、Ezreal PID870197（session93101），
+运行/proc/PID/exe SHA256与各自build一致：
+G7fbd3c3323eaa9120ce055ab92b20d93d62fa093214647276d6a3926483fc2d7，
+Ec8eaa169cfe9095cdfa9acd1abebe4ed022f043a9b0eabf3b888378310072d86。
+guest仍6.12.0-vanilla-vfio #26、四CPU、HPET；不修改guest源码。
+combined2/RX512/TX128/RSS固定q1、XPS tx0=0、tx1 G3/Ec；
+网卡开启调用分别绑CPU0/2，data IRQ按名字q0 CPU0/2、q1 CPU1/3。
+当前IRQ36→0、37→1、39→2、40→3，NUMA仍-1。
+TX idle/RX bounded/coalesce继续关闭。
+
+双卡四worker流量START/STOP门控，owner TGID作用域uprobes：
+G read_pool414583次/363465840字节，E339796次/297119144字节；
+全部成功返回，作用域range_covered/pool_copy入口均0；
+nested/overflow0、pending0，两端detach/cleanup退出0。
+核实反汇编fallback仍实际call这两个函数，未被编译内联藏掉；
+因此本次所有成功调用确实通过单页直接复制路径。
+G读取大小计数8:184365、32:44641、2048:142028、1536:42337、
+4096:1137、12:60、104:15；E分别150226、38000、114786、35440、
+1265、64、15。字节统计只覆盖read_pool，不覆盖TX guest读取、
+snapshot发布等其他复制，不能当总复制放大率。
+流量内容/字节数PASS、错误/丢弃增量0；探针吞吐不作性能结论。
+
+撤掉探针，同启动parent创建前绑核、双卡四worker每轮6秒，
+G→Jinx10.3/E→Garenhost11.1，三轮612.107/613.734/607.537 MiB/s；
+12条流内容/字节数PASS，稳态错误/丢弃增量均0。
+一次两卡down/up并恢复同样配置，随后609.074 MiB/s、四流内容PASS，
+流量窗口错误/丢弃增量0；控制窗口观察到tx_dropped G+2/E+4。
+PF统计异步更新，不能仅凭观察窗口确定真实丢弃发生的具体时刻/原因。
+与旧启动549/495不可直接相减归因；没有同启动旧路径开关对照，
+不宣称本优化造成全部带宽变化或已经达到线性聚合。
+
+两NIC并行各接收256MiB，G3.168108/E3.692581秒，
+内容与source确认PASS；Jinx两IP共享一个物理10G口，只作功能验证。
+最终error级dmesg空、两NIC up，RX/TX错误和RX dropped0，
+累计tx_dropped G2/E4。保留HPET、guest内核与原文件系统；
+启动仍有此前hrtimer/FAT warning，不作文件系统修复。
+接收服务/源及uprobes正常退出0，Jinx临时IP删除，
+49161/49162/48744监听消失；worker6122保留。
+全部测试stdin/memfd，无实验文件/新盘，不测Lux/磁盘。
+整体目标仍未完成，下一步需要按实际完成路径量化剩余描述符扫描、
+重复快照/发布及本地锁定成本，区分DSM等待后再选优化。
