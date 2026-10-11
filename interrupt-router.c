@@ -690,41 +690,50 @@ void pio_forwarding(uint16_t port, MemTxAttrs attrs, void *data, int direction,
     qemu_mutex_unlock(&io_forwarding_mutex);
 }
 
-void mmio_forwarding(hwaddr addr, MemTxAttrs attrs, uint8_t *data, int len, bool is_write)
+void mmio_forwarding(hwaddr addr, MemTxAttrs attrs, uint8_t *data,
+                     int len, bool is_write)
 {
+    uint8_t inline_data[sizeof(int32_t) + sizeof(hwaddr) +
+                        sizeof(MemTxAttrs) + sizeof(int) + sizeof(bool) + 8];
+    size_t data_size = sizeof(int32_t) + sizeof(hwaddr) +
+                       sizeof(MemTxAttrs) + sizeof(int) + sizeof(bool) + len;
+    uint8_t *msg_data, *ptr;
+    int32_t cpu_index;
+
     qemu_mutex_lock(&io_forwarding_mutex);
     debugf("[RDMA Router] MMIO forwarding: addr=0x%llx, len=%d, is_write=%d\n",
            (unsigned long long)addr, len, is_write);
-    /* 准备消息数据 */
-    size_t data_size = sizeof(int32_t) + sizeof(hwaddr) + sizeof(MemTxAttrs) + 
-                       sizeof(int) + sizeof(bool) + len;
-    uint8_t *msg_data = g_malloc(data_size);
-    
-    uint8_t *ptr = msg_data;
-    *(int32_t*)ptr = current_cpu ? current_cpu->cpu_index : CPU_INDEX_ANY;
-    ptr += sizeof(int32_t);
-    *(hwaddr*)ptr = addr;
-    ptr += sizeof(hwaddr);
-    *(MemTxAttrs*)ptr = attrs;
-    ptr += sizeof(MemTxAttrs);
-    *(int*)ptr = len;
-    ptr += sizeof(int);
-    *(bool*)ptr = is_write;
-    ptr += sizeof(bool);
+
+    /* KVM MMIO is at most 8 bytes. The synchronous send consumes this
+     * payload before returning; retain the heap fallback for larger callers. */
+    msg_data = data_size <= sizeof(inline_data) ?
+               inline_data : g_malloc(data_size);
+    ptr = msg_data;
+    cpu_index = current_cpu ? current_cpu->cpu_index : CPU_INDEX_ANY;
+    memcpy(ptr, &cpu_index, sizeof(cpu_index));
+    ptr += sizeof(cpu_index);
+    memcpy(ptr, &addr, sizeof(addr));
+    ptr += sizeof(addr);
+    memcpy(ptr, &attrs, sizeof(attrs));
+    ptr += sizeof(attrs);
+    memcpy(ptr, &len, sizeof(len));
+    ptr += sizeof(len);
+    memcpy(ptr, &is_write, sizeof(is_write));
+    ptr += sizeof(is_write);
     memcpy(ptr, data, len);
-    
+
     if (!is_write) {
-        /* 读操作，需要响应 */
         size_t resp_len;
-        rdma_router_send_request(0, MMIO, msg_data, data_size, 
-                                data, &resp_len);
+        rdma_router_send_request(0, MMIO, msg_data, data_size,
+                                 data, &resp_len);
     } else {
-        /* 写操作，不需要响应 */
-        rdma_router_send_request(0, MMIO, msg_data, data_size, 
-                                NULL, NULL);
+        rdma_router_send_request(0, MMIO, msg_data, data_size,
+                                 NULL, NULL);
     }
-    
-    g_free(msg_data);
+
+    if (msg_data != inline_data) {
+        g_free(msg_data);
+    }
     qemu_mutex_unlock(&io_forwarding_mutex);
 }
 
