@@ -51,6 +51,8 @@ int loom_vfio_ram_remove(VFIOContainerBase *, hwaddr, uint64_t);
 int loom_vfio_ram_read_cpu(VFIOContainerBase *, hwaddr, void *, uint64_t);
 int loom_vfio_ram_materialize(VFIOContainerBase *, hwaddr, uint64_t,
                               bool device_writes);
+/* Existing writable identity mapping; no allocation or persistent pointer. */
+bool loom_vfio_ram_identity_range(VFIOContainerBase *, hwaddr, uint64_t);
 /* Same-page warm pair authority check; cold/unsupported retains scalar order. */
 int loom_vfio_ram_materialize_pair(VFIOContainerBase *, hwaddr, hwaddr, uint64_t);
 /* Startup only: 0 default, 1 physical prototype, negative invalid setting. */

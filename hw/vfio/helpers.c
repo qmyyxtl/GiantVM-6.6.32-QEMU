@@ -332,7 +332,19 @@ uint64_t vfio_region_read(void *opaque,
      * Sampling a queue head after the snapshot could otherwise expose work
      * whose descriptors were not yet copied into guest RAM.
      */
-    if (!vfio_loom_sync(vbasedev, false)) {
+    int dma_ret = 0;
+
+    if (region->nr == 0 && size == 4 &&
+        (addr == 0x4800 || addr == 0x5000 || addr == 0x6400 ||
+         addr == 0x6800 || addr == 0x7400 || addr == 0x8000 || addr == 0x8800)) {
+        dma_ret = loom_iavf_sync_control_completion(vbasedev);
+    }
+    if (dma_ret < 0) {
+        error_report("VFIO DSM control completion synchronization failed");
+        vm_stop(RUN_STATE_INTERNAL_ERROR);
+        return UINT64_MAX;
+    }
+    if (!dma_ret && !vfio_loom_sync(vbasedev, false)) {
         return UINT64_MAX;
     }
     if (region->nr == 0 && size == 4 && addr == 0x7400) {

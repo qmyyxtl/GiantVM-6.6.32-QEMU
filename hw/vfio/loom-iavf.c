@@ -7,6 +7,7 @@
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
 #include "qemu/error-report.h"
+#include "qemu/main-loop.h"
 #include "hw/vfio/vfio-common.h"
 #include "hw/vfio/loom-dma.h"
 #include "hw/vfio/loom-iavf.h"
@@ -1077,6 +1078,309 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
         }
     }
     return 1;
+}
+
+
+typedef struct LoomAdminExtent {
+    uint64_t start, end;
+} LoomAdminExtent;
+
+typedef struct LoomAdminSnapshot {
+    hwaddr descriptor, payload;
+    unsigned capacity;
+    uint8_t desc[AQ_DESC_SIZE];
+    uint8_t *bytes;
+} LoomAdminSnapshot;
+
+static int admin_extent_compare(const void *a, const void *b)
+{
+    const LoomAdminExtent *x = a, *y = b;
+
+    return x->start < y->start ? -1 : x->start > y->start;
+}
+
+static bool admin_extent_add(VFIOContainerBase *bc, LoomAdminExtent *extent,
+                              unsigned *count, hwaddr addr, uint64_t size)
+{
+    if (!loom_vfio_ram_identity_range(bc, addr, size)) {
+        return false;
+    }
+    extent[(*count)++] = (LoomAdminExtent) { addr, addr + size };
+    return true;
+}
+
+/* Merge the data domain; overlap within that domain remains legal. */
+static unsigned admin_extent_merge(LoomAdminExtent *extent, unsigned count)
+{
+    unsigned out = 0;
+
+    if (count) {
+        qsort(extent, count, sizeof(*extent), admin_extent_compare);
+    }
+    for (unsigned i = 0; i < count; i++) {
+        if (out && extent[i].start <= extent[out - 1].end) {
+            extent[out - 1].end = MAX(extent[out - 1].end, extent[i].end);
+        } else {
+            extent[out++] = extent[i];
+        }
+    }
+    return out;
+}
+
+static bool admin_extent_overlaps(const LoomAdminExtent *extent, unsigned count,
+                                   hwaddr addr, uint64_t size)
+{
+    unsigned low = 0, high = count;
+
+    while (low < high) {
+        unsigned mid = low + (high - low) / 2;
+
+        if (extent[mid].end <= addr) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low < count && extent[low].start < addr + size;
+}
+
+/*
+ * AQ consumers use hardware heads, not necessarily DD. Capture both entire
+ * rings and every posted buffer, including non-DD entries, before any writes.
+ * The read caller has already sampled its hardware status/head. Native identity
+ * mappings let the alias check compare addresses directly. Unknown layouts
+ * return zero before publication; publication errors are fatal, never fallback.
+ */
+int loom_iavf_sync_control_completion(VFIODevice *dev)
+{
+    static int scoped = -1;
+    VFIOContainerBase *bc = dev->bcontainer;
+    LoomIAVFQueues *s = dev->loom_iavf_queues;
+    LoomAdminSnapshot *snapshot = NULL;
+    LoomAdminExtent *data = NULL;
+    unsigned capacity = 0, count = 0, total = 0, captured = 0;
+    uint64_t base[2];
+    unsigned entries[2];
+    int ret = 0;
+
+    if (scoped < 0) {
+        const char *mode = getenv("LOOM_IAVF_ADMIN_SCOPED");
+
+        scoped = mode && !strcmp(mode, "1");
+    }
+    assert(bql_locked());
+    if (!scoped || !dev->loom_iavf_irq_control || !bc || !bc->loom_ram ||
+        !s || !s->valid_mask || !(s->enabled_rx | s->enabled_tx) ||
+        !s->completion_payload || s->pending || s->enable_pending ||
+        s->ambiguous || !s->asq_enabled || !s->arq_enabled ||
+        !s->asq_count || s->asq_count >= AQ_MAX_COUNT ||
+        !s->arq_count || s->arq_count >= AQ_MAX_COUNT ||
+        !s->asq_base || !s->arq_base) {
+        return 0;
+    }
+    base[0] = s->asq_base;
+    base[1] = s->arq_base;
+    entries[0] = s->asq_count;
+    entries[1] = s->arq_count;
+    if (!loom_vfio_ram_identity_range(bc, base[0], entries[0] * 32ULL) ||
+        !loom_vfio_ram_identity_range(bc, base[1], entries[1] * 32ULL) ||
+        range_intersects(base[0], entries[0] * 32ULL,
+                         base[1], entries[1] * 32ULL)) {
+        return 0;
+    }
+    for (unsigned id = 0; id < VF_QUEUE_COUNT; id++) {
+        if (s->valid_mask & (1U << id)) {
+            LoomIAVFQueue *q = &s->queue[id];
+
+            if (!q->rx_count || q->rx_count > 4096 || !q->tx_count ||
+                q->tx_count > 4096 || !q->rx_buffer_size ||
+                q->rx_buffer_size > 4096) {
+                return 0;
+            }
+            capacity += q->rx_count + q->tx_count + 2;
+        }
+    }
+    data = g_new(LoomAdminExtent, capacity);
+    for (unsigned id = 0; id < VF_QUEUE_COUNT; id++) {
+        LoomIAVFQueue *q = &s->queue[id];
+        LoomIAVFCompletion *c = &s->completion[id];
+
+        if (!(s->valid_mask & (1U << id))) {
+            continue;
+        }
+        if (!admin_extent_add(bc, data, &count, q->rx_iova,
+                               q->rx_count * 32ULL) ||
+            !admin_extent_add(bc, data, &count, q->tx_iova,
+                               q->tx_count * 16ULL)) {
+            goto out;
+        }
+        if (s->enabled_rx & (1U << id)) {
+            if (!c->seeded || !c->rx_slot) {
+                goto out;
+            }
+            for (unsigned n = 0; n < q->rx_count; n++) {
+                hwaddr addr = c->rx_slot[n].iova;
+
+                if (addr && !admin_extent_add(bc, data, &count, addr,
+                                               q->rx_buffer_size)) {
+                    goto out;
+                }
+            }
+        }
+        if (!(s->enabled_tx & (1U << id))) {
+            continue;
+        }
+        if (loom_vfio_dma_read_baseline(bc, q->tx_iova, s->submit_desc,
+                                         q->tx_count * 16ULL) ||
+            !tx_snapshot_types_valid(s->submit_desc, q->tx_count)) {
+            goto out;
+        }
+        for (unsigned n = 0; n < q->tx_count; n++) {
+            const uint8_t *desc = s->submit_desc + n * 16;
+            uint64_t cmd = ldq_le_p(desc + 8);
+            unsigned len = (cmd >> 34) & 0x3fff;
+
+            if ((cmd & 15) == 0 && len &&
+                !admin_extent_add(bc, data, &count, ldq_le_p(desc), len)) {
+                goto out;
+            }
+        }
+    }
+    count = admin_extent_merge(data, count);
+    for (unsigned ring = 0; ring < 2; ring++) {
+        if (admin_extent_overlaps(data, count, base[ring],
+                                    entries[ring] * 32ULL)) {
+            goto out;
+        }
+    }
+    total = entries[0] + entries[1];
+    snapshot = g_new0(LoomAdminSnapshot, total);
+    for (unsigned ring = 0; ring < 2; ring++) {
+        for (unsigned n = 0; n < entries[ring]; n++) {
+            LoomAdminSnapshot *p = &snapshot[captured++];
+            uint8_t posted[32];
+            unsigned opcode, flags;
+
+            p->descriptor = base[ring] + n * 32ULL;
+            if (loom_vfio_dma_read_baseline(bc, p->descriptor, posted, 32) ||
+                loom_vfio_dma_read_pool(bc, p->descriptor, p->desc, 32)) {
+                goto out;
+            }
+            opcode = lduw_le_p(posted + 2);
+            flags = lduw_le_p(posted);
+            if (!(flags & 0x1000) && !opcode) {
+                uint8_t zero[32] = { 0 };
+
+                if (memcmp(posted, zero, 32) || memcmp(p->desc, zero, 32)) {
+                    goto out;
+                }
+                continue;
+            }
+            if ((!ring && opcode != 0x0801) ||
+                (ring && opcode != 0 && opcode != 0x0802) ||
+                (!ring && lduw_le_p(p->desc + 2) != 0x0801) ||
+                (ring && lduw_le_p(p->desc + 2) != 0 &&
+                 lduw_le_p(p->desc + 2) != 0x0802)) {
+                goto out;
+            }
+            if (ring && memcmp(posted, p->desc, 32)) {
+                unsigned op = ldl_le_p(p->desc + 8);
+
+                if (op == 6 || op == 8 ||
+                    (op == 17 && lduw_le_p(p->desc + 4) < 4)) {
+                    goto out;
+                }
+            }
+            if (!(flags & 0x1000)) {
+                if (lduw_le_p(posted + 4) ||
+                    (lduw_le_p(p->desc) & 0x1000) ||
+                    lduw_le_p(p->desc + 4)) {
+                    goto out;
+                }
+                continue;
+            }
+            p->capacity = lduw_le_p(posted + 4);
+            p->payload = (uint64_t)ldl_le_p(posted + 24) << 32 |
+                         ldl_le_p(posted + 28);
+            if (!p->payload || p->capacity > 4096 ||
+                lduw_le_p(p->desc + 4) > p->capacity ||
+                memcmp(posted + 24, p->desc + 24, 8)) {
+                goto out;
+            }
+            if (!p->capacity) {
+                continue;
+            }
+            if (!loom_vfio_ram_identity_range(bc, p->payload, p->capacity) ||
+                payload_intersects_descriptors(s, p->payload, p->capacity) ||
+                admin_extent_overlaps(data, count, p->payload, p->capacity)) {
+                goto out;
+            }
+            for (unsigned i = 0; i + 1 < captured; i++) {
+                if (snapshot[i].capacity &&
+                    range_intersects(p->payload, p->capacity,
+                                     snapshot[i].payload,
+                                     snapshot[i].capacity)) {
+                    goto out;
+                }
+            }
+            p->bytes = g_malloc(p->capacity);
+            if (loom_vfio_dma_read_pool(bc, p->payload, p->bytes, p->capacity)) {
+                goto out;
+            }
+            /* Queue control ACKs/reset events can revoke the data snapshot. */
+            if (ring && memcmp(posted, p->desc, 32)) {
+                unsigned op = ldl_le_p(p->desc + 8);
+
+                if (op == 6 || op == 8 ||
+                    (op == 17 && (p->capacity < 4 ||
+                     lduw_le_p(p->desc + 4) < 4 ||
+                     ldl_le_p(p->bytes) == 2 || ldl_le_p(p->bytes) == 3))) {
+                    goto out;
+                }
+            }
+        }
+    }
+    ret = loom_iavf_sync_data_completion(dev);
+    if (ret <= 0) {
+        goto out;
+    }
+    for (unsigned i = 0; i < captured; i++) {
+        LoomAdminSnapshot *p = &snapshot[i];
+
+        if (p->capacity) {
+            ret = loom_vfio_dma_publish_snapshot(bc, p->payload,
+                                                  p->bytes, p->capacity);
+            if (ret) {
+                goto out;
+            }
+        }
+    }
+    for (unsigned i = 0; i < captured; i++) {
+        LoomAdminSnapshot *p = &snapshot[i];
+
+        ret = loom_vfio_dma_publish_snapshot(bc, p->descriptor + 2,
+                                               p->desc + 2, 30);
+        if (ret) {
+            goto out;
+        }
+    }
+    smp_wmb();
+    for (unsigned i = 0; i < captured; i++) {
+        LoomAdminSnapshot *p = &snapshot[i];
+
+        ret = loom_vfio_dma_publish_snapshot(bc, p->descriptor, p->desc, 2);
+        if (ret) {
+            goto out;
+        }
+    }
+    ret = 1;
+out:
+    for (unsigned i = 0; i < captured; i++) {
+        g_free(snapshot[i].bytes);
+    }
+    g_free(snapshot);
+    g_free(data);
+    return ret;
 }
 
 /*

@@ -2229,6 +2229,37 @@ rollback:
     return ret;
 }
 
+/* Existing writable identity pages only; never creates or retains a map. */
+bool loom_vfio_ram_identity_range(VFIOContainerBase *bc, hwaddr addr,
+                                  uint64_t size)
+{
+    hwaddr end;
+
+    assert(bql_locked());
+    if (!bc || !bc->loom_physical || !bc->loom_ram || bc->loom_ram->failed ||
+        bc->loom_ram->materializing || !bc->space ||
+        bc->space->as != &address_space_memory || !bc->loom_dma ||
+        !bc->loom_dma->page_indexed || !size || size > 64 * MiB ||
+        addr > UINT64_MAX - size) {
+        return false;
+    }
+    end = addr + size;
+    for (hwaddr pos = addr; pos < end; ) {
+        hwaddr page = pos & ~UINT64_C(4095);
+        LoomRAMRange *r = ram_range_at(bc, page);
+        LoomDMAMap *m = map_at(bc->loom_dma, page);
+        LoomDMABuffer *b = buffer_at(bc->loom_dma, page);
+
+        if (!r || r->readonly || !m || m->iova != page || m->size != 4096 ||
+            m->readonly || !b || b->iova != page || b->gpa != page ||
+            b->size != 4096 || b->direction || b->pool != m->pool) {
+            return false;
+        }
+        pos += MIN(end - pos, 4096 - (pos & 4095));
+    }
+    return true;
+}
+
 /*
  * Warm RX pairs share an existing native page mapping. Validate it once.
  * Cold or non-native layouts retain both calls, including their failure order.

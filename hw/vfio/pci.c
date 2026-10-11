@@ -371,7 +371,8 @@ static void vfio_msi_interrupt(void *opaque)
         abort();
     }
 
-    int dma_ret = nr ? loom_iavf_sync_data_completion(&vdev->vbasedev) : 0;
+    int dma_ret = nr ? loom_iavf_sync_data_completion(&vdev->vbasedev) :
+                      loom_iavf_sync_control_completion(&vdev->vbasedev);
     if (!dma_ret) {
         dma_ret = loom_vfio_dma_sync(vdev->vbasedev.bcontainer, false);
         if (!dma_ret) {

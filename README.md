@@ -4641,3 +4641,38 @@ AdminQ event/reset/未知opcode/布局/失效保留完整同步。
 当前ASQ next只跟踪提交观察、ARQ next只跟踪控制observer，
 不等于可直接复用的完整发布head cursor。控制路径仍使用原full同步。
 这仍是未完成项，不能宣称只剩DSM成本或全量扫描已消除。
+
+### AdminQ scoped completion 原型（默认关闭，待实机验证）
+
+LOOM_IAVF_ADMIN_SCOPED=1 启用；默认关闭，guest/HPET不改。
+已知BAR0四字节control reads（4800/5000/6400/6800/7400/8000/8800）
+在硬件pread之后尝试AdminQ+data completion；控制vector0 IRQ同样尝试。
+未知read/write保留原路径。返回0表示在任何新AQ或data发布前回退full；
+发布开始后的同步错误为负，停止VM，不再重新采样/回退。
+
+本阶段捕获完整ASQ/ARQ ring和每个已声明buffer，不按DD筛选，
+也不把已有asq_next/arq_next当发布游标。覆盖原生按hardware head消费的语义：
+ASQ按baseline原capacity捕获，ARQ保留posted capacity与firmware datalen校验。
+每次控制同步有短期分配，后续可按head窗口缩减，尚未证明CPU/吞吐收益。
+
+启动/未配置/队列pending/unknown布局/共享container走full。
+只允许现有普通RAM、writable identity mapping；新增只读验证API
+loom_vfio_ram_identity_range校验authority、poison/materializing、nativepage、
+map/buffer/GPA/permission/pool一致性，不创建map、不保留指针。
+预先收集数据descriptor及活跃RX/TX payload范围，排序合并允许data域内部重叠。
+拒绝AQ ring/ring、AQ/ring-data、AQ payload/descriptor、AQ payload/data、
+AQ payload/payload别名；拒绝新配置/enable ACK和reset事件，以免错误沿用data快照。
+所有AQ descriptor和payload先捕获；再执行既有data completion；
+再发布全部AQ payload、全部metadata字节2..31、barrier、最后全部flags字节0..1。
+捕获/检查错误返回0且不发布；data或AQ发布失败不当成fallback。
+
+Ezrealbuild PASS。memfd提取production control function/extent/tx-validation，
+ASAN+UBSAN85050 cases PASS：默认OFF、DD0/1、1..4096 capacities与短/零writeback
+datalen、live pool在data completion期间改变的immutable snapshot测试，
+正常direct ASQ、unknown/pending/disabled/zero/large rings、RX/TX/descriptor/AQ别名、
+bad identity、unknown opcode、queue ACK/reset/malformed event、
+全部11个fixture read失败点、10个发布失败点、data fallback/error、
+80000个随机merged-extent overlap差分查询。publisher/data组件stub用于控制顺序和错误注入；
+不是完整硬件/DSM等价证明。新增identity真实函数20个authority/map/GPA/readonly/
+poison/overflow/边界cases与现有warm pair56000回归一起ASAN/UBSAN PASS。
+实机启用、控制操作、性能和scan counts仍待验证，默认不启用。
