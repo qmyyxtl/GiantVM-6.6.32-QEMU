@@ -6860,3 +6860,47 @@ Jinx两个临时地址和49161/49162监听已清除、服务退出0；
 本次只消除约10ns/次的本地打包分配开销；
 后续优先评估远端同步RPC的唤醒/等待及master设备目录/BQL开销，
 区分这些开销与已确认的HPET共享页DSM争用，不改guest或HPET。
+
+### 2026-10-11：真实 RDMA 小请求 CQ 等待对照，暂不引入同步 RPC 事件等待
+
+运行实例仍为功能提交02fd3bf635，Garen PID146011、Ezreal PID43226。
+直接读取 /proc/TID/timerslack_ns（不是task子目录），确认两端：
+主线程、所有vCPU、gvm-rdma-req、gvm-rdma-rx的timer slack均为1 ns。
+各有一个其它qemu-system-x86线程为50000 ns，未推断其功能或修改配置。
+因此不能把Linux默认50us timer slack套用到当前RPC线程。
+
+先不改QEMU，使用memfd编译O2/Werror的独立libibverbs/librdmacm程序，
+Garen172.0.1.4与Ezreal172.0.1.2的真实RC链路、临时端口39441，
+双方CPU10、timer slack显式设1 ns、单个未完成请求，
+29B请求/24B响应；每条消息校验递增sequence、长度及变化内容。
+服务端接收使用CQ事件，发送完成固定usleep(1)轮询；
+客户端比较：
+mode0 SEND完成及RECV回复均usleep(1)轮询；
+mode1仅RECV回复使用CQ事件；
+mode2 SEND完成和RECV回复均使用CQ事件。
+事件路径先arm再poll，允许空事件、非阻塞读取并逐一ack；
+每个CQ唯一consumer，SEND确认后复用缓冲，正常停止后销毁QP/CQ/MR。
+两方向各12轮、每轮1000请求，顺序0/1/2、2/1/0重复两次，
+所有请求及停止消息均PASS，双方正常退出0、端口清除。
+
+每种mode的4轮请求延迟p50的中位数；CPU是客户端每1000请求进程CPU：
+| 调用方向 | mode0 p50 us | mode1 p50 us | mode2 p50 us | mode0 CPU ms | mode1 CPU ms | mode2 CPU ms |
+|---|---:|---:|---:|---:|---:|---:|
+| Ezreal→Garen | 12.809 | 19.622 | 19.386 | 8.347 | 6.425 | 8.748 |
+| Garen→Ezreal | 12.817 | 19.227 | 19.187 | 8.094 | 6.415 | 8.829 |
+
+这是等待机制的短窗口、单QP、分离SEND/RECV CQ对照，
+真实QEMU使用四条连接且含worker调度、BQL、模型回调及DSM，
+本测试不含这些路径、不代表完整RPC或网卡吞吐。
+事件等待虽然仅回复模式约少23%客户端CPU，但p50约多50%；
+双CQ事件模式没有显示CPU收益。不据此在同步RPC启用CQ事件。
+初次微测试默认timer slack造成约54us的延迟，不作为匹配QEMU的结果；
+初次server连接等待5秒因工具启动间隔超时，修正为60秒后才进行上述有效测试，
+未重启或改动正在运行的巨虚。
+
+保留现有RPC spin0、接收CQ事件ON（后者用途是请求接收线程空闲等待），
+未修改guest、HPET、host内核、网络亲和性或进行磁盘/Lux测试。
+没有实验脚本/日志/二进制文件，测试源码与可执行体在内存，编译临时文件自动清理。
+实验巨虚两端及worker-g4 PID6969仍运行。
+下一步应优先评估减少PCI目录路径的BQL获取及接收侧调度，
+不能把纯链路等待改善等同整体DSM/网卡扩展性改善；整体目标未完成。
