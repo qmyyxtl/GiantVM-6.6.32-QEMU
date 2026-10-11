@@ -5618,3 +5618,48 @@ guest执行、阻塞等待、其他TGID均不在这些host CPU样本中。
 当前证据支持将DSM页竞争与设备路径额外成本分别处理，
 但不证明非DSM成本已最小化。下一步在设备owner本地准备/完成路径
 测量调用密度及本地CPU成本，优先验证能安全消除的重复处理。
+
+### 小范围 DMA 同步：合并覆盖验证与索引收集
+
+代码93d917d807，仅改QEMU hw/vfio/loom-dma.c。
+原page-indexed、最多16页的sync-range先range_covered逐页查索引，
+再逐页收集同一buffer。现在收集时检查每页是否存在，全部收集成功后
+才同步；保留按registration_sequence倒序发布、精确buffer_view范围、
+各段失败后的部分提交行为。大范围/非索引路径仍用原覆盖检查。
+没有缓存映射身份，没有取消materialize/DSM读取/差分merge或失效机制。
+
+对照当前实际函数和66c203dd07的旧函数，外部buffer_at/sync_buffer为mock，
+memfd GCC ASAN/UBSAN 40,000案例全部PASS：覆盖缺页、未对齐、16/17页、
+0/超过64MiB/地址溢出、非索引重叠布局、随机注册顺序、逐段错误注入。
+返回值、发布trace和baseline部分更新逐项相同；
+30,942次缺覆盖均无提前发布、730次注入失败行为相同；
+6,862个命中短索引路径案例查询数减半。这是局部操作数证明，
+mock不能代替实际设备/DSM验证。
+
+Ezreal/Garen完整编译及diff --check通过，origin同步。
+正常guest poweroff，两端原QEMU退出0后重启；没有host重启。
+新Garen PID365528（session12551）、Ezreal PID861309（session41785），
+运行/proc/PID/exe与各自build binary SHA256一致。
+guest仍#26，四CPU/HPET；XPS0/RSS equal2，RX512/TX128，明确data IRQ
+36→0、37→1、39→2、40→3；TX idle/RX bounded/coalesce关闭。
+
+实际双卡四worker发送一次，接收内容/字节数PASS。
+sync作用域uprobes：G148808 entry/成功，E118282 entry/成功；
+错误/嵌套0，全部范围不超过16页，作用域内range_covered入口计数0，
+最终active0，两端detach/cleanup退出0。只证明实际同步成功与范围，
+没有动态直接统计每次hash lookup，也不把uprobes吞吐作性能结论。
+
+撤掉探针，同启动双卡四worker、parent创建前绑核、每轮6秒，
+G→Jinx10.3、E→Garenhost11.1三轮588.036/572.690/544.466 MiB/s，
+12条流内容/字节数全部PASS。中位数572.690，但没有同启动旧路径开关
+对照，不能与旧启动520或459直接相减宣称收益/线性扩展。
+两卡同时各接收256MiB，G3.823159/E4.647691秒，内容和source确认PASS；
+接收端Jinx两IP共用一个10G物理口，只作功能验证。
+guest两NIC错误/丢弃均0，error级dmesg为空；启动仍有此前hrtimer/FAT
+warning，HPET及guest文件系统未修改。TCP重传仍存在，本项未处理。
+
+接收服务首次未以sudo启动导致临时IP添加权限不足，进程退出1；
+没有流量发生，改用已授权sudo后服务正常，不算设备故障。
+测试只使用stdin/memfd，无实验文件/新盘，不测Lux、不重复磁盘测试。
+保留worker6122。整体目标仍未完成；下一步继续查本地同步/完成路径成本，
+并用受控对照验证后续优化收益。
