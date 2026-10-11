@@ -4580,3 +4580,64 @@ ready=true表示该range完成了snapshot复制。范围计数仍不是CPU耗时
 未证明达到只剩DSM开销。最终四CPU、HPET、RSS equal2恢复，
 两卡error/drop计数0、dmesg error为空，两原1GiB盘保持。
 Jinx source STOPLOOM/EXIT0、aliases删除，探针退出，未动Lux或创建实验文件。
+
+### RX warm pair 注册检查合并（98971fc949）
+
+新增loom_vfio_ram_materialize_pair，仅对同4KiB页、互不重叠的两个range、
+现有page_indexed且已有pool mapping时，合并为一次materialize调用。
+原materializer仍检查完整页RAM authority、readonly、map/buffer大小、
+GPA、direction和pool identity；没有省略失效验证，gap不参与payload staging。
+新入口多做一次map lookup，不能称所有lookup减少一半。
+冷页、缺失map、非indexed、跨页/重叠/非法geometry保留两次scalar原顺序。
+
+差分测试发现直接将两个cold调用合一会改变nonindexed布局的失败语义：
+首调用创建mapping，第二调用可能拒绝不一致布局。已改为warm-only合并；
+该初始方案未提交，实际98971fc949保留冷/unsupported路径。
+Ezreal/Garenbuild及diff-check PASS；memfd提取实际production materializer、
+pair API、iavf调用片段，与f263c6ec8c旧代码ASAN+UBSAN差分56000 cases：
+随机正逆序/长度/间隙、高地址、缺失authority/readonly、
+failed/materializing、nonindexed、陈旧size/GPA/direction/pool/read-only、
+map失败、cold/warm、跨页/重叠/零长度，返回值/映射/失败状态相同。
+正常warm pair scalar calls与authority检查2->1；cold failure order保持。
+
+同规格新启动无探针9x256MiB内容/长度/ACK全PASS：
+RX中位数267.485MiB/s，owner hostCPU 4.501ms/MiB，
+hostCPU 10.37s，窗口9.198s。
+四guest CPU/4GiB/两NUMA/#26/HPET、host CPU/memory node0、
+RX RSS全q1/IRQ CPU1/receiver CPU0/固定50042，原组合开关ON。
+```
+0.98196559, 0.95706124, 0.87678632, 0.99330294, 0.88506078, 0.89354027, 1.00180123, 0.95242472, 1.01419801
+```
+没有匹配旧代码OFF回测，未证明本次改动吞吐/CPU收益，未达到native性能。
+该9flow阶段hardware rx_discards从0->519；不能称丢包已消除，
+也没有证据将增加归因于这项改动。
+
+独立带uprobe3x256MiB全PASS：244530次pair仅一个materialize子调用；
+另1次pair保留两个子调用。没有非零返回组，pending/dropped0，
+窗口15.571s包含背景和probe开销，不用作带宽或CPU依据。
+两卡同时收各256MiB也PASS，Garen3.351s/Ezreal4.049s，仅功能证据。
+最终四CPU在线、HPET、RSS equal2，Garenrx_dropped519，
+其他NIC error/drop计数0，guest dmesg error为空，两原1GiB盘保留。
+实际QEMU Garen64221（wrapper86842）/Ezreal802030（wrapper27714）。
+Jinx source STOPLOOM/EXIT0及aliases清理，probe cleanup；
+未改guest或host内核、未动Lux、未创建实验文件。
+
+### AdminQ scoped completion 必须按硬件head设计（尚未实施）
+
+guest现有iavf_adminq.c:598的iavf_asq_done读取VF_ATQH1并比较next_to_use，
+注释明确head比DD timing更可靠；ASQ command head完成后直接复制descriptor
+及buff_size bytes。ARQ clean_element读取VF_ARQH1后直接消费descriptor和payload，
+用完成descriptor datalen作为有效msg长度，再恢复原bi->size/address并写ARQT1。
+因此仅按AQ DD选择完成项会漏发布guest已允许消费的数据；不能套用RX DD逻辑。
+
+下一实现应先采样硬件AQ heads，再从有明确代次/初始化状态的已发布游标
+到采样head确定完成窗口；pread(head)必须先于immutable descriptor/payload捕获，
+全部依赖捕获/验证完再发布，guest看到head前须完成对应内容发布。
+队列wrap、posted tail、cold seed、reset、重新配置、撤销及alias需要显式处理；
+设备稍后推进不能让未捕获payload的新descriptor被重新采样发布。
+ASQ使用posted capacity覆盖driver buff_size消费语义，ARQ保留posted容量与
+writeback datalen的关系。AQ descriptor/payload和数据队列别名需拒绝或统一捕获，
+AdminQ event/reset/未知opcode/布局/失效保留完整同步。
+当前ASQ next只跟踪提交观察、ARQ next只跟踪控制observer，
+不等于可直接复用的完整发布head cursor。控制路径仍使用原full同步。
+这仍是未完成项，不能宣称只剩DSM成本或全量扫描已消除。
