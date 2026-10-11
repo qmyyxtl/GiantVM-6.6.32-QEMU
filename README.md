@@ -6538,3 +6538,61 @@ CPU10固定，O2，函数noinline/noipa，old/new顺序交替，7轮中位数。
 guest #26/HPET与worker-g4不变。没有本轮新网络吞吐结果。
 下一步检查非DSM的off-CPU等待，区分BQL、条件变量、设备队列等待；
 前轮CPU样本不足以排除这些成本。整体目标仍未完成。
+
+#### 单卡主从性能不对称：当前 HPET RPC 归因（2026-10-11）
+
+设备配置逐项核实：两端X710 rev02、固件9.40 0x8000f483 1.3647.0，
+物理10Gbps/MTU1500、VF trust on/spoofchk off，无显示的VF速率限制。
+guest iavf均combined2、RX512/TX128、TSO/GSO/GRO与checksum ON，
+adaptive RX/TX ON、rx/tx-usecs50，RPS0、TXq0 XPS0、
+TXq1 G mask3/E maskc，MSI-X TxRx IRQ分别0/1和2/3。
+设备NUMA G0/CPU0-1、E1/CPU2-3；当前IRQ实际计数也落配置CPU。
+host两侧QEMU线程均允许host NUMA0 CPUs0-47,96-143，
+实际进程内存绝大多数在host NUMA0，与各自VF PCI NUMA0相符。
+没有据这些检查宣称host整机负载/所有PF设置或内存实际页owner完全相同。
+内核源码HEAD两侧e861243ac，但运行G#54内建KVM与E#61模块KVM，
+并不是相同内核binary；这项差异本轮没有因果实验。
+
+代码路径本身尚不完全对称：
+accel/kvm/kvm-all.c 3195-3226先执行loom_pci_handle_mmio，
+其未接管的地址在slave(local_cpu_start_index!=0)走mmio_forwarding，
+master则本地address_space_rw。
+interrupt-router.c 693-729在io_forwarding_mutex下，读同步请求node0回复；
+HPET_BASE=0xfed00000、HPET_COUNTER=0xf0，是非PCI系统设备。
+这里不是说Ezreal网卡BAR全部经master；PCI owner路径已在通用分支前处理。
+
+同一633640bbb6功能binary、四guestCPU在线、#26 HPET不变，
+SSE2 ON、三BAR候选OFF、RPC spin ns0两端QMP读取确认。
+两个单卡条件均两个本地CPU worker、32x1MiB变化内容buffer、
+本地预分配，20秒流量到第三方Jinx两地址，receiver CPU8-11/12-15。
+仅在Ezreal实际PID15976对mmio_forwarding入口/返回挂BCC探针，
+按TGID过滤，用TID配对，按地址统计同步调用墙钟。
+每种模式probe READY后启动guest负载，probe计时15秒，
+因此含负载启动/预分配阶段，不是精确共同payload窗口。
+
+| 流量条件 | vCPU2 HPET完成调用数 / 累计ms | vCPU3 HPET完成调用数 / 累计ms | 合计调用数 / 累计ms |
+|---|---:|---:|---:|
+| G单卡 | 5743 / 370.351887 | 3262 / 210.075219 | 9005 / 580.427106 |
+| E单卡 | 129183 / 3053.330180 | 88126 / 2111.826081 | 217309 / 5165.156261 |
+
+两窗口记录到的地址只有0xfed000f0，明确是远端HPET计数器读取。
+G流量时活跃CPU0/1在master本地，E CPU2/3仍有背景HPET请求；
+E流量时活跃CPU2/3频繁读时钟产生远端同步RPC。
+这证实当前负载下有主从不对称的非DSM设备RPC开销，
+不能把所有等待都算DSM，也不能宣称这已解释全部单卡差距。
+
+统计的是完成入口/返回配对的调用。nested0、结束inflight0，
+但入口/返回探针分别attach/detach，边界未匹配返回G54/E97；
+这些返回没计入次数/耗时，不声称捕捉了所有调用。
+累计是两个vCPU并行调用墙钟，包含锁/调度/发送/回复等待，
+不是独占CPU时间，不能用5.17秒/15秒直接作为带宽损失比例。
+未实施探针开销对照，单轮profile流量观察G947.817/E679.479 MiB/s
+不可替代此前六轮median934.177/704.713或用来推算优化收益。
+四条流内容/字节数校验通过；两模式两卡error/drop增量均0。
+
+探针已卸载，两个receiver正常STOP exit0，Jinx临时地址/49161清理，
+巨虚和worker-g4保留。未改guest/QEMU功能源码/HPET/配置，
+无新实验文件/磁盘/Lux操作。
+下一步先拆这个HPET通用RPC的锁、SEND CQ和reply CQ等待成本；
+已有有界spin候选过去收益不稳定、当前保持0，不能仅据新归因重复开关后称解决。
+同时仍需核实BQL/off-CPU与DSM之外的其它成本，整体目标未完成。
