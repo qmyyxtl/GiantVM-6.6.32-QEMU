@@ -1168,8 +1168,7 @@ int loom_iavf_sync_control_completion(VFIODevice *dev)
 
         scoped = mode && !strcmp(mode, "1");
     }
-    assert(bql_locked());
-    if (!scoped || !dev->loom_iavf_irq_control || !bc || !bc->loom_ram ||
+    if (!scoped || !bql_locked() || !dev->loom_iavf_irq_control || !bc || !bc->loom_ram ||
         !s || !s->valid_mask || !(s->enabled_rx | s->enabled_tx) ||
         !s->completion_payload || s->pending || s->enable_pending ||
         s->ambiguous || !s->asq_enabled || !s->arq_enabled ||
