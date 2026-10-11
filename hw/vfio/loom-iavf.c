@@ -1066,9 +1066,10 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
                 pair = size == rx_payload_size(c->rx_snapshot + next * 32,
                                                  q->rx_buffer_size, bounded) &&
                        (address >> 12) == (second >> 12) &&
-                       (address & 4095) + size <= 4096 &&
-                       (second & 4095) + size <= 4096 &&
-                       MAX(address, second) - MIN(address, second) >= size;
+                       (address & 4095) + q->rx_buffer_size <= 4096 &&
+                       (second & 4095) + q->rx_buffer_size <= 4096 &&
+                       MAX(address, second) - MIN(address, second) >=
+                           q->rx_buffer_size;
             }
             ret = loom_vfio_dma_read_pool(dev->bcontainer, address,
                                           s->completion_payload, size);
