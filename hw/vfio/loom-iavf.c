@@ -71,7 +71,7 @@ static void completion_free(LoomIAVFQueues *s)
 static void completion_init(LoomIAVFQueues *s)
 {
     completion_free(s);
-    s->completion_payload = g_malloc(4096);
+    s->completion_payload = g_malloc(8192);
     for (unsigned i = 0; i < VF_QUEUE_COUNT; i++) {
         LoomIAVFQueue *q = &s->queue[i];
         LoomIAVFCompletion *c = &s->completion[i];
@@ -992,19 +992,39 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
         LoomIAVFQueue *q = &s->queue[id];
         LoomIAVFCompletion *c = &s->completion[id];
 
-        for (unsigned n = 0; n < done[id]; n++) {
+        for (unsigned n = 0; n < done[id]; ) {
             unsigned slot = (c->rx_next + n) % q->rx_count;
             uint64_t address = c->rx_slot[slot].iova;
+            uint64_t second = 0, size = q->rx_buffer_size;
+            bool pair = false;
 
+            if (n + 1 < done[id]) {
+                unsigned next = (slot + 1) % q->rx_count;
+
+                second = c->rx_slot[next].iova;
+                pair = (address >> 12) == (second >> 12) &&
+                       (address & 4095) + size <= 4096 &&
+                       (second & 4095) + size <= 4096 &&
+                       MAX(address, second) - MIN(address, second) >= size;
+            }
             ret = loom_vfio_dma_read_pool(dev->bcontainer, address,
-                                  s->completion_payload, q->rx_buffer_size);
+                                          s->completion_payload, size);
+            if (!ret && pair) {
+                ret = loom_vfio_dma_read_pool(dev->bcontainer, second,
+                                              s->completion_payload + size,
+                                              size);
+            }
             if (!ret) {
-                ret = loom_vfio_dma_publish_snapshot(dev->bcontainer, address,
-                                  s->completion_payload, q->rx_buffer_size);
+                ret = pair ?
+                    loom_vfio_dma_publish_rx_payload_pair(dev->bcontainer,
+                            address, second, s->completion_payload, size) :
+                    loom_vfio_dma_publish_snapshot(dev->bcontainer, address,
+                                             s->completion_payload, size);
             }
             if (ret) {
                 return ret;
             }
+            n += pair ? 2 : 1;
         }
     }
     for (unsigned id = 0; id < VF_QUEUE_COUNT; id++) {

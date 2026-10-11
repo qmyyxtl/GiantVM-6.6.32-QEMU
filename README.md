@@ -4194,3 +4194,47 @@ IRQ q0/q1 local / remote 分布不变。两 host 当前保留
 `LOOM_VFIO_RX_PAGE_BATCH=1`（代码默认仍关闭），PIN=1、ORDERED=1、EARLY=0。
 测试 source/sinks 均收到 STOPLOOM 并 EXIT0，Jinx aliases 删除，未留实验文件。
 Garen 无关 worker-g4 PID6122 未动；未使用 Lux，未重测已接受的磁盘读写。
+
+### 2026-10-11：RX payload 同页双 buffer lease（默认关闭）
+
+guest 不变（四 CPU、HPET、6.12.0-vanilla-vfio #26）。
+本次先在同一次启动中做远端 CPU2/3 online/offline/online 对照，
+固定本地任务 CPU0/1 与本地 NIC data IRQ。单卡到 Jinx 发送三轮中位数
+938.942/937.159/809.148 MiB/s；固定 RX 队列的 256MiB 接收三轮中位数
+243.355/255.418/236.650 MiB/s；既有 owner0 1GiB raw 的
+O_DIRECT、1MiB、两个 worker、每 worker QD4 读取三轮中位数
+2005.000/2007.125/1975.875 MiB/s。发送基线波动大，磁盘未见明显提升；
+这些结果不能证明 DSM 因果关系，远端 CPU offline 也没有停止 slave QEMU/DSM。
+CPU 与 IRQ 已恢复，无 guest dmesg error。未使用 Lux。
+
+独立 BCC 上下文计数轮接收 3 x 256MiB，精确长度/内容/ACK 均通过：
+- RX rearm 的 1536-byte sync_to_device_range：559120 次 CPU 回读，
+  共 858808320 bytes。
+- 1536-byte payload publish_snapshot：558644 次；
+  对应 payload pin/unpin 各 558514 次。
+- RX descriptor API 内 pin/unpin 各 26806 次。
+- dropped/nested/pending/scopes/error 均为 0，探针已退出和清理。
+- 另一独立页面邻接轮：559312 个 RX payload，283682 个同页连续组，
+  同页最大连续组为 2；错误/丢失/残留上下文均为 0。
+探针对吞吐有明显影响，以上仅用于归属和次数分析，elapsed ns 不是 CPU 时间。
+host CPU 与内存固定 node0 是本轮控制条件，不代表已证明通用收益。
+
+新增 LOOM_VFIO_RX_PAYLOAD_BATCH=1（默认 0），
+入口 loom_vfio_dma_publish_rx_payload_pair：
+只在同一有效注册、同一 4KiB IOVA/GPA/host page、
+两个不重叠 RX payload 均有变化且普通 RAM/BQL/RCU 条件满足时，
+共享一次临时写 pin。两份不可变快照先从设备 staging 读取，
+然后逐个按原顺序只发布变化字节，分别 dirty/TB accounting 和 baseline 更新；
+不写间隙，不覆盖未变化的 CPU 字节，所有 payload 仍先于任何 RX DD。
+cache/pin 不可用、跨页、无变化等情况回退原逐 buffer 路径；
+pin 错误立即返回，unpin 错误保留 sticky failure，
+不在失败后发布描述符。不持久缓存 RAM pointer 或 ownership。
+本次保留 rearm CPU 回读、AdminQ/未知操作全量回退与注册失效机制。
+
+编译 PASS。memfd 中提取实际生产函数进行 ASAN+UBSAN：
+已有 ordered RX 108018 cases、descriptor page batch 14408 cases、
+新增 payload pair 16009 cases 均 PASS。新增随机测试含逆序同页地址、
+CPU 未变化字节保护、buffer 间隙保护、逐变化区间失败注入、
+关开关/非RAM/短映射/无BQL/无pin/native/host page 非4KiB/跨页回退，
+pin 0/7 成功、negative pin 与 sticky unpin failure、参数错误。
+硬件开关对照尚待完成，当前不能宣称吞吐收益或启用为默认。

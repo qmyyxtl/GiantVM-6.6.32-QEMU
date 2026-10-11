@@ -58,4 +58,9 @@ int loom_vfio_physical_attach(VFIODevice *, AddressSpace *);
  * Runtime removal with attached devices and materialized pages is unsupported.
  */
 int loom_vfio_physical_region(VFIOContainerBase *, MemoryRegionSection *, bool);
+
+/* Two caller-owned RX payload snapshots, each of size bytes. */
+int loom_vfio_dma_publish_rx_payload_pair(VFIOContainerBase *, hwaddr, hwaddr,
+                                          const void *, uint64_t);
+
 #endif

@@ -58,6 +58,7 @@ struct LoomVFIODMA {
     bool ordered_publication;
     bool early_publication;
     bool batched_rx_publication;
+    bool batched_rx_payload;
     bool publication_failed;
 };
 
@@ -299,6 +300,9 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
         const char *batch = getenv("LOOM_VFIO_RX_PAGE_BATCH");
 
         bc->loom_dma->batched_rx_publication = batch && !strcmp(batch, "1");
+        const char *payload = getenv("LOOM_VFIO_RX_PAYLOAD_BATCH");
+
+        bc->loom_dma->batched_rx_payload = payload && !strcmp(payload, "1");
         const char *buffers = getenv("LOOM_VFIO_BUFFER_RECYCLE");
         bc->loom_dma->recycle_buffers =
             !buffers || strcmp(buffers, "0");
@@ -1569,6 +1573,130 @@ int loom_vfio_dma_publish_snapshot(VFIOContainerBase *bc, hwaddr iova,
         bytes += len;
     }
     return 0;
+}
+
+/*
+ * Two immutable RX payload snapshots can borrow one single-page write lease.
+ * Merge only their changed bytes: the gap and CPU updates to unchanged bytes
+ * remain untouched. The caller publishes completion descriptors afterwards.
+ */
+static int publish_rx_payload_cached(MemoryRegionCache *cache,
+                                      LoomDMABuffer *b,
+                                      const uint8_t *snapshot)
+{
+    uint64_t pos = 0;
+
+    while (pos < b->size) {
+        uint64_t start;
+
+        pos = skip_matching_bytes(snapshot, b->baseline, pos, b->size, true);
+        start = pos;
+        pos = skip_matching_bytes(snapshot, b->baseline, pos, b->size, false);
+        if (start == pos) {
+            break;
+        }
+        if (address_space_write_cached(cache, start, snapshot + start,
+                                        pos - start) != MEMTX_OK) {
+            return -EIO;
+        }
+        address_space_cache_invalidate(cache, start, pos - start);
+        memcpy(b->baseline + start, snapshot + start, pos - start);
+    }
+    return 0;
+}
+
+int loom_vfio_dma_publish_rx_payload_pair(VFIOContainerBase *bc,
+                                           hwaddr first, hwaddr second,
+                                           const void *snapshot, uint64_t size)
+{
+    MemoryRegionCache cache = { 0 };
+    const uint8_t *bytes = snapshot;
+    hwaddr address[2] = { first, second };
+    LoomDMABuffer *b, part[2];
+    hwaddr lower, upper;
+    uint64_t span;
+    bool pinned = false;
+    int ret;
+
+    if (!bc || !bc->loom_dma) {
+        return -ENODEV;
+    }
+    if (!snapshot || !size || size > 4096 ||
+        first > UINT64_MAX - size || second > UINT64_MAX - size) {
+        return -EINVAL;
+    }
+    if (bc->loom_dma->publication_failed) {
+        return -EIO;
+    }
+    if (!bc->loom_dma->batched_rx_payload ||
+        !bc->loom_dma->pin_publication || !bc->loom_physical ||
+        !bc->loom_dma->cache_publication || !bql_locked()) {
+        goto fallback;
+    }
+    /* Reject overlapping buffers and leases crossing an IOVA page. */
+    lower = MIN(first, second);
+    upper = MAX(first, second) + size;
+    span = upper - lower;
+    if (MAX(first, second) - lower < size || span > 4096 ||
+        (lower & 4095) + span > 4096) {
+        goto fallback;
+    }
+    b = buffer_at(bc->loom_dma, first);
+    if (!b || b->direction == 1 ||
+        buffer_at(bc->loom_dma, second) != b) {
+        goto fallback;
+    }
+    for (unsigned n = 0; n < 2; n++) {
+        if (address[n] < b->iova || address[n] - b->iova > b->size ||
+            size > b->size - (address[n] - b->iova)) {
+            goto fallback;
+        }
+        part[n] = buffer_view(b, address[n] - b->iova, size);
+    }
+    /* A lease saves work only when both snapshots need publication. */
+    if (!memcmp(bytes, part[0].baseline, size) ||
+        !memcmp(bytes + size, part[1].baseline, size) ||
+        ((b->gpa + lower - b->iova) & 4095) + span > 4096) {
+        goto fallback;
+    }
+    rcu_read_lock();
+    if (address_space_cache_init(&cache, &address_space_memory,
+                                  b->gpa + lower - b->iova, span, true) != span ||
+        !memory_access_is_direct(cache.mrs.mr, true)) {
+        address_space_cache_destroy(&cache);
+        rcu_read_unlock();
+        goto fallback;
+    }
+    ret = publication_acquire(bc, &cache, span, &pinned);
+    if (!ret && !cache.ptr) {
+        address_space_cache_destroy(&cache);
+        rcu_read_unlock();
+        goto fallback;
+    }
+    for (unsigned n = 0; !ret && n < 2; n++) {
+        uint64_t offset = address[n] - lower;
+        MemoryRegionCache view = cache;
+
+        view.ptr += offset;
+        view.xlat += offset;
+        view.len = size;
+        ret = publish_rx_payload_cached(&view, &part[n], bytes + n * size);
+    }
+    if (pinned) {
+        int release_ret = publication_unpin(bc, &cache);
+
+        if (release_ret) {
+            ret = release_ret;
+        }
+    }
+    address_space_cache_destroy(&cache);
+    rcu_read_unlock();
+    return ret;
+
+fallback:
+    ret = loom_vfio_dma_publish_snapshot(bc, first, bytes, size);
+    return ret ? ret : loom_vfio_dma_publish_snapshot(bc, second,
+                                                       bytes + size, size);
 }
 
 /*
