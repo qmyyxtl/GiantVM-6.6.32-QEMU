@@ -5034,3 +5034,55 @@ iavf coherent ring用dma_alloc_coherent，page pool nid=NUMA_NO_NODE。
 这不证明实际DMA页落在哪个节点；下一步检查实际注册GPA/NUMA位置，
 判断E额外耗时哪些属于DSM，哪些仍为可降低的设备处理开销。
 目标尚未完成，不把IRQ数量减少解释成全部非DSM开销已消除。
+
+### 2026-10-11：RX 完成路径的包长与缓冲区处理范围
+
+本轮未修改 guest、HPET、设备配置或 QEMU 功能代码。两端源码均为
+b400b19c84，Garen QEMU PID 175504、Ezreal 825299；四个 guest CPU 在线。
+只对 Garen 的实际运行 ELF 做临时 uprobe 抽样，无实验文件。
+文件式 gdb 读取 DWARF（不 attach 进程）确认队列/完成结构偏移；
+sync_data_completion 入口记录当前线程的 completion_payload，
+仅统计 read_pool 的目标地址恰为该缓冲区起点的调用。
+每 128 次抽样一次，在已登记 RX slot 中匹配 IOVA，
+读取不可变 rx_snapshot 的 DD 与长度；仅 read_pool 返回成功才计入长度直方图。
+第二个配对 payload（目标为 completion_payload + size）不纳入该样本，
+因此下面不是全部 RX 包数或整条路径的总字节数。
+
+发送：guest CPU0/1 两 worker 经 enp0s7 向第三方 Jinx 发约 6 秒。
+接收端内容校验全部 PASS。首 payload read 调用 50244 次、请求字节数
+77174784；成功抽样 393 次，其中 392 个长度 66、1 个长度 74，
+处理大小全部 1536。抽样实际长度合计 25946 字节，
+请求范围 603648 字节；按已验证包长缩小该范围的理论空间为 95.70%。
+这是缓冲区读取/比较范围的空间，不是整个 QEMU CPU、DSM 流量
+或网络吞吐的收益证明。探针使调用开销增加，带探针吞吐不作基线。
+
+接收：Jinx 分别向两 VF 发 256 MiB，两端内容校验 PASS；
+探针仍只在 Garen。首 payload read 94282 次、请求字节数 144817152；
+成功抽样 737 次：长度1514有725个，其余为
+1146×3、274×1、1034×1、434×3、74×1、1074×1、1186×2。
+处理大小均1536，样本长度合计1107218、请求范围1132032，
+理论范围缩减仅2.19%。所以此项更针对发送过程中的小 ACK 接收，
+不能当作大包接收性能差的主要解释。
+
+两次观测 read-user 错误、无效 DD/长度、slot 未匹配、抽样 read 返回错误
+计数均0，导出时 sample active0；探针 detach/cleanup 后退出0。
+计数包含观测窗口背景流量，抽样是周期性的，并非随机全量分布。
+Jinx source/sinks STOP 后均正常退出0，临时IP/端口清理。
+
+当前 guest iavf 驱动 iavf_txrx.c 的 clean_rx_irq 在 DD/dma_rmb 后
+取 LENGTH_PBUF，并以 size 调用 libeth_rx_sync_for_cpu、
+iavf_build_skb/iavf_add_rx_frag。这给出了 guest 实际消费范围的源码证据。
+QEMU loom-iavf.c:1015 已验证长度不大于配置缓冲区，
+但1031后的 payload read/publish 仍使用 rx_buffer_size。
+下一项候选是只处理已验证的有效前缀，仍需检查设备写入范围契约；
+保持现有全范围的注册/生命周期/别名检查、payload-before-DD 顺序，
+零长度/未知描述符等状态回退原路径，配对长度不同时正确退化，
+并做原路径对照、实际收发与 reset 验证。尚未实现或启用这个候选。
+
+另：本 boot 的 guest cmdline 不含 IOMMU 选项，DMAR日志/IOMMU groups 为空，
+实际为无 guest vIOMMU 的 physical DMA 路径；不能沿用历史 strict vIOMMU
+实验标签。此前 DMA NUMA 快照中 Ezreal 注册表完整（1815项、读错误0、
+链表余项0），两 RX/TX ring 和已登记的 posted RX payload 均为 guest node1。
+Garen 2048项快照有余项，不能由缺失项判定未映射；8192项扩大探针
+被 BPF verifier 拒绝，已 cleanup，无可用结果。SRAT 的逻辑 GPA NUMA
+不等于当前 DSM owner，尚不能据此判断跨网传页成本。
