@@ -6440,3 +6440,56 @@ __dev_queue_xmit在ENETDOWN路径确有core drop计数，但没trace具体skb，
 新巨虚及worker-g4保留。stdin/memfd，无实验文件/新盘/磁盘测试/Lux。
 既有host dirty-page warning未修复。下一步以这个匹配单/双卡基线定位
 并发增加的DSM与非DSM成本；当前仍不能宣称设备聚合性能目标完成。
+
+#### 同一NUMA启动的单卡/双卡 owner CPU 堆栈比较（2026-10-11）
+
+沿用633640bbb6 binary、实际PID G52069/E15976、#26、
+四CPU/HPET/两iavf NUMA0/1、RSS q1与IRQ/XPS配置。
+local-bar-route/negative-filter/lock-batch均OFF，byte SIMD ON。
+不再down/up；Jinx两地址对应同一10Gbps物理口和CPU8-11/12-15。
+每模式单独变化内容流量20秒，G或E两个本地worker，dual四个。
+打印TRAFFIC_BEGIN后，两端各采cpu-clock:H 49Hz、DWARF8192、12秒，
+实际record周边计数窗口13.407–13.439秒，包含perf启动/结束开销。
+内存buffer在worker CPU本地预分配，不新增guest源码/config/实验文件。
+
+| 模式 | G/E 样本数 | G/E DSM帧样本 | 合计DSM比例 | 合计无DSM的设备样本 | 两端hostCPU秒 |
+|---|---|---|---:|---:|---:|
+| G单卡 | 645/84 | 182/49 | 31.69% | 304 | 18.58 |
+| E单卡 | 153/579 | 32/131 | 22.27% | 253 | 20.39 |
+| 双卡 | 615/539 | 273/264 | 46.53% | 239 | 32.35 |
+
+hostCPU=(utime+stime-guest_time)/CLK_TCK，PID范围所有线程，
+不包括独立DSM请求kernel线程、IRQ或其他进程；不是全host成本。
+堆栈按DSM/ivy/krdma优先分组，比例是CPU样本不是wall-clock等待。
+kvm_dsm_memcpy帧也含本地读写API，不能把每个DSM帧都当成远端传页。
+没有记录perf子窗口内独立payload计数，不据全20秒吞吐推算精确CPU/MiB。
+
+双卡dsm_lock inclusive样本合计123，对单G24/单E19；
+mutex_spin_on_owner第一帧合计103，对单G12/单E12。
+锁栈明确来自KVM page acquire dsm_lock；
+CQ锁栈来自mlx5_ib_poll_cq→krdma_poll→krdma_send→kvm_dsm_fetch。
+这是并发DSM锁/完成轮询放大的证据，不是仅凭raw_spin函数名猜BQL。
+
+字节扫描skip_matching_bytes第一帧合计：G单41、E单33、dual30。
+活跃owner单卡比例G41/645=6.36%、E33/579=5.70%。
+类型检查第一帧单G18/单E11，dual合计19；
+bql_lock_impl inclusive G单20、E单28、dual23（非互斥、不能与其它帧相加）。
+本次CPU采样没有显示这些函数绝对样本数像DSM锁一样增长，
+但不能排除BQL/off-CPU阻塞、队列等待或其它未采到的共享争用。
+bar_access inclusive单G372/单E285、dual239；
+仍包括其内部DMA/KVM时间，不能将整段归为纯路由成本。
+
+记录流量观察G925.716/E699.224/dual531.456 MiB/s，
+三模式八条流全部变化内容/字节数PASS，error/drop增量0。
+有profiler且一轮/模式，不能与无profile的934/705/561跨窗口
+相减当性能收益，或据此定量归因全部聚合损失。
+最终软件tx_dropped各4未增长，其它三计数0，guest error-level dmesg为空，
+HPET保持。所有perf/flow任务完成exit0；receiver STOP exit0，
+Jinx临时10.3/11.3与49161监听清理，保留巨虚与worker-g4。
+既有host dirty-page warning未修复。本轮无功能源码修改/磁盘/Lux测试。
+
+本次证据支持双卡并行额外CPU热点主要向DSM锁与完成轮询转移，
+整体性能目标仍未完成，不能宣称所有剩余损失都由DSM造成。
+下一步非DSM候选是精确变化字节扫描（单卡活跃端约6%样本）；
+先做更宽SIMD的实际helper微测试与边界证明，只有证明有益才修改，
+不改变publication范围或DMA顺序。同时保留阻塞等待未核实的限制。
