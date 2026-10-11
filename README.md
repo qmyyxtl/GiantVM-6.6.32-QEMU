@@ -4676,3 +4676,58 @@ bad identity、unknown opcode、queue ACK/reset/malformed event、
 不是完整硬件/DSM等价证明。新增identity真实函数20个authority/map/GPA/readonly/
 poison/overflow/边界cases与现有warm pair56000回归一起ASAN/UBSAN PASS。
 实机启用、控制操作、性能和scan counts仍待验证，默认不启用。
+
+
+### AdminQ 原型实机初验（2026-10-11，functional b486e282c6）
+
+Ezreal/Garen 同源、clean，production控制测试在BQL fail-closed修正后
+ASAN+UBSAN 85051 cases PASS BOTH；identity真实函数+warm回归56020 PASS BOTH。
+未改guest源代码、host内核、HPET。先前“尚未实施”和“待实机验证”为历史记录，
+本节记录当前实现与实机结果；按head窗口进一步缩减仍未实施。
+
+同一二进制、host CPU/memory bind0、guest #26四核4GiB/两NUMA，
+两VF、两原1GiB数据盘；Garen单卡RSS所有流固定queue1，worker CPU0，
+owner IRQ queue0/1=CPU0/1、远端=CPU2/3。跨启动仅AdminQ开关OFF→ON。
+无探针9×256MiB接收均验证内容、长度和ACK：
+OFF median 264.550 MiB/s，owner CPU 10.82s /
+4.696181 ms/MiB；
+ON median 276.711 MiB/s，owner CPU 10.6s /
+4.600694 ms/MiB。
+吞吐中位数约+4.60%，CPU约-2.03%；只有一对跨启动、样本重叠，
+RSS key每boot重新生成（已固定queue），不能宣称稳定收益或普通VM性能已追平。
+CPU=/proc/<actual-qemu>/stat (user+system-guest)/HZ，窗口含串口启动边缘；
+不是纯VFIO或DSM成本。OFF/ON该9轮rx_discards都0。
+
+独立uprobe三轮接收，内容PASS（带probe速度不作性能基线）：
+OFF已知MMIO read对应full from-device共88次，其他from-device40、to-device8；
+control ret0=96，data retpositive=80590。
+ON已知read full=0，其他from-device36、to-device9；
+control retpositive=98、ret0=2、negative0，data retpositive85752。
+OFF full-sync snapshot candidates 290624页/1190395904 bytes，
+其中snapshot_ready实际copy95页/389120 bytes；
+ON candidates151240页/619479040 bytes，copy7页/28672 bytes。
+这些计数只覆盖full同步，不包含新AQ/data scoped capture/publish；
+候选bytes不是实际copy、更不是CPU成本或可归因吞吐损失。
+两个窗口9.314/10.314s含背景；readonly探针detach cleanup、
+active read/snapshot均0。不能因候选量减少就声称全部非DSM开销降低同样比例。
+
+最终ON同次运行的caller探针（两卡同时收各256MiB，内容PASS）：
+Garen16次非read from-device full均定位到两直接返回地址：
+vfio_loom_sync.constprop.0+0x14 8次；
+loom_iavf_physical_bar_write+0x362 8次。
+frame-pointer用户栈不完整，仅直接caller有确定证据。
+源码核实physical_bar_write非data控制写先full completion、
+reconcile/observe再AdminQ prepare/write；helpers非scoped写也保留full。
+下一步应记录确切BAR地址及控制阶段，验证安全的提交/完成依赖边界，
+再考虑控制写限定范围；不可直接跳过full或复用过期发布快照。
+
+ON两卡同时RX各256MiB PASS，G3.451s/E4.072s（probe期间，仅功能）。
+TX G/E/DUAL各一轮6s，8条连接内容/长度PASS，
+805.930/606.268/425.956 MiB/s；没有对应OFF对照，仅功能证据，
+Jinx两测试IP共用一个10G物理口，不能用这组数字证明线性双卡扩展。
+final guest CPU0-3、HPET、RSS equal2，两盘仍各1GiB；
+两卡rx/tx errors/dropped0，error级dmesg空。
+当前actual QEMU Garen101450(wrapper91087)/Ezreal809236(wrapper17412)，
+LOOM_IAVF_ADMIN_SCOPED=1仅本次显式启用，source默认OFF。
+所有探针终止cleanup，Jinx sink/source STOPLOOM/EXIT0及aliases移除；
+未动Lux、worker-g4，未创建实验文件。目标仍未完成。
