@@ -5198,3 +5198,73 @@ driver finally实际恢复flag0、G XPS0/RSS equal2，回到原配置；
 E始终flag0/XPS0/RSS equal2。两组测试正常EXIT0，
 Jinx两sink STOP/EXIT0，拥有的两个测试IP均删除、端口清理。
 四CPU/HPET保持，Garen worker6122保留，Lux不动；无新增实验文件。
+
+### 2026-10-11：完成回调中空闲 TX ring 的实际工作量
+
+源码仍d59ef7403c，文档基线771673ca40；G226864/E835692同boot。
+未改生产代码/guest/HPET/内核；仅G临时uprobe+kprobe，
+观察sync_data_completion、read_pool、kvm_vm_ioctl_dsm、
+ivy_kvm_dsm_page_fault。文件式gdb确认运行ELF结构偏移，
+不attach进程。启动cached bounded0，DESC_PAIR0，原有模式不变。
+每次发送G两worker CPU0/1、6秒到第三方Jinx，接收内容校验PASS。
+
+首版单层scope/pending表出现1次嵌套完成与3次嵌套读取，
+会误配父子return，整个首版导出弃用。
+修正按PID/TID+调用深度保存scope和read pending，匹配各层返回；
+测试观察两次导出所有active/depth表均0，用户字段读取错误0、
+DMA read及DSM ioctl错误0，探针均detach/cleanup/EXIT0。
+修正版两次窗口中实际nested计数均0，不据此宣称已实测覆盖嵌套场景。
+
+固定q1（G XPS q0=0/q1=3、RSS weight0,1）：
+实际包数q0 TX/RX均0，q1 TX1941145/RX75724，
+guest q0 IRQ0、q1 IRQ20823且全在CPU1，discard/errors/drop增量0。
+完成回调87234次，全部ret1；TX ring q0与q1各87234次，
+每次2048，共各178655232字节（170.379 MiB）。
+q0没有流量却仍付出同样TX ring读取、type检查、publish比较路径。
+RX q0仅87234次8字节DD检查，q1 162943次8字节status、
+75709次32字节描述符、75709次1536字节payload。
+不建议以无流量为由跳过RX状态检查，因为仍有已投递buffer。
+计数含背景窗口，不等于测试包数；没有用探针吞吐比较性能。
+
+同一固定q1窗口，完成上下文DSM MEMCPY(cmd0x4020aef1)75044次、
+观测处理器elapsed总56145139ns；MEMPIN(cmd0x4018aef2)161382次、
+88012676ns（含pin/unpin形态，未分flags）。
+上下文外MEMCPY885211次/777848339ns，MEMPIN126次/848392ns，
+cmd0x4010aef3有918次/1639157ns。
+ivy_page_fault入口上下文内155735、外1306198。
+ivy函数入口包含is_fast_path，不是远端传页次数；ioctl处理器elapsed
+也不包括完整syscall边界、全部异步DSM工作或纯CPU时间，
+不能简单从回调时间中相减后宣称其它部分全部是非DSM。
+
+恢复原XPS0/RSS equal2后另一次观察（多加caller probe，扰动不同）：
+两TX/RX队列实际均有包，q0/q1 IRQ21839/25472，全在ownerCPU0/1，
+错误/discard/drop增量0。完成129610次，ret1，
+两个TX ring各129610次×2048=265441280字节。
+RX q0/q1 status152125/157218次、描述符22515/27608次，
+payload50123次×1536=76988928字节。
+完成内MEMCPY62653次/49516236ns、MEMPIN151274次/85250555ns；
+ivy入口内138290、外1264162。全部read/ioctl错误0、active0。
+该组与固定q1组窗口/流量/探针不同，不能按总量比较单位流量收益。
+
+caller probe从入口stack return address取得直接调用者，
+运行ELF addr2line解析，读取错误0。窗口计数：
+vfio_msi_interrupt(pci.c:374)47312；
+vfio_loom_sync_write(helpers.c:199)47312；
+loom_iavf_physical_bar_write(loom-iavf-bar.c:181)34470；
+loom_iavf_sync_control_completion(loom-iavf.c:1387)300。
+caller窗口与工作量窗口并非严格相同，不能要求两者总和完全一致。
+源码显示中断控制写、队列tail写和MSI-X都触发完整data completion；
+不能只由IRQ数量判断完成扫描次数。
+
+下一项设计：从已验证的TX tail提交和RS/EOP完成状态跟踪outstanding，
+只有证明队列drained且配置/generation未变化，才跳过空TX ring读取、
+类型扫描及publish比较；reset、reconfigure、unmap、未知/歧义状态失效，
+保留原完整同步fallback。不能把单个尾指针相等或一轮无包当成drained，
+也不能只检查所有descriptor均DD（native只在RS/EOP处写回）。
+不直接删除中断控制/队列tail前完成同步，避免遗漏被屏蔽IRQ期间的完成。
+这还是设计候选，尚未实现或证明收益。
+
+测试结束G XPS0/RSS equal2恢复，E一直保持原配置；
+四CPU/HPET、guest error级dmesg空，Gworker6122保留。
+Jinx sink STOP/EXIT0并清理测试IP，全部uprobe/kprobe EXIT0清理；
+无新增实验文件、无重启、不测Lux、不再测已接受磁盘性能。
