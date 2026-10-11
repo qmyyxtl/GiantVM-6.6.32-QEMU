@@ -909,7 +909,7 @@ static bool tx_snapshot_types_valid(const uint8_t *snapshot, unsigned count)
  */
 int loom_iavf_sync_data_completion(VFIODevice *dev)
 {
-    static int scoped = -1;
+    static int scoped = -1, descriptor_paired = -1;
     LoomIAVFQueues *s = dev->loom_iavf_queues;
     unsigned done[VF_QUEUE_COUNT] = { 0 }, devices = 0;
     VFIODevice *member;
@@ -919,6 +919,11 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
         const char *mode = getenv("LOOM_IAVF_COMPLETION_SCOPED");
 
         scoped = !mode || strcmp(mode, "0");
+    }
+    if (descriptor_paired < 0) {
+        const char *mode = getenv("LOOM_VFIO_RX_DESC_READ_PAIR");
+
+        descriptor_paired = mode && !strcmp(mode, "1");
     }
     if (!scoped || !dev->loom_iavf_irq_control || !dev->bcontainer ||
         !s || !s->valid_mask || !(s->enabled_rx | s->enabled_tx) ||
@@ -984,8 +989,22 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
              * as in the native driver. The helper may reuse a native mapping
              * within this call; status must still match the captured word.
              */
-            ret = loom_vfio_dma_read_rx_descriptor(dev->bcontainer,
-                                q->rx_iova + slot * 32ULL, snapshot, &word);
+            if (descriptor_paired) {
+                ret = loom_vfio_dma_read_rx_descriptor(dev->bcontainer,
+                                    q->rx_iova + slot * 32ULL, snapshot, &word);
+            } else {
+                uint8_t status[8];
+
+                ret = loom_vfio_dma_read_pool(dev->bcontainer,
+                                    q->rx_iova + slot * 32ULL + 8, status, 8);
+                if (!ret) {
+                    word = ldq_le_p(status);
+                    if (word & 1) {
+                        ret = loom_vfio_dma_read_pool(dev->bcontainer,
+                                    q->rx_iova + slot * 32ULL, snapshot, 32);
+                    }
+                }
+            }
             if (ret) {
                 return ret;
             }
