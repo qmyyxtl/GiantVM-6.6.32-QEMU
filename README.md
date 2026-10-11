@@ -5745,3 +5745,65 @@ Jinx两IP同一10G口，仅作功能验证。HPET/四CPU不变，error级dmesg�
 RX/TX错误/丢弃的增量均0，TX累计保持23/13；TCP重传仍未处理。
 当前带宽漂移和累计丢弃需要后续结合实际DSM请求/丢弃来源定位，
 不能用本轮证明线性扩展或整体非DSM成本已经最小化。
+
+### 网卡 open 调用 CPU 对照与设备 NUMA 路径核实
+
+功能版本仍93d917d807，两端运行PID365528/861309；
+guest 6.12.0-vanilla-vfio、CPU0–3、NUMA0–1、HPET不变。
+两NIC device/numa_node实测均-1；没有修改guest源码或写numa_node。
+
+源码检查纠正一个先前的设计假设：
+guest drivers/pci/probe.c:pci_device_add把设备节点设为pcibus_to_node(bus)；
+arch/x86/pci/acpi.c:pci_acpi_root_get_node读取根桥_PXM。
+当前pci_acpi_setup及x86 pcibios_device_add没有从端点_PXM更新设备节点。
+QEMU两个聚合端点在同一根总线，remote proxy也未复制目录numa_node；
+即便只增加端点_PXM，当前guest的上述路径仍不会据此设置dev_to_node。
+因此本轮没有实施或宣称“只改QEMU端点AML就能修复guest NUMA”。
+若以后支持该拓扑，需要完整验证PCI根桥/总线拓扑方案，或guest
+PCI绑定时读取端点节点；移动设备到额外根总线还受现有Loom目录
+仅支持root bus/256个BDF槽约束，不能只改启动地址。
+
+不改guest源码的配置实验：
+iavf_open直接调用setup_all_tx/rx_resources，TX tx_bi普通kzalloc，
+RX fqes为kvcalloc_node(NUMA_NO_NODE)，DMA direct分配读取dev_to_node。
+因此把ip link set up的调用进程绑到owner CPU可能影响首次分配位置，
+但这不证明全部页面归属；CMA、fallback、异步workqueue及后续分配
+仍需单独核实。没有用sysfs numa_node覆盖（该接口会标记firmware
+workaround taint，而且不会自动迁移已经分配的对象）。
+
+三组同启动交替A/B，每轮两NIC先down/up：
+A两张卡均由CPU0开启；B G卡CPU0/E卡CPU2开启。
+临时调用进程亲和性随后恢复；combined2、RX512/TX128、RSS固定q1，
+XPS tx0=0/tx1 G3/Ec，按名字绑定q0 CPU0/2、q1 CPU1/3。
+四worker、parent创建前绑核、1MiB发送块、每轮6秒；
+G→Jinx10.3/E→Garenhost11.1，两物理接收链路，后一host与Gowner共用。
+两QEMU user+system-guest CPU由serial BEGIN/END握手同步采样，
+配置不在采样窗口，包含worker创建/连接/回收及DSM，不是纯非DSM成本。
+
+|pair|master开启 MiB/s|owner开启 MiB/s|master host ms/MiB|owner host ms/MiB|
+|---|---:|---:|---:|---:|
+|0|537.649|549.793|4.264163|4.093249|
+|1|533.357|559.501|4.508580|4.117822|
+|2|505.716|524.580|4.724771|4.690574|
+
+中位数533.357/549.793，owner高约3.08%，三组均高；
+host CPU中位数4.508580/4.117822。样本少、整体带宽随过程下降，
+不能声称稳定收益或证明DSM已减少，更不能证明非DSM开销已经最小。
+六轮24条流内容/字节数PASS，测量窗口两NIC错误/丢弃增量均0。
+
+最终保留owner开启配置，再做独立四流功能检查495.341 MiB/s；
+所有内容/字节数PASS。G q0 TX/RX增量0，q1 TX1083881/RX47926；
+E q0 TX1/RX0，q1 TX1074427/RX46781，不声称q0绝对无控制包。
+error级dmesg为空、四CPU/HPET保持，IRQ36→0、39→1、38→2、40→3。
+累计tx_dropped从G23/E13变为G37/E27；七次双卡重开期间总体各增加14，
+全部七轮流量窗口增量0，但尚未在控制阶段逐次定位具体丢弃原因。
+iavf_virtchnl.c把PF返回的tx_discards映射到netdev->stats.tx_dropped；
+不能只按该计数断言QEMU数据复制错误，也不能忽略累计增长。
+
+接收服务及只读CPU服务已STOP并退出0；Jinx临时IP删除，
+49161/48747监听消失，worker6122保留。首次从Garen向Jinx测试IP发STOP
+因host无相应连通路径超时，随后各节点通过自己的本地IP发STOP成功，
+没有据此重启或重复实验。仅stdin，无实验文件/新盘；未测Lux/磁盘。
+本轮只更新README记录；设备NUMA拓扑代码和guest源码均未修改。
+整体目标仍未完成，后续需继续量化真实DMA复制/扫描/队列处理的
+非DSM成本，再选择有证据支持的QEMU优化。
