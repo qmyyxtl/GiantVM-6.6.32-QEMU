@@ -1018,20 +1018,24 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
                 return ret;
             }
         }
-        for (unsigned n = 0; n < done[id]; n++) {
+        for (unsigned n = 0; n < done[id]; ) {
             unsigned slot = c->rx_next;
-
             uint64_t descriptor = q->rx_iova + slot * 32ULL;
             uint8_t *snapshot = c->rx_snapshot + slot * 32;
+            unsigned count = MIN(done[id] - n, q->rx_count - slot);
 
-            /* Payload is complete; this API preserves metadata-before-DD. */
-            ret = loom_vfio_dma_publish_rx_descriptor(dev->bcontainer,
-                                                       descriptor, snapshot);
+            /* Bound the lease to one page and never cross the ring wrap. */
+            count = MIN(count, MAX(1, (4096 - (descriptor & 4095)) / 32));
+            ret = loom_vfio_dma_publish_rx_descriptors(dev->bcontainer,
+                                             descriptor, snapshot, count);
             if (ret) {
                 return ret;
             }
-            memset(&c->rx_slot[slot], 0, sizeof(c->rx_slot[slot]));
-            c->rx_next = (slot + 1) % q->rx_count;
+            for (unsigned j = 0; j < count; j++) {
+                memset(&c->rx_slot[slot + j], 0, sizeof(c->rx_slot[slot + j]));
+            }
+            c->rx_next = (slot + count) % q->rx_count;
+            n += count;
         }
     }
     return 1;

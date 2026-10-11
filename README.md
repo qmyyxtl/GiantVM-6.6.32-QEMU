@@ -4098,3 +4098,38 @@ CPU0–3/HPET、两NIC UP/2queues512128，NIC IRQ37/38/39/40→2/0/3/1，
 两1GiB盘枚举正常，error级dmesg空、NIC四项errors/drops均0。
 Garen worker-g4 PID6122仍运行、未操作；Jinx只剩原管理IP、49161/49162无监听。
 最终gate修正binary只做启动/配置核实，以上性能/流量对照均明确来自398ab02b19。
+
+### 2026-10-11：接收描述符按页批量发布（实验开关）
+
+`LOOM_VFIO_RX_PAGE_BATCH=1`（默认关闭）允许同一完成处理中的连续 RX
+描述符共用一次短暂的 RAM translation / DSM write-pin。guest 不变，
+不修改 HPET。依赖已有 `LOOM_VFIO_ORDERED_PUBLICATION=1`、
+`LOOM_VFIO_PUBLICATION_PIN=1`，以及已经验证的 atomic-unpin host kernel。
+
+- 调用者先完成所有选中 payload 的发布，随后把不可变的 32 字节描述符快照
+  按连续、同 4KiB 页、同环区间拆分；单批最多 128 个，不跨 ring wrap。
+- DMA 层还检查完整注册覆盖、device-writable direction、完整普通 RAM mapping、
+  GPA 和真实 host pointer 的单页边界；指针不越过 BQL/RCU 或本次调用。
+- 每个描述符仍只写与 baseline 不同的字节，metadata 两个区间先写，
+  write barrier 后 DD byte 最后写；保留 dirty/TB accounting 和 baseline 更新。
+  不合并整页写回，不覆盖 CPU 对未改变字节的修改。
+- cache 子视图借用同一个 mapping/lease，只有父视图负责 destroy/unpin。
+  pin 错误不降级为无所有权写入；unpin 错误保持 sticky failure 并由既有路径停机。
+  不支持的布局和关闭开关均保留逐描述符发布。
+- 编译通过；从真实生产函数抽取、memfd 编译执行的 ASAN/UBSAN 验证通过：
+  原有 ordered RX 108018 cases + batch 14408 cases。覆盖随机 1–128 描述符、
+  不覆盖 guest 未修改字节、每个 DD 的 metadata 顺序、逐写失败、
+  pin 返回正值/零/负值、unpin sticky failure、缓存短映射、非 RAM、
+  BQL/pin/ordered/batch 关闭、native RAM、错误参数及 dirty offset。
+  这些测试使用 mock RAM/DSM，真实设备吞吐仍需另行验证。
+
+修改前 Garen owner 实测：四个 guest CPU 在线、#26 guest kernel / HPET，
+enp0s7 固定 RX 队列 1、IRQ CPU1、接收进程 CPU0，
+Jinx 198.18.10.3:49162 -> guest 198.18.10.2:50042，
+3 x 256MiB 全部 count/pattern 校验通过。
+BCC uprobe 观察到 559019 个 RX 描述符，可分为 27896 个连续同页区间，
+约 20.04 描述符/区间；90306 次 completion 调用中 24110 次非空，
+2914 次只有一个描述符，单次最大 192、同页最大 128。
+pending/dropped/outside/errors 均为 0。
+该统计说明存在摊薄调用的机会；probe 本身影响时序，
+不能把理论减少比例当成已实现的 ioctl 或吞吐提升。

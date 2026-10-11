@@ -34,6 +34,9 @@ int loom_vfio_dma_publish_snapshot(VFIOContainerBase *, hwaddr,
 /* Immutable 32-byte RX writeback: metadata first, DD byte at offset 8 last. */
 int loom_vfio_dma_publish_rx_descriptor(VFIOContainerBase *, hwaddr,
                                         const void *);
+/* Same ordered publication for up to 128 contiguous captured writebacks. */
+int loom_vfio_dma_publish_rx_descriptors(VFIOContainerBase *, hwaddr,
+                                         const void *, unsigned);
 /* Registration lifetime of a native device-writable page, or zero. */
 uint64_t loom_vfio_dma_page_generation(VFIOContainerBase *, hwaddr);
 /*

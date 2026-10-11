@@ -57,6 +57,7 @@ struct LoomVFIODMA {
     bool pin_publication;
     bool ordered_publication;
     bool early_publication;
+    bool batched_rx_publication;
     bool publication_failed;
 };
 
@@ -295,6 +296,9 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
         bc->loom_dma->ordered_publication = ordered && !strcmp(ordered, "1");
         const char *early = getenv("LOOM_VFIO_PUBLICATION_EARLY_PIN");
         bc->loom_dma->early_publication = early && !strcmp(early, "1");
+        const char *batch = getenv("LOOM_VFIO_RX_PAGE_BATCH");
+
+        bc->loom_dma->batched_rx_publication = batch && !strcmp(batch, "1");
         const char *buffers = getenv("LOOM_VFIO_BUFFER_RECYCLE");
         bc->loom_dma->recycle_buffers =
             !buffers || strcmp(buffers, "0");
@@ -1705,6 +1709,101 @@ int loom_vfio_dma_publish_rx_descriptor(VFIOContainerBase *bc, hwaddr iova,
     address_space_cache_destroy(&cache);
     rcu_read_unlock();
     return ret;
+}
+
+
+/*
+ * Publish a contiguous RX completion run using one bounded page lease.
+ * The caller has captured immutable writebacks and published every payload.
+ * Never span a registration, RAM mapping, host page or BQL/RCU lifetime.
+ * Each descriptor still publishes only changed metadata, then its DD byte.
+ */
+int loom_vfio_dma_publish_rx_descriptors(VFIOContainerBase *bc, hwaddr iova,
+                                         const void *snapshot, unsigned count)
+{
+    MemoryRegionCache cache = { 0 };
+    const uint8_t *bytes = snapshot;
+    LoomDMABuffer *b, part;
+    uint64_t size = count * 32ULL;
+    bool pinned = false;
+    int ret;
+
+    if (!bc || !bc->loom_dma) {
+        return -ENODEV;
+    }
+    if (!snapshot || !count || count > 128 || iova > UINT64_MAX - size) {
+        return -EINVAL;
+    }
+    if (bc->loom_dma->publication_failed) {
+        return -EIO;
+    }
+    if (!bc->loom_dma->batched_rx_publication || count == 1 ||
+        !bc->loom_dma->ordered_publication ||
+        !bc->loom_dma->pin_publication || !bc->loom_physical ||
+        !bc->loom_dma->cache_publication || !bql_locked() || (iova & 31)) {
+        goto fallback;
+    }
+    b = buffer_at(bc->loom_dma, iova);
+    if (!b || b->direction == 1 || iova - b->iova > b->size ||
+        size > b->size - (iova - b->iova)) {
+        goto fallback;
+    }
+    part = buffer_view(b, iova - b->iova, size);
+    if ((part.gpa & 4095) + size > 4096) {
+        goto fallback;
+    }
+    if (!memcmp(bytes, part.baseline, size)) {
+        return 0;
+    }
+    rcu_read_lock();
+    if (address_space_cache_init(&cache, &address_space_memory, part.gpa,
+                                  size, true) != size ||
+        !memory_access_is_direct(cache.mrs.mr, true)) {
+        address_space_cache_destroy(&cache);
+        rcu_read_unlock();
+        goto fallback;
+    }
+    ret = publication_acquire(bc, &cache, size, &pinned);
+    if (!ret && !cache.ptr) {
+        /* No usable local pointer/lease: retain the original ownership path. */
+        address_space_cache_destroy(&cache);
+        rcu_read_unlock();
+        goto fallback;
+    }
+    for (unsigned n = 0; !ret && n < count; n++) {
+        uint64_t offset = n * 32ULL;
+        MemoryRegionCache view = cache;
+        LoomDMABuffer descriptor = buffer_view(&part, offset, 32);
+
+        /*
+         * Borrow the parent's mapping and lease; only the parent is destroyed
+         * or unpinned. All dirty accounting uses this descriptor's RAM offset.
+         */
+        view.ptr += offset;
+        view.xlat += offset;
+        view.len = 32;
+        ret = publish_rx_cached(&view, &descriptor, bytes + offset);
+    }
+    if (pinned) {
+        int release_ret = publication_unpin(bc, &cache);
+
+        if (release_ret) {
+            ret = release_ret;
+        }
+    }
+    address_space_cache_destroy(&cache);
+    rcu_read_unlock();
+    return ret;
+
+fallback:
+    for (unsigned n = 0; n < count; n++) {
+        ret = loom_vfio_dma_publish_rx_descriptor(bc, iova + n * 32ULL,
+                                                   bytes + n * 32ULL);
+        if (ret) {
+            return ret;
+        }
+    }
+    return 0;
 }
 
 /*
