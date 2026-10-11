@@ -9,6 +9,8 @@
 #include "qemu/units.h"
 #include "qemu/atomic.h"
 #include "qemu/cutils.h"
+#include "qemu/host-utils.h"
+#include "qapi/error.h"
 #include "qemu/main-loop.h"
 #include "qemu/error-report.h"
 #include "exec/address-spaces.h"
@@ -16,6 +18,9 @@
 #include "hw/vfio/loom-dma.h"
 #include "hw/vfio/loom-iavf.h"
 #include "sysemu/kvm.h"
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 typedef struct LoomDMAMap {
     hwaddr iova;
@@ -62,6 +67,29 @@ struct LoomVFIODMA {
     bool batched_rx_rearm;
     bool publication_failed;
 };
+
+/* CPU-only comparison mode; switching does not change DMA state or bytes. */
+#if defined(__SSE2__)
+static bool byte_scan_simd = true;
+#else
+static bool byte_scan_simd;
+#endif
+
+static bool get_byte_scan_simd(Object *obj, Error **errp)
+{
+    return qatomic_read(&byte_scan_simd);
+}
+
+static void set_byte_scan_simd(Object *obj, bool enabled, Error **errp)
+{
+#if !defined(__SSE2__)
+    if (enabled) {
+        error_setg(errp, "SIMD byte scanning requires SSE2 on the QEMU host");
+        return;
+    }
+#endif
+    qatomic_set(&byte_scan_simd, enabled);
+}
 
 static void loom_vfio_ram_free(VFIOContainerBase *bc);
 static bool loom_vfio_ram_materializing(VFIOContainerBase *bc);
@@ -268,6 +296,12 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
         return -EINVAL;
     }
     if (!bc->loom_dma) {
+        Object *machine = OBJECT(qdev_get_machine());
+
+        if (!object_property_find(machine, "loom-dma-byte-scan-simd")) {
+            object_property_add_bool(machine, "loom-dma-byte-scan-simd",
+                                     get_byte_scan_simd, set_byte_scan_simd);
+        }
         bc->loom_dma = g_new0(LoomVFIODMA, 1);
         const char *skip_zero = getenv("LOOM_VFIO_SKIP_REDUNDANT_ZERO");
         bc->loom_dma->skip_redundant_zero =
@@ -478,6 +512,21 @@ void loom_vfio_dma_free(VFIOContainerBase *bc)
 static uint64_t skip_matching_bytes(const uint8_t *a, const uint8_t *b,
                                     uint64_t pos, uint64_t size, bool equal)
 {
+#if defined(__SSE2__)
+    if (qatomic_read(&byte_scan_simd)) {
+        while (size - pos >= 16) {
+            __m128i x = _mm_loadu_si128((const __m128i *)(a + pos));
+            __m128i y = _mm_loadu_si128((const __m128i *)(b + pos));
+            uint32_t matches = _mm_movemask_epi8(_mm_cmpeq_epi8(x, y));
+            uint32_t stop = equal ? matches ^ UINT32_C(0xffff) : matches;
+
+            if (stop) {
+                return pos + ctz32(stop);
+            }
+            pos += 16;
+        }
+    }
+#endif
     while (size - pos >= sizeof(uint64_t)) {
         uint64_t x, y;
         memcpy(&x, a + pos, sizeof(x));
