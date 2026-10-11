@@ -4528,3 +4528,55 @@ owner hostCPU seconds old 10.33/new 11.22，
 Garen实际QEMU46128（wrapper9747），Ezreal797466（wrapper33710），运行新代码。
 Jinx source STOPLOOM/EXIT0、测试aliases删除，探针均退出。
 未改guest源码、未动Lux/host内核、未创建实验文件；仅改QEMU源及README。
+
+### 完成路径新采样及全量扫描定位（2026-10-11，功能67315bb40b）
+
+两端工作树clean、运行actual QEMU Garen46128/Ezreal797466。
+未改guest/HPET/host内核，组合优化ON；本轮未改功能代码或重启VM。
+独立24s、99Hz owner hostCPU perf采样、18x256MiB全部内容/长度/ACK PASS。
+2022有效samples、bad0。inclusive completion pair payload10.485%、
+rearm pair8.012%、hash lookup3.956%、byte scan3.017%、
+dirty invalidate1.039%、RAM materialize3.165%（分类不同、inclusive会重叠，不能相加）。
+按stack name分类DSM named body14.985%、VFIO without namedbody34.817%、
+OTHER49.159%；VFIO部分包含DSM wrapper，OTHER包含虚拟化/计时等，不能当成纯非DSM。
+不以带perf测试的吞吐比较性能，也不把采样比例解释为全部带宽损失。
+
+采样部分unknown libc栈来自snapshot_from_device <- loom_vfio_dma_sync
+<- vfio_region_read/MSI等。于是另用短时uprobe核实：
+第一次3x256MiB（内容PASS）窗口10.214s：
+scoped completion正返回83921次，未记录零或负返回；
+完整device->CPU sync中88次来自MMIO read，40次来自其他调用，
+另8次完整CPU->device sync。不是数据队列频繁失败回退。
+MMIO地址read数与其full-sync数一一相同：
+0x4800=8、0x5000=8、0x6400=32、0x6800=8、
+0x7400=8、0x8000=16、0x8800=8。
+guest原iavf_register.h确认：ICR01/ICR0_ENA1、ATQH/ATQLEN、
+ARQH/ARQLEN、VFGEN_RSTAT；iavf_flush读VFGEN_RSTAT。
+这些AdminQ/状态/control操作仍需完成同步，不直接删掉。
+
+第二次独立3x256MiB窗口7.861s：
+scoped正返回83224次，snapshot_from_device进入265200次；
+非direction1 buffer范围合计1086259200 bytes，无direction1字节。
+这个计数是候选比较/拷贝范围，不等于已复制字节。
+
+第三次独立3x256MiB窗口9.113s，在entry+return分别统计：
+snapshot进入343364次、候选range1406418944 bytes；
+成功返回且snapshot_ready为true仅101次/413696 bytes（404KiB）。
+GDB读取正在运行相同binary的DWARF确认LoomDMABuffer
+size偏移16、direction24、snapshot_ready56，sizeof96，避免猜offset。
+helper源码在完整范围memcmp未变化时返回，不复制scratch；
+ready=true表示该range完成了snapshot复制。范围计数仍不是CPU耗时或
+精确memcmp读取字节量；probe开销、背景control频率和较小窗口不可忽略。
+该轮scoped正返回79987次；read/snapshot active contexts均0；全部probe cleanup。
+
+这给出下一步明确候选：将已知AdminQ及数据队列的完成发布分别限定到
+对应已提交描述符和payload，以免control访问重复比较整个registration集合。
+此设计尚未实现/验证。必须保留immutable snapshots、先payload后completion、
+覆盖及generation检查、AdminQ异步event/reset/未知opcode/未知设备完整回退，
+不得简单跳过completion、跳过DSM或按read地址粗暴关闭同步。
+同页rearm pair还重复materialize同一页，可审查合并authority检查，但非主要结论。
+
+所有27个接收flow内容、长度、ACK通过；未做新native基线或吞吐对照，
+未证明达到只剩DSM开销。最终四CPU、HPET、RSS equal2恢复，
+两卡error/drop计数0、dmesg error为空，两原1GiB盘保持。
+Jinx source STOPLOOM/EXIT0、aliases删除，探针退出，未动Lux或创建实验文件。
