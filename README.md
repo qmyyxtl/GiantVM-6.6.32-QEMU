@@ -4919,3 +4919,13 @@ Ezreal build PASS。CPU时间微基准4轮交替、200000次相同run扫描：
 实际ON full-changed1536B耗时约减少36%，mixed1536B约15%，descriptor32B约12%；
 全相同1536B约慢7%。均只为纯扫描微基准，不是整卡/DSM改善证明。
 实机开启及端到端对照待验证；保持默认OFF。
+
+两端构建及actual helper ASAN/UBSAN全部模式+forced scalar均PASS；
+Garen同步到6b00529008并构建完成。当前运行Garen154340/Ezreal820039
+仍映射旧e1 binary，未重启、未开启vector原型；后续探针应使用
+/proc/PID/exe对应运行ELF，不能把新build符号地址套到旧运行实例。
+最终四CPU在线、HPET、RSS equal2、guest error级dmesg空；
+Garen NIC rx_dropped60与带采样后一组一致，Ezreal NIC error/drop0。
+所有perf FD/probes正常cleanup，Jinx source EXIT0、alias/监听移除；
+Lux/worker-g4不动，无实验文件。下一步新binary实机OFF/ON/OFF对照，
+同时验证两owner收发及热重配置；收益未证明前保持默认OFF。
