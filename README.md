@@ -6113,3 +6113,25 @@ DMA分配归属、DSM下降或聚合带宽收益。普通VM随后正常poweroff�
 测试通过stdin/memfd，无实验文件/新盘，无Lux操作。
 下一步恢复Ezreal、同步代码、验证PAM广播和真实跨机启动，再看
 guest两VF的numa_node及驱动分配；当前总目标仍未完成。
+
+#### 原生真实 VF NUMA 补充验证（2026-10-11）
+
+Ezreal 重启后 SSH/从 Jinx ping 的复查仍失败，尚不能同步并重新启动
+两端巨虚。本轮在 Garen 做独立普通 VM 真实 VF 测试：
+相同 guest #26、4CPU/4GiB/两NUMA节点、HPET；关闭聚合，
+Garen 实验 VF0c:02.0 通过标准 VFIO 接到 device-port-1，
+node0 使用 e1000e 模型，不做带宽测试，也不挂实验数据盘。
+绑定前检查 VF physfn=0c:00.0、PF=i40e、VF独立IOMMU组，
+仅将实验 VF iavf→vfio-pci，保留 PF/worker-g4。
+
+启动登录后 sysfs：
+  0000:41:00.0 numa_node=1 local_cpulist=2-3 driver=iavf
+CPU2 上执行 down、combined2、RX512/TX128、up 均成功。
+第一次读取状态在链路通知前是 NO-CARRIER；随后复查
+operstate=up、carrier=1、10000Mb/s、Link detected=yes。
+guest error-level dmesg 为空，NATIVE_REAL_VF_NUMA_PASS。
+随后正常 poweroff，QEMU exit0，实验VF恢复 iavf。
+
+这证明原生 iavf 可识别 NUMA 根桥上的真实 VF 并初始化队列；
+未测收发性能、DMA页实际归属、DSM或跨机 root-port 配置同步，
+不能替代真实巨虚验证。当前未新增实验文件/日志/磁盘。
