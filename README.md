@@ -6135,3 +6135,57 @@ guest error-level dmesg 为空，NATIVE_REAL_VF_NUMA_PASS。
 这证明原生 iavf 可识别 NUMA 根桥上的真实 VF 并初始化队列；
 未测收发性能、DMA页实际归属、DSM或跨机 root-port 配置同步，
 不能替代真实巨虚验证。当前未新增实验文件/日志/磁盘。
+
+#### 两端真实 VF 根桥 NUMA 启动与收发验证（2026-10-11）
+
+Ezreal 在 BMC 确认重启后恢复 SSH，uptime 为0min；
+内核仍为6.6.32-krdma+，NFS服务未启用。恢复 ib_ipoib、
+ibs4f0=172.0.1.2/24、一个实验 VF0c:02.0 及原 VF MAC；
+Garen/Ezreal IPoIB双向ping均2/2通过。
+Ezreal FF同步至4b8a5ac1ef并编译，包含c7353f5f18的未编号bus修复。
+两端以 --device-numa-roots 启动，当前真实QEMU PID22361/5038，
+启动wrapper sessions46511/71833。两端各自 /proc/exe 与编译binary
+SHA一致（host之间构建依赖不同，不要求两个host的hash相同）。
+Garen worker-g4 PID6969 保留，本轮未重启host。
+
+巨虚越过固件并正常登录。guest原6.12.0-vanilla-vfio #26、
+HPET、4CPU/4GiB/2NUMA节点，源码没有改。
+两张真实iavf：
+  Garen VF → 0000:21:00.0 enp33s0 numa_node0 local_cpulist0-1
+  Ezreal VF → 0000:41:00.0 enp65s0 numa_node1 local_cpulist2-3
+GIANT_REAL_VF_NUMA_PASS，guest error-level dmesg为空。
+此前固件gfn253/-14未再出现，与未编号bus配置匹配修复一致；
+没有加PAM寄存器探针，不能说所有故障因果都已独立证明。
+
+保留combined2/RX512/TX128、RSS固定q1、RPS0、XPS G3/Ec，
+CPU0/2上配置打开对应NIC。按本次IRQ名字识别：
+G q0/q1 IRQ43/44→CPU0/1，E IRQ38/39→CPU2/3。
+两卡10Gbps Link UP，内核/时钟保持。
+一轮四worker变化内容TX，每worker在对应CPU预分配32个独立1MiB
+buffer，内容按块变化，运行6秒，接收方完整内容和字节数核验：
+四条流PASS，错误/丢弃增量0，约508.988 MiB/s。
+G→Jinx198.18.10.3，E→Garen host198.18.11.1；
+这是冷启动功能样本，无匹配新旧/NUMA关闭对照，不作性能收益结论。
+
+双卡并行RX，各32MiB，CPU0/2创建worker，完整内容校验PASS，
+elapsed G0.343/E0.390s；Jinx同一物理NIC提供两源IP，
+只作功能验证，不据此推算双卡吞吐。源收到两条OK。
+最后guest两卡UP、numa0/1、四项error/drop总计数均0，
+guest error-level dmesg为空。发送/接收服务正常STOP退出0，
+Jinx10.3/11.3和Garen临时11.1地址删除，实验监听消失，
+保留两端巨虚和worker-g4；stdin/memfd，无实验文件/新盘/磁盘测试/Lux。
+
+Garen本轮在guest初始化期间仍出现一次host warning：
+mark_page_dirty_in_slot:3388，gvm-rdma-req 经
+kvm_vm_ioctl_dsm→kvm_dsm_memcpy→ivy_kvm_dsm_page_fault→
+__kvm_write_guest_page 写页时没有running vCPU。
+源码此分支 WARN_ON_ONCE(!vcpu &&
+!kvm_arch_allow_write_without_running_vcpu(kvm))，x86默认返回false。
+它与此前gfn253失败不同，VM继续启动和完成收发；没有压掉警告，
+没有改host/guest内核，也不能据功能测试证明它无风险。
+收发后未见新增host警告。后续应单独审查DSM写页与dirty tracking
+上下文；现在不能宣称整个host日志无错误或长期稳定。
+
+设备NUMA识别/真实两端功能这一项已有证据；吞吐是否改善、
+DMA页是否归属owner、非DSM开销是否最低均尚未验证。
+下一步以同条件测量页面放置/处理成本，避免把拓扑成功当性能成功。
