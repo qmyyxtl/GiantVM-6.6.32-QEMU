@@ -25,12 +25,17 @@ parser.add_argument("--host", required=True, help="VF PCI address, e.g. 0000:0c:
 parser.add_argument("--legacy-dma-bridge", action="store_true",
                     help="use the old guest-assisted identity DMA bridge")
 parser.add_argument("--data-disk", type=Path, help="existing dedicated raw data image")
+parser.add_argument("--device-numa-roots", action="store_true",
+                    help="expose owner-specific PCI roots with ACPI NUMA proximity")
 args = parser.parse_args()
 physical = os.environ.get("LOOM_VFIO_PHYSICAL_DMA", "0")
 try:
     startup_iommu = iommu_environment(physical, args.legacy_dma_bridge)
 except ValueError as exc:
     parser.error(str(exc))
+
+if args.device_numa_roots and (physical != "1" or args.legacy_dma_bridge):
+    parser.error("--device-numa-roots requires physical DMA without the legacy bridge")
 
 if args.data_disk is not None:
     args.data_disk = args.data_disk.resolve()
@@ -80,8 +85,17 @@ try:
     env.setdefault("GVM_GUEST_EXTRA_ARGS", "clocksource=hpet")
     if args.node == 0 and not Path(env["GVM_GUEST_KERNEL"]).is_file():
         raise RuntimeError("guest kernel does not exist")
+    topology = []
+    endpoint_bus = ""
+    if args.device_numa_roots:
+        for node in range(2):
+            topology += ["-device",
+                         f"pxb-pcie,id=device-root-{node},bus=pcie.0,"
+                         f"addr={0x0b + node:02x}.0,bus_nr={32 + node * 32},"
+                         f"numa_node={node}"]
+        endpoint_bus = f"bus=device-root-{args.node},"
     endpoint = (f"vfio-pci,host={args.host},id=vfio-vf-owner-{args.node},"
-                f"addr=0{7 + args.node}.0,rombar=0,x-no-mmap=on,"
+                f"{endpoint_bus}addr=0{7 + args.node}.0,rombar=0,x-no-mmap=on,"
                 "x-no-kvm-msi=on,x-no-kvm-msix=on,"
                 f"loom-aggregate=on,loom-numa-node={args.node}")
     bridge = (f"loom-dma-bridge,id=dma-owner-{args.node},"
@@ -109,7 +123,7 @@ try:
                  "iothread=owner-io"]
     print(f"VF {args.host}; host PF {parent.name} remains on i40e", flush=True)
     child = subprocess.Popen([str(root / "scripts/gvm-device-node.sh"),
-                              str(args.node), "-device", endpoint,
+                              str(args.node), *topology, "-device", endpoint,
                               *extra], env=env)
     print(f"QEMU PID {child.pid}", flush=True)
     raise SystemExit(child.wait())

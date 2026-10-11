@@ -84,6 +84,16 @@ static PCIDevice *owned[LOOM_MAX_DEVICES];
 static uint32_t owned_generation[LOOM_MAX_DEVICES];
 static unsigned owned_reset_depth[LOOM_MAX_DEVICES];
 static PCIBus *root_bus;
+/* Root buses are fixed before the device directory starts. Proxies retain
+ * the owner's complete BDF on the identical topology of every peer. */
+static PCIBus *root_buses[256];
+
+static PCIDevice *device_at_bdf(uint16_t bdf)
+{
+    PCIBus *bus = root_buses[bdf >> 8];
+
+    return bus ? bus->devices[bdf & 0xff] : NULL;
+}
 static unsigned local_node, node_count, owned_count;
 static uint32_t config_address;
 static bool owner_iommu_present;
@@ -288,7 +298,7 @@ void loom_pci_intx_dispatch(const LoomPCIRequest *req)
     if (!locked) {
         bql_lock();
     }
-    dev = root_bus->devices[d->bdf];
+    dev = device_at_bdf(d->bdf);
     if (dev && object_dynamic_cast(OBJECT(dev), TYPE_LOOM_REMOTE_PCI)) {
         loom_pci_set_effective_irq(dev, req->bar, req->value);
     }
@@ -388,7 +398,7 @@ int loom_pci_directory_update_dispatch(unsigned peer, unsigned device_id,
     memcpy(&update, data, size);
     if ((update.config_size != PCI_CONFIG_SPACE_SIZE &&
          update.config_size != PCIE_CONFIG_SPACE_SIZE) ||
-        update.bdf >= ARRAY_SIZE(root_bus->devices)) {
+        !root_buses[update.bdf >> 8]) {
         return -EINVAL;
     }
     qemu_mutex_lock(&directory_lock);
@@ -533,9 +543,9 @@ static void collect_device(PCIBus *bus, PCIDevice *dev, void *opaque)
     if (!dev->loom_aggregate) {
         return;
     }
-    if (bus != root_bus ||
+    if (!pci_bus_is_root(bus) ||
         (dev->config[PCI_HEADER_TYPE] & 0x7f) != PCI_HEADER_TYPE_NORMAL) {
-        fatal_error("initial implementation requires endpoints on the root bus");
+        fatal_error("aggregation requires endpoints directly on a PCI root bus");
     }
     if (owned_count == LOOM_MAX_DEVICES) {
         fatal_error("too many owned PCI devices");
@@ -592,11 +602,26 @@ void loom_pci_prepare(void)
     if (local_node >= node_count) {
         fatal_error("invalid local node");
     }
-    host = QLIST_FIRST(&pci_host_bridges);
-    if (!host || QLIST_NEXT(host, next) || pci_bus_num(host->bus) != 0) {
-        fatal_error("initial implementation requires one PCI root bus numbered zero");
+    QLIST_FOREACH(host, &pci_host_bridges, next) {
+        PCIBus *bus = host->bus;
+        unsigned number;
+
+        if (!bus || !pci_bus_is_root(bus)) {
+            fatal_error("aggregation requires PCI root host bridges");
+        }
+        number = pci_bus_num(bus);
+        if (number >= ARRAY_SIZE(root_buses) || root_buses[number]) {
+            fatal_error("duplicate or unsupported PCI root bus number");
+        }
+        root_buses[number] = bus;
     }
-    root_bus = host->bus;
+    root_bus = root_buses[0];
+    if (!root_bus) {
+        fatal_error("aggregation requires the primary PCI root bus zero");
+    }
+    if (loom_iommu_enabled() && QLIST_NEXT(QLIST_FIRST(&pci_host_bridges), next)) {
+        fatal_error("owner IOMMU mode does not yet support multiple root buses");
+    }
     qemu_mutex_init(&directory_lock);
     qemu_cond_init(&directory_changed);
     directory = g_new0(LoomPCINode, node_count);
@@ -604,7 +629,9 @@ void loom_pci_prepare(void)
     directory[local_node].magic = LOOM_DIRECTORY_MAGIC;
     directory[local_node].version = LOOM_DIRECTORY_VERSION;
     directory[local_node].reserved = loom_iommu_enabled() ? 1 : 0;
-    pci_for_each_device_under_bus(root_bus, collect_device, NULL);
+    QLIST_FOREACH(host, &pci_host_bridges, next) {
+        pci_for_each_device_under_bus(host->bus, collect_device, NULL);
+    }
     directory[local_node].count = owned_count;
     directory[local_node].heartbeat = 1;
     qatomic_store_release(&directory[local_node].ready, 1);
@@ -781,7 +808,7 @@ void loom_pci_bootstrap(void)
 {
     int64_t deadline;
     unsigned owner, index, bdf;
-    int ids[256];
+    g_autofree int *ids = NULL;
 
     if (!directory) {
         return;
@@ -806,7 +833,8 @@ void loom_pci_bootstrap(void)
             fatal_error("incompatible device directory");
         }
     }
-    memset(ids, -1, sizeof(ids));
+    ids = g_new(int, 65536);
+    memset(ids, -1, 65536 * sizeof(*ids));
     for (owner = 0; owner < node_count; owner++) {
         for (index = 0; index < directory[owner].count; index++) {
             LoomPCIDescriptor *d = &directory[owner].devices[index];
@@ -824,7 +852,7 @@ void loom_pci_bootstrap(void)
                 } while (d->sequence != after || (after & 1));
             }
             bdf = d->bdf;
-            if (bdf >= ARRAY_SIZE(ids) || ids[bdf] != -1) {
+            if (!root_buses[bdf >> 8] || ids[bdf] != -1) {
                 fatal_error("duplicate or unsupported global BDF");
             }
             if (d->config_size != PCI_CONFIG_SPACE_SIZE &&
@@ -857,7 +885,7 @@ void loom_pci_bootstrap(void)
     for (index = 0; index < owned_count; index++) {
         publish_directory_update(index);
     }
-    for (bdf = 0; bdf < ARRAY_SIZE(ids); bdf++) {
+    for (bdf = 0; bdf < 65536; bdf++) {
         unsigned id;
         LoomPCIDescriptor *d;
         PCIDevice *dev;
@@ -869,20 +897,21 @@ void loom_pci_bootstrap(void)
         d = descriptor(id);
         owner = id / LOOM_MAX_DEVICES;
         if (owner != local_node) {
-            if (root_bus->devices[bdf]) {
+            if (device_at_bdf(bdf)) {
                 fatal_error("remote BDF conflicts with an existing local device");
             }
-            dev = pci_new(bdf, TYPE_LOOM_REMOTE_PCI);
+            dev = pci_new(bdf & 0xff, TYPE_LOOM_REMOTE_PCI);
             remote = (LoomRemotePCI *)dev;
             remote->device_id = id;
             remote->generation = d->generation;
             dev->cap_present |= d->cap_present &
                 (QEMU_PCI_CAP_EXPRESS | QEMU_PCI_CAP_MULTIFUNCTION);
-            pci_realize_and_unref(dev, root_bus, &error_fatal);
+            pci_realize_and_unref(dev, root_buses[bdf >> 8], &error_fatal);
         }
-        fprintf(stderr, "Loom PCI directory node=%u bdf=00:%02x.%u "
+        fprintf(stderr, "Loom PCI directory node=%u bdf=%02x:%02x.%u "
                 "owner=%u numa=%d vendor=%04x device=%04x generation=%u\n",
-                local_node, PCI_SLOT(bdf), PCI_FUNC(bdf), owner, d->numa_node,
+                local_node, bdf >> 8, PCI_SLOT(bdf & 0xff),
+                PCI_FUNC(bdf & 0xff), owner, d->numa_node,
                 pci_get_word(d->config + PCI_VENDOR_ID),
                 pci_get_word(d->config + PCI_DEVICE_ID), d->generation);
     }
@@ -1055,7 +1084,7 @@ static void refresh_remote_mappings(void)
             LoomPCIDescriptor d;
             PCIDevice *dev;
             snapshot(&directory[owner].devices[index], &d);
-            dev = root_bus->devices[d.bdf];
+            dev = device_at_bdf(d.bdf);
             if (dev && memcmp(dev->config, d.config, d.config_size)) {
                 memcpy(dev->config, d.config, d.config_size);
                 pci_update_mappings(dev);
