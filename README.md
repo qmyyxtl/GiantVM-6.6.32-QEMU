@@ -6959,7 +6959,7 @@ guest错误级dmesg为空、CPU0-3/HPET保持，
 巨虚和worker-g4 PID6969运行；host既有warning未修复。
 没有新实验文件、新盘、磁盘/Lux测试；整体目标仍未完成。
 
-### 2026-10-11：BAR 稳定未命中索引候选（默认关闭，待运行设备验证）
+### 2026-10-11：BAR 稳定未命中索引候选（默认关闭）
 
 新增机器属性loom-bar-miss-index，默认false，使用QMP qom-set/qom-get设置。
 只对稳定且确定不属于任何聚合PCI BAR的PIO/MMIO返回未命中；
@@ -6993,3 +6993,93 @@ missing/odd前缀、未应用epoch、控制depth、未发布本地映射回退�
 不把编译失败或早期缺少depth的测试版本作为最终源码证明。
 此测试不证明真实PCI重配置/设备模型/DSM路径，仍须运行验证。
 运行实例目前为旧功能02fd3bf635，候选没有启用；guest/HPET未改。
+
+#### 稳定未命中索引运行与性能验证
+
+abfa50d534 已推送origin，两端fast-forward和完整编译通过，
+Garen也链接实际RCU执行同一ASAN+UBSAN/O2各757214项检查及并发压力，全部通过。
+正常guest poweroff后两端旧实验实例退出，新启动：
+Garen PID180609 /proc/exe SHA256 c90b1c227a53df5764f617f608bad5d83578ee22ea8e523ae72e8c3ce9ff755a；
+Ezreal PID57132 SHA256 397e25b3bb523ac052b9f7e9a3b9890a933ddfb9c1262b91229a055213ae5fd6。
+guest仍为6.12.0-vanilla-vfio #26、4CPU/HPET，NIC NUMA0/1、
+本地IRQ/RSS/XPS及2队列恢复。未重启host或改guest/source/kernel。
+启动时索引OFF；随后QMP两端ON/OFF对照，其它BAR选项全部OFF、
+SSE2 ON、RPC spin0、接收CQ事件ON。
+
+三个uprobes单独计数master HPET读取handler范围：
+OFF 86129项，每项BQL入口8次；
+ON 112925项，每项1次；entry与return数量相等，
+nested/read_errors/inflight均0，两窗口之后均cleanup。
+说明稳定HPET miss跳过7次PCI分类BQL获取；
+这些探针会对OFF的8次入口造成更大测量扰动，
+不把探针窗口吞吐差作为性能收益。
+
+EDU控制验证：两块无driver测试设备0000:00:05.0/06.0，
+分别由guest CPU0、CPU2访问。通过只读/dev/mem、ctypes显式uint32读取，
+原标识0x010000ed；sysfs config关闭PCI_COMMAND_MEMORY后读0；
+恢复原command=259后标识恢复，两种索引状态各4组全部PASS。
+覆盖本地/远端config及MEM unmapped→mapped的失效/重建，
+未触碰VF网卡或磁盘BAR，original command已读回恢复。
+测试初期错误地期望unassigned MMIO读0xffffffff，断言失败在disabled阶段；
+关闭候选也复现。源码system/memory.c:unassigned_mem_read明确返回0，
+修正预期后通过；未发现索引造成的EDU标识读取回归。
+此前把错误预期/映射权限差异猜为索引问题的判断不作为结论。
+未对真实VF reset或BAR地址重定位进行运行验证，
+odd/未知/未应用/控制depth等情况仅由源抽取fixture覆盖。
+只读live索引快照包含两段EDU合并区间[0xfe800000,0xfe9fffff]，
+两端各6个区间（MMIO5/PIO1），revision/depth稳定时读取；
+此观测不代替RCU或并发正确性证明。
+
+无探针、同一次启动、各6秒变化内容到第三方Jinx。
+E单卡6组OFF/ON交替，每次2个owner本地CPU worker：
+| pair | OFF MiB/s | ON MiB/s | OFF hostCPU秒 | ON hostCPU秒 |
+|---|---:|---:|---:|---:|
+| 0 | 687.035 | 769.654 | 9.770 | 10.120 |
+| 1 | 668.802 | 764.451 | 9.350 | 9.980 |
+| 2 | 664.908 | 758.871 | 9.210 | 9.920 |
+| 3 | 691.554 | 758.937 | 9.540 | 9.580 |
+| 4 | 687.708 | 756.122 | 9.150 | 7.600 |
+| 5 | 680.503 | 779.149 | 9.450 | 10.140 |
+
+双卡6组，每次4个worker（每个owner本地2个）：
+| pair | OFF MiB/s | ON MiB/s | OFF hostCPU秒 | ON hostCPU秒 |
+|---|---:|---:|---:|---:|
+| 0 | 535.175 | 592.699 | 15.180 | 14.810 |
+| 1 | 557.762 | 572.130 | 14.520 | 14.890 |
+| 2 | 559.123 | 575.021 | 14.700 | 14.050 |
+| 3 | 536.795 | 567.975 | 15.330 | 14.230 |
+| 4 | 526.600 | 549.747 | 15.090 | 15.400 |
+| 5 | 535.912 | 562.961 | 15.280 | 15.430 |
+
+G单卡回退检查3组，每次2个本地CPU worker：
+| pair | OFF MiB/s | ON MiB/s | OFF hostCPU秒 | ON hostCPU秒 |
+|---|---:|---:|---:|---:|
+| 0 | 913.343 | 928.194 | 8.140 | 8.540 |
+| 1 | 932.660 | 971.695 | 9.080 | 8.690 |
+| 2 | 931.426 | 956.339 | 8.970 | 8.940 |
+
+E median OFF683.769/ON761.694 MiB/s（+11.40%，6/6更高）；
+双卡OFF536.353/ON570.053（+6.28%，6/6更高）；
+G OFF931.426/ON956.339（+2.67%，3/3更高，较小回退检查样本）。
+hostCPU总量median E9.400→9.950秒，dual15.135→14.850秒，
+G8.970→8.690秒。计数窗6.764–7.466秒含分配/启动/收尾及DSM，
+按进程utime+stime-guest_time统计，不能当纯非DSM CPU，
+固定时间下传输量不同，不将总CPU差当每字节效率。
+本改动不改HPET或guest，却可能缩短HPET共享锁等待、
+反馈影响DSM交错；未联合定量测量，不将全部收益归为纯独立非DSM开销。
+Jinx仍是单个10G接收端，这套双卡测试不能证明2x10G上限；
+双卡仍低于单卡，整体聚合瓶颈未解决。
+
+30项无探针case、84条TCP连接全部内容/字节校验通过，
+每项两卡rx/tx error/drop增量0；未以TCP重传作为本轮优化指标。
+最后索引ON，Jinx→两卡每卡32MiB接收也通过，
+前后rx/tx error/drop绝对计数均0。
+最终guest错误级dmesg为空、HPET/CPU0-3、EDU command恢复均PASS。
+当前实验实例保留两端loom-bar-miss-index=ON，源码默认仍false；
+回退可在两端QMP设置value=false，不需重启guest。
+所有其余BAR候选OFF，SSE2 ON/RPC spin0/receive events ON。
+接收服务均退出0、临时IP及49161/49162清理；一次停止请求因旧服务已到TTL超时，
+先确认其terminal0且cleanup，再启动下一服务，没有因此重启巨虚。
+worker-g4 PID6969保留，无实验文件/新盘/磁盘/Lux测试；
+host旧warning与DSM热点没有被宣称修复。
+后续继续检查请求队列调度及owner DMA处理成本，整体目标仍未完成。
