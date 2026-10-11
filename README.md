@@ -4238,3 +4238,46 @@ CPU 未变化字节保护、buffer 间隙保护、逐变化区间失败注入、
 关开关/非RAM/短映射/无BQL/无pin/native/host page 非4KiB/跨页回退，
 pin 0/7 成功、negative pin 与 sticky unpin failure、参数错误。
 硬件开关对照尚待完成，当前不能宣称吞吐收益或启用为默认。
+
+### RX payload pair 硬件对照结果（功能版本 7f5ae3b103）
+
+同一二进制 OFF -> ON -> OFF，各阶段 9 x 256MiB，无性能探针。
+沿用固定 RX RSS q1 / IRQ CPU1 / receiver CPU0 / 固定端口50042，
+四 guest CPU、4GiB、两 guest NUMA、#26、HPET 不变。
+两 host 使用 numactl --cpunodebind=0 --membind=0；EARLY=1、PIN=1、
+ORDERED=1、RX_PAGE_BATCH=1 在三个阶段相同，只改变 RX_PAYLOAD_BATCH。
+
+| Payload pair | 接收中位数 MiB/s | owner QEMU host CPU ms/MiB |
+| --- | ---: | ---: |
+| off | 229.442 | 5.117 |
+| on | 237.773 | 4.883 |
+| off2 | 229.023 | 5.742 |
+
+每轮秒数：
+```
+off: 1.12012898, 1.17239966, 1.15130861, 1.06583608, 1.06288816, 1.12273335, 1.03377890, 1.11575276, 1.05324854
+on: 1.28188609, 0.99264670, 1.03177753, 1.05776991, 1.07665850, 1.09652984, 1.08015773, 1.08141297, 0.98645091
+off2: 1.31861682, 1.11779183, 1.09523698, 1.11834208, 1.10785708, 1.11781450, 1.10423429, 1.17723276, 1.09862686
+```
+27 flows 精确长度、内容校验与 sender ACK 全部 PASS。
+三个 owner QEMU host CPU 总秒数分别 11.79/11.25/13.23，计算仍采用
+进程组 (utime+stime-gtime)/CLK_TCK，不能解释为纯 VFIO 或纯非 DSM CPU。
+ON 吞吐比两个 OFF 中位数约高 3.6%/3.8%，CPU 消耗低约4.6%/15.0%；
+CPU 基线有明显波动，只能视为小幅收益证据，未验证长时间稳定性。
+
+独立 BCC 计数轮 ON/OFF 各接收3 x 256MiB校验通过：
+总 pin/unpin 各313419/582792，ON 减少46.221%；
+2048 bucket CPU read 各559440/558752，说明 rearm 回读仍未减少。
+所有观测API errors、dropped、pending、ordered_pending为0，探针已cleanup。
+ON/OFF观察窗口6.228/13.911秒，空闲边缘不同，不能比较ns总和或背景统计；
+按已校验数据集的主要payload read及pin计数判断调用变化，不作CPU耗时比较。
+
+ON时两张卡并发接收各256MiB内容校验通过，Garen2.508s/Ezreal4.030s，
+该功能检查不是聚合带宽验证。三个性能阶段硬件rx_discards末值0/24/0，
+不能宣称消除丢包。当前运行留在OFF回测：
+Garen actual QEMU15059、Ezreal actual QEMU789957，
+RX_PAYLOAD_BATCH=0，其余开关同上；保留默认关闭，后续可复测启用。
+最终四CPU在线、HPET、两卡guest错误/丢弃统计为0、dmesg error为空，
+RSS equal2恢复，中断配置正常。source收到STOPLOOM并EXIT0，aliases删除。
+未产生实验文件，未使用Lux，未改guest源码；本轮除了CPU offline诊断，
+未重跑已接受的磁盘聚合。下一步仍需降低rearm回读和逐变化区间处理成本。
