@@ -6055,3 +6055,61 @@ dmesg 错误检查为空，HPET/guest kernel 保持。
 实验仅 stdin/memfd，没有实验文件/新盘，也没有访问 Lux。
 总体目标仍未完成；下一步审查描述符验证的扫描范围和失效条件，
 不依据小比例样本直接删除正确性检查。
+
+#### 原生 guest 设备 NUMA：根桥验证与跨机卡点（2026-10-11）
+
+用户要求先尝试只改 QEMU 拓扑，guest 源码保持不变。
+当前 guest x86 的 arch/x86/pci/acpi.c:pci_acpi_root_get_node 读取
+根桥 acpi_get_node；drivers/pci/probe.c:pci_device_add 用
+pcibus_to_node(bus) 初始化设备 node。原生 Linux 支持这条路径，
+“必须改 guest 才能识别设备 NUMA”的说法不成立。
+
+启动脚本增加可选 --device-numa-roots，仅允许 physical DMA、
+无 legacy bridge。两端创建一致的 pxb-pcie 根桥，bus_nr=32/64，
+numa_node=0/1，各连接一个 pcie-root-port，VF 接在对应 port 的
+00.0。已有数据盘显式保留在 pcie.0；没有做数据盘性能测试。
+直接把 VF 插在 pxb-pcie 会被 QEMU 拒绝，所以必须有 root port。
+
+设备目录原来只接受 root bus0，代理也固定在其 devices[]。
+ae49c31438 开始扩展 root bus；2a5d6de789/b253507c5f 使用
+不可变 bus_name + devfn 识别设备，支持固件尚未编号的下游 bus，
+在每端同名 bus 上创建代理。协议版本从3升到4，完整 descriptor
+附加64B bus_name，控制更新448B前缀保持原大小。
+通过 PCI 总线深度遍历收集 endpoint；代理配置/INTx/映射刷新
+按不可变拓扑定位。两端必须使用一致拓扑和新版代码。
+owner vIOMMU 多根桥模式仍明确拒绝，当前只验证 physical DMA。
+07772cc126 修复创建 expanders 后数据盘默认 bus 被改变的问题。
+
+两端跨机实例目录已正确显示 device-port-0/1 上的 8086:154c，
+但在固件 AP 启动阶段，Ezreal KVM DSM gfn253 (0xfd000) 返回 -14，
+vcpu EIP=f000:d07b，guest Linux 尚未启动，不能声称跨机 NUMA 成功。
+QMP Garen info pci 已显示 root32→secondary33、root64→secondary65，
+两张 VF 资源已分配；Ezreal QMP 观察超时。
+
+代码检查发现未编号的 root port 下游 bus 暂时为0，
+VF00.0会与主 chipset00:00.0 的配置访问混淆，使 PAM 写不再走
+原有 peer 广播。这与固件页面 DSM 故障相符，但尚无修复后跨机验证。
+c7353f5f18 排除未编号非root bus 的 endpoint BDF匹配，Garen编译通过。
+收到内核报错后请求 Ezreal reboot，再进行修复编译。
+Garen也失去网络，之后观察到新boot；没有向Garen发reboot命令，
+上一boot日志尾部没有证明重启原因。worker-g4 自动启动为 PID6969。
+恢复 Garen IPoIB ibs4f0→172.0.1.4/24 和 PF0c:00.0 的一个实验VF，
+PF驱动/管理地址保持。Ezreal SSH暂未恢复，未同步 c7353f5f18。
+
+独立普通VM验证：Garen，相同6.12.0-vanilla-vfio #26，
+四CPU/4GiB/两个NUMA节点，HPET，不启用聚合、不直通真实VF；
+每根桥后用一张 e1000e 模型，无网络peer，不做吞吐测试。
+启动登录通过，读取 sysfs 得到：
+  0000:21:00.0 numa_node=0 local_cpulist=0-1 driver=e1000e
+  0000:41:00.0 numa_node=1 local_cpulist=2-3 driver=e1000e
+dmesg 明确显示 PC20 在 NUMA node0，PC40 在 node1。
+NATIVE_NUMA_PASS。这证明原生guest根桥NUMA识别，不证明真实VF跨机、
+DMA分配归属、DSM下降或聚合带宽收益。普通VM随后正常poweroff。
+
+此外，本轮完成耗时 uprobes 出现嵌套/缺失返回，pending未清零，
+全部耗时统计丢弃；第一轮 payload 内容/字节数校验及 error/drop
+增量0，但不能用于函数成本归因。探针已卸载，第二轮通过串口
+恢复控制握手完成内容验证；接收服务正常STOP、临时Jinx IP删除。
+测试通过stdin/memfd，无实验文件/新盘，无Lux操作。
+下一步恢复Ezreal、同步代码、验证PAM广播和真实跨机启动，再看
+guest两VF的numa_node及驱动分配；当前总目标仍未完成。
