@@ -7140,3 +7140,34 @@ ASAN+UBSAN（含 leak）和 O2 各覆盖 0..4080 全部4081种长度，
 fixture 不替代真实 RDMA repost/控制交互验证；
 完整 QEMU 增量编译通过。运行与性能收益仍待新实例验证，
 不将少一次分配直接宣称为带宽提升。
+
+运行补充：同日首次真实新实例启动未通过。原实例正常 poweroff，
+两端 launcher 退出0后启动本候选；在 iavf 初始化阶段 master 报：
+owner=1 device=66 operation=3 bar=0 offset=0x8800 status=-5，
+requested/returned generation均1。该状态由 owner address_space_rw 非 MEMTX_OK
+转为 -EIO；不能据此断言 VF pread、allocator 或某种具体 mapping 错误。
+slave query-status仍running；只读query-pci显示 device-port-1
+secondary=0、memory/prefetch窗口关闭，而端点 descriptor 已有BAR。
+这提示检查旧式配置广播与 owner 地址空间/bridge 的一致性，
+尚未证明根因，也未完成旧版本匹配启动对照。
+
+master进程243230已进入退出但卡在 kvm_dsm_free→kthread_stop，
+其kvm-dsm/0线程243241继续在kthread_stop，
+连接线程243492/243494阻塞krdma_receive；slave vCPU2/3同样在DSM fetch/receive。
+对slave发QMP quit已收到host-qmp-quit SHUTDOWN事件，
+等待最终reply超时，后续只读进程/栈仍显示其未退出；
+QEMU transport retry错误不是成功退出证明。
+kernel dsm.c先stop连接线程再release(conn->sock)，
+krdma_receive的-EAGAIN循环未检查kthread_should_stop，
+能解释为何发SIGKILL/kthread_stop不足以结束无消息等待；
+尚未修改或重启host内核。
+未因为观察超时重新启动/重启；worker-g4 PID6969保持存活。
+Jinx旧服务已terminal0、cleanup PASS，49161无listener、临时别名已清理。
+无新guest源码或实验文件，无磁盘/Lux测试。
+
+为避免把未经真实启动验证的候选留作工作分支默认，
+后续提交仅恢复 migration/rdma-gvm.c 到 f078513800 的已验证实现；
+e4dd209a8b保留可审阅候选/fixture结果和线程布局记录。
+候选没有可声称的真实吞吐收益，恢复源码不等于恢复当前挂起的VM。
+整体目标未完成；下一步先定位控制配置同步/owner BAR失败，
+以及不依赖重启的DSM退出路径，再恢复真实性能验证。

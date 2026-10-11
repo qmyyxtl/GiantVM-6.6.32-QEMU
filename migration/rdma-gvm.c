@@ -64,35 +64,7 @@ typedef struct router_work {
     rdma_msg_header_t hdr;
     void *data;
     struct router_work *next;
-    /* Keep malloc's alignment for callbacks which decode typed payloads. */
-    uint8_t payload[] QEMU_ALIGNED(16);
 } router_work_t;
-
-/*
- * Own the header and payload together before reposting the receive buffer.
- * The control handler and FIFO worker share the same ownership rule: free
- * only the work item after the synchronous callback has returned.
- */
-static router_work_t *router_work_copy(const rdma_msg_header_t *hdr,
-                                      const void *data)
-{
-    router_work_t *work;
-
-    if (hdr->data_len > MAX_MSG_DATA_SIZE || (hdr->data_len && !data)) {
-        return NULL;
-    }
-    work = malloc(sizeof(*work) + hdr->data_len);
-    if (!work) {
-        return NULL;
-    }
-    work->hdr = *hdr;
-    work->next = NULL;
-    work->data = hdr->data_len ? work->payload : NULL;
-    if (hdr->data_len) {
-        memcpy(work->data, data, hdr->data_len);
-    }
-    return work;
-}
 
 typedef struct {
     pthread_mutex_t lock;
@@ -916,6 +888,7 @@ static void *request_worker_func(void *arg)
         if (g_msg_handler) {
             g_msg_handler(peer, &work->hdr, work->data);
         }
+        free(work->data);
         free(work);
     }
     rcu_unregister_thread();
@@ -1035,11 +1008,12 @@ static void* recv_thread_func(void *arg)
             debugf("[RDMA Router] Received request from peer %d: type=%d, len=%d, seq=%lu\n",
                    peer_id, hdr->msg_type, hdr->data_len, hdr->sequence);
             
-            /* Copy before repost: the HCA may immediately reuse this buffer. */
-            router_work_t *work = router_work_copy(hdr, data);
-            if (!work) {
-                fprintf(stderr, "[RDMA] request queue allocation failed\n");
-                abort();
+            // 🔑 关键修改：先复制消息到临时缓冲区
+            rdma_msg_header_t hdr_copy = *hdr;
+            void *data_copy = NULL;
+            if (hdr->data_len > 0) {
+                data_copy = malloc(hdr->data_len);
+                memcpy(data_copy, data, hdr->data_len);
             }
             
             // 🔑 立即 re-post recv（在处理消息之前！）
@@ -1061,10 +1035,17 @@ static void* recv_thread_func(void *arg)
             // 🔑 现在可以慢慢处理消息了（使用副本）
             debugf("[RDMA Router] Handling message from peer %d\n", peer_id);
             if (g_control_handler &&
-                g_control_handler(peer_id, &work->hdr, work->data)) {
-                free(work);
+                g_control_handler(peer_id, &hdr_copy, data_copy)) {
+                free(data_copy);
             } else {
                 router_worker_t *worker = &g_ctx.workers[peer_id];
+                router_work_t *work = calloc(1, sizeof(*work));
+                if (!work) {
+                    fprintf(stderr, "[RDMA] request queue allocation failed\n");
+                    abort();
+                }
+                work->hdr = hdr_copy;
+                work->data = data_copy;
                 pthread_mutex_lock(&worker->lock);
                 if (worker->queued == RDMA_BUFFER_COUNT) {
                     fprintf(stderr, "[RDMA] request queue exhausted\n");
@@ -1259,6 +1240,7 @@ void rdma_router_cleanup(void)
             while (worker->head) {
                 router_work_t *work = worker->head;
                 worker->head = work->next;
+                free(work->data);
                 free(work);
             }
             pthread_cond_destroy(&worker->ready);
