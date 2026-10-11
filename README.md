@@ -6702,3 +6702,106 @@ Jinx地址/49161清理，保留巨虚与worker-g4。
 下一步优先同条件G单/E单、两host同步测DSM API频率和耗时，
 区分直接调用、BQL持有期间调用与间接竞争，再选择非DSM优化。
 HPET远端RPC路径与DSM代价可同时存在，当前整体性能目标未完成。
+
+#### 同条件单卡 DSM 对照与 guest HPET 热页指令归因（2026-10-11）
+
+运行仍G52069/E15976、worker-g4 6969、633640bbb6功能binary、
+guest #26四CPU在线/HPET，源树基线cae0257e9f。
+设备/NUMA/IRQ/RSS/XPS不变，不修改guest或HPET设备。
+两端同时挂kprobe/kretprobe：kvm_dsm_vcpu_acquire_page、
+kvm_dsm_memcpy、kvm_dsm_fetch，按各自QEMU TGID过滤。
+READY后4秒开启入口gate，采10秒，再关入口并有界drain。
+每条件两个本地CPU worker，CPU本地预分配32x1MiB变化内容buffer，
+20秒TCP到Jinx两地址。G单和E单各一轮，采样窗未记录独立payload字节数，
+不是精确共同payload区间，不计算严谨calls/MiB或据此定量解释全差距。
+
+| 发包条件 / 被采host | acquire次数 / 累计ms | memcpy次数 / 累计ms | 远端fetch次数 / 累计ms |
+|---|---:|---:|---:|
+| G-Garen | 702787 / 2747.347 | 2556327 / 1773.503 | 100798 / 1583.451 |
+| G-Ezreal | 129117 / 1957.045 | 3050 / 7.016 | 97188 / 1611.532 |
+| E-Garen | 99497 / 1565.698 | 3920 / 11.308 | 75251 / 1302.227 |
+| E-Ezreal | 636180 / 2146.200 | 1989924 / 1272.318 | 78415 / 1295.074 |
+
+各host gate约10.00012–10.00020秒；四份entry总数均与完整return计数之和相等，
+nested/req_read_invalid/hot_map_failed/active_at_stop均0，
+cleanup前实际kprobe_profile三个return probe的nmissed均0。
+所有fetch调用记录的dest均为另一节点，返回错误0。
+从实际IVY源码req_type0/1/2=INV/READ/WRITE，
+请求gfn位于offset8、req_type offset16；记录分布均有效，
+hot map计数总数与fetch次数相等。
+fetch是远端请求函数调用，内部可重试/转发，次数不是唯一页数或wire消息数；
+INV也算fetch，不把它全部说成4KiB传页。
+acquire/memcpy/fetch有嵌套，不把三个累计时间相加；
+memcpy含大量本地快路径，不把它都算DSM跨网。
+采样能证明两端都有实际远端DSM活动，单轮原始计数本身
+不能证明E更慢全由更多fetch造成；E单原始fetch总数反而较低，
+但也完成较少数据，需区分频率、延迟、锁竞争和payload/时间窗。
+带kprobe整段流量G804.883/E604.218 MiB/s仅作诊断观察，
+不可取代无探针934.177/704.713中位数或作为代码收益。
+
+所有四份fetch热点中，GFN0x2c06占约37.84%–41.80%。
+在运行guest直接读取/proc/iomem、/proc/kallsyms：
+Kernel code物理0x01000000、_text虚拟0xffffffff81000000，
+确认本启动映射offset0xffffffff80000000。
+GFN2c06对应0xffffffff82c06000，页首symbol hpet，
+同页还有mmlist_lock、tasklist_lock、softirq_vec、pidmap_lock、bit_wait_table。
+GFN2c07含jiffies/jiffies_seq/jiffies_lock及bit_wait_table部分；
+385c含tk_core、shadow_timekeeper、timekeeper_lock；
+385d含tick/clockevent相关全局状态；3818含调度全局状态。
+因此只凭页级热点不能将所有访问归某个对象。
+
+进一步E单20秒流量时，仅两端kvm:kvm_page_fault tracepoint，
+按QEMU PID过滤6个热GFN，独立10秒gate，记录guest_rip/vcpu/GPA/error_code。
+实际format和源代码确认guest_rip由kvm_rip_read读取；
+本EPT fault窗口地址与目标物理GFN匹配。
+G matched53799、E64708，全部map计数总和相等、map_failed0。
+这份统计是KVM fault指令归因，不是与前一份fetch逐次关联的消息计数。
+在GFN2c06页：
+G fault30549，其中read_hpet26382（约86.36%）；
+E fault35831，其中read_hpet35160（约98.13%）。
+其它同页fault包含handle_softirqs，不能忽略页内其它对象。
+
+运行guest符号表read_hpet=[0xffffffff8106ea00,0xffffffff8106eaf0)；
+从运行guest /proc/kcore只读提取这240B，在host memfd用objdump反汇编：
++0x2a/+0xa6读取0xffffffff82c06000的lockval；
++0x52为lock cmpxchg，同地址获取锁；
++0x7d将计数器值写至0xffffffff82c06004。
+这使用运行代码而非假定当前guest vmlinux与启动binary一致。
+E fault位置+0x52共13240、+0x7d共15325；
+G +0xa6竞争等待读共11698、+0x2a初始读共8431。
+guest原有read_hpet源码先获取共享锁，再读HPET MMIO，
+写共享缓存值、释放锁；竞争方读lockval等缓存变化。
+证实热点包含具体HPET锁/缓存访问，支持DSM与设备读取耦合机制；
+远端MMIO可延长锁持有、页级共享可造成读写互扰，
+但未逐次联合记录锁持有/远端RPC/fetch延迟，
+不声称已定量证明因果链每一环或解释全部单/双卡损失。
+TP流量702.596 MiB/s仅功能/诊断观察，不当作优化结果。
+
+随后无需探针的现有候选loom-bar-negative-filter OFF/ON，
+两端同设，其它BAR选项OFF，RPC spin0、SSE2 ON。
+只测E单两个本地worker，各6秒，共6组交替顺序/12轮：
+| pair | OFF MiB/s | ON MiB/s | OFF两端hostCPU秒 | ON两端hostCPU秒 |
+|---|---:|---:|---:|---:|
+| 0 | 678.369 | 703.931 | 9.360 | 7.600 |
+| 1 | 695.157 | 699.639 | 9.050 | 9.320 |
+| 2 | 703.432 | 698.832 | 9.060 | 9.000 |
+| 3 | 694.799 | 709.730 | 9.190 | 9.120 |
+| 4 | 687.387 | 704.820 | 9.340 | 9.380 |
+| 5 | 702.698 | 706.634 | 7.190 | 9.300 |
+
+吞吐median OFF694.978 / ON704.376 MiB/s，+1.35%，5/6组ON较高；
+两端hostCPU累计median OFF9.125 / ON9.210秒，仍有明显波动，
+不据这份结果宣称CPU稳定降低或解决934/705不对称。
+CPU按进程utime+stime-guest_time读取，
+周边计数窗6.809–7.143秒包含启动/分配/收尾与DSM，
+不是纯设备CPU或精确6秒payload窗；不把近似CPU/MiB当严格指标。
+当前候选和默认仍OFF；QMP两侧restore readback验证。
+未实施新功能源码修改，也没有把小幅滤目录收益当DSM修复。
+
+以上各流内容/字节数全部验证通过，每轮两卡error/drop增量0。
+所有BCC/TP probes已cleanup、receiver STOP exit0、
+Jinx临时地址/49161清除，巨虚和worker-g4保留。
+无实验文件/新盘/Lux/磁盘测试，guest预存fair.c及旧bzImage变更未碰。
+HPET和guest保持，既有host dirty-page warning未修复。
+下一步据已确认的共享HPET锁/缓存DSM机制评估剩余QEMU非DSM成本，
+不再将RPC累计总耗时直接作为纯非DSM损失；整体目标仍未完成。
