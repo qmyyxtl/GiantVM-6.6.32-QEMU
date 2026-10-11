@@ -6596,3 +6596,64 @@ E流量时活跃CPU2/3频繁读时钟产生远端同步RPC。
 下一步先拆这个HPET通用RPC的锁、SEND CQ和reply CQ等待成本；
 已有有界spin候选过去收益不稳定、当前保持0，不能仅据新归因重复开关后称解决。
 同时仍需核实BQL/off-CPU与DSM之外的其它成本，整体目标未完成。
+
+#### 当前 HPET RPC 分段观测（2026-10-11）
+
+沿用实际G52069/E15976和3a4fb51582源树（功能binary633640bbb6），
+没有修改guest/HPET/QEMU功能代码或运行配置。
+两端QMP核实recv-cq-events=true、rpc-spin-ns=0。
+对Ezreal单卡两个本地worker的20秒变化内容TCP流量，
+在PID15976挂12个入口/返回uprobe，按TGID/TID限定HPET地址
+0xfed000f0且is_write=false，再记录嵌套锁/RPC/SEND/usleep范围。
+完成全部attach后才开启入口gate：READY后4秒开始，gate窗口8.000112秒，
+关闭入口后最多1秒等待已有调用返回，再读取map并cleanup。
+只累计完整外层MMIO调用，51170 entries全部完成，nested0/inflight0。
+首次BPF加载因动态数组index verifier拒绝；finally cleanup后
+改为常量3/5分支，重新加载成功，没有修改目标进程源码或重启。
+
+| 范围 | 次数 | 两vCPU累计ms |
+|---|---:|---:|
+| mmio | 51170 | 2277.303678 |
+| io_mutex | 51170 | 217.272246 |
+| rpc | 51170 | 1869.045562 |
+| response_mutex | 51170 | 87.146400 |
+| send | 51170 | 530.291864 |
+| send_mutex | 51170 | 96.278972 |
+| send_sleep | 51164 | 278.543476 |
+| reply_sleep | 167696 | 918.663423 |
+
+io_mutex是MMIO内、进入rdma_router_call前的qemu_mutex_lock_impl；
+rpc内pthread_mutex_lock按phase分为response_mutex和send_mutex。
+send是rdma_send_msg含send_lock/post_send/SEND CQ等待；
+rdma_wait_completion已内联，无独立符号，故没有把整个send视为CQ时间。
+send_sleep/reply_sleep是对应phase的libc usleep入口到返回范围，
+包含探针/睡眠/调度返回，不是设置的名义1us或纯网络时延。
+
+这些范围嵌套，不能相加：io_mutex属于mmio，
+response_mutex/send属于rpc，send_mutex/send_sleep属于send。
+本窗口每个完整RPC几乎一次send_sleep，平均约3.28次reply_sleep；
+两类sleep累计约1197.207ms，占rpc累计1869.046ms约64.05%，
+只说明被观测的等待策略成本，不能解释为无探针正常带宽损失。
+两个vCPU累计墙钟也不是独占CPU或单线程wall百分比。
+
+12个uprobe会显著扰动路径。本轮完整流量观察392.088 MiB/s，
+与此前单探针/无探针679/705不同窗口不可量化比较，也不能归因为代码回退。
+不以这个重探针吞吐作为baseline、改善幅度或最终性能数据。
+两条流内容与字节数校验通过，两卡全部error/drop增量0。
+接收器STOP正常exit0，临时Jinx地址/49161清理，BCC probes cleanup，
+巨虚和worker-g4保留，无实验文件/新盘/磁盘/Lux操作。
+
+源代码核实：每peer request receiver通过条件变量唤醒FIFO worker；
+worker同步执行g_msg_handler后才取下一条请求。
+rdma_send_msg用send_lock保护单个已注册buffer，
+确认SEND CQ成功且wr_id匹配后才允许复用。
+不能跳过完成检查，或仅返回成功就复用buffer/释放MR。
+request receiver当前为CQ事件模式，与回复CQ的usleep轮询是不同路径；
+不能把回复等待诊断直接解释为request receiver未启用event。
+
+下一步针对master接收→worker队列→BQL/模型处理→reply SEND完成，
+做扰动更低的分段定位，优先核实回复服务链上可避免的调度等待。
+如考虑异步回复，必须先解决已发布buffer生命周期、CQ单consumer、
+发送FIFO、错误与关闭drain；目前没有实施。
+之前双方CQ统一5us短spin收益不稳定，保持0，没有重复开关宣称解决。
+整体目标未完成，guest与HPET保持。
