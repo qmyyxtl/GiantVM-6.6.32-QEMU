@@ -5469,5 +5469,51 @@ prepare累计inclusive耗时3.103s，materialize0.689s、sync-range1.738s；
 覆盖连续区间、context、间隙、重叠、环回绕、16页限制、地址溢出、
 warm与cold回退、同步失败禁止描述符发布、精确载荷写入及发布顺序。
 外部DMA/硬件接口使用mock，不能代替实际网卡和DSM的正确性验证。
-Ezreal完整QEMU编译通过。实际硬件收发和未插桩成对性能对照尚待验证；
-默认关闭，不宣称性能收益，不改guest、HPET或磁盘配置。
+Ezreal完整QEMU编译通过。实际硬件收发和未插桩成对性能对照见下节；
+默认关闭，不宣称稳定性能收益，不改guest、HPET或磁盘配置。
+
+#### 相邻TX合并：实际设备验证和同启动性能对照
+
+两端QEMU同步到da88d77cfb并编译；Garen也完成四组合各144,351例回归。
+guest正常poweroff后两端QEMU退出0，再启动，host未重启。
+Garen PID320354、Ezreal PID851829；worker6122保留。
+四CPU在线，guest6.12.0-vanilla-vfio #26、HPET、RX512/TX128；
+TX idle OFF，RX bounded OFF。开启coalesce时，两端各两worker发送6s，
+接收端载荷/字节数校验通过；两端同时各接收256MiB并获得发送端确认通过。
+未覆盖任意DMA重映射、完整PCI FLR和长期稳定性。
+
+无插桩，同次启动G单卡两worker CPU0/1，XPS/RSS固定队列1，
+Jinx作接收端，6组交替OFF→ON / ON→OFF，每轮6s：
+| pair | OFF MiB/s | ON MiB/s | OFF host ms/MiB | ON host ms/MiB |
+|---|---:|---:|---:|---:|
+| 0 | 938.061 | 931.968 | 1.330373 | 1.273200 |
+| 1 | 960.556 | 972.347 | 1.276670 | 1.248715 |
+| 2 | 980.873 | 989.204 | 1.258492 | 1.207477 |
+| 3 | 966.381 | 943.822 | 1.263793 | 1.288614 |
+| 4 | 945.675 | 984.591 | 1.286117 | 1.218274 |
+| 5 | 979.292 | 963.967 | 1.248724 | 1.259938 |
+
+中位数 OFF963.469 / ON968.157 MiB/s（+0.49%）；
+owner QEMU user+system-guest OFF1.270231 / ON1.254327 ms/MiB（-1.25%）。
+带宽3/6组ON更高、CPU4/6组ON更低，不能宣称稳定收益。
+12轮载荷/字节数校验通过，队列0包及IRQ增量0，
+网卡错误/丢弃增量0；TCP重传仍存在，本项未解决它。
+这是重新启动后的同启动开关对照，不把963/968与此前904跨启动相减作为收益。
+
+另做TX prepare作用域内uprobes（无ioctl或materialize探针），
+恢复XPS0/RSS equal2，每个模式G两worker发送6s，载荷校验通过：
+OFF：prepare51,863次均返回1，sync399,470次/3,411,577,338B；
+超过单描述符16383B的sync为0，identity-range查询0。
+ON：prepare57,440次均返回1，sync208,951次/3,760,067,218B；
+identity-range99,541次全部true；其中99,484次sync超过16383B，
+合并大范围3,557,823,120B。证明实际硬件流量触发合并；
+按同步字节数归一，sync调用密度减少约52.5%。
+调用密度不等同系统调用数、DSM远端传页数或CPU收益；
+每页CPU读取和merge仍执行，没有据此取消数据同步。
+sync错误0，所有probe活动map为0，detach/cleanup退出0。
+插桩吞吐显著受影响，不作性能结论。
+
+收尾两端coalesce运行时OFF，TX idle/RX bounded OFF，XPS0/RSS equal2。
+source/sink正常退出，Jinx测试地址及监听器清理。
+下一步定位每页读取、差分merge/复制及等待成本，
+解释同步调用数量大降为何未转成稳定CPU/带宽收益；整体目标尚未完成。
