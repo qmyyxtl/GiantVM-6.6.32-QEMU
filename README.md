@@ -7171,3 +7171,46 @@ e4dd209a8b保留可审阅候选/fixture结果和线程布局记录。
 候选没有可声称的真实吞吐收益，恢复源码不等于恢复当前挂起的VM。
 整体目标未完成；下一步先定位控制配置同步/owner BAR失败，
 以及不依赖重启的DSM退出路径，再恢复真实性能验证。
+
+### owner BAR 失败与 bridge 窗口的进一步定位（2026-10-11）
+
+38226fe2f3 后只读核实：Garen master243230仍D、kvm-dsm/0
+243241在kthread_stop，连接线程243492/243494在krdma_receive；
+Ezreal75934仍存在，vCPU2/3在DSM fetch/receive。
+先前QMP quit事件并未让slave退出，不视为terminal；
+本轮未重启或新建巨虚，worker-g4 PID6969保持。
+
+源码确认旧式PIO路径广播CF8/CFC/CFE配置写。
+KVM master通用MMIO回落只address_space_rw本地地址空间；
+pcie_mmcfg_data_write直接pci_host_config_write_common，
+后者发布聚合endpoint目录，但不复制普通bridge配置到peer。
+slave普通MMIO转发master，同样不能使所有peer bridge窗口保持一致。
+这说明ECAM bridge写存在需要核实的同步缺口；
+当前失败未记录具体配置访问序列，尚不能认定现场必经ECAM，
+也不能把单次分配候选认定为根因。
+
+使用当前编译QEMU暂停TCG/qtest（无VF、无KVM、无disk），
+构造pxb-pcie bus32→root-port→EDU bus33。
+PIO配置端点BAR=0xfe800000、command=MEM；
+上级窗口关闭时readl BAR标识返回0；
+开启bridge command=MEM及MEM窗口后读0x010000ed；
+关闭窗口再次返回0。再配置Q35 PCIEXBAR=0xb0000001，
+通过ECAM 0xb2000020独立开启/关闭同一窗口，结果相同。
+fixture在修改诊断前后各运行一次，均BRIDGE_WINDOW_PASS、
+ECAM_WINDOW_PASS，TCG退出0，stderr为空。
+这验证“端点BAR已配置不代表owner地址空间可达”，
+但不是实际跨机VF/owner dispatch测试，未证明现场MEMTX错误类型。
+QMP/qtest均使用pipe/TCP，未生成实验文件，listener随子进程清理。
+
+本次功能行为只增加失败路径诊断：
+loom_pci_dispatch保留address_space_rw、status=-EIO和generation语义，
+失败时记录具体MemTxResult、端点bus/BDF/BAR基址/offset/size/command，
+以及上级bridge bus号和MEM/prefetch窗口。
+MEMTX_ERROR=1代表设备错误，MEMTX_DECODE_ERROR=2代表地址解码失败，
+不能把旧日志的-EIO直接解释为其中一种。
+没有绕过bridge直接读设备MemoryRegion、没有修改guest或HPET，
+没有加新的正常访问RPC、没有声称修复启动问题。
+完整QEMU编译通过；运行候选仍撤回。
+下一步需要恢复可运行现场后确认失败分类和真实配置序列，
+再将拓扑配置同步放入控制路径，避免在doorbell热路径补查询。
+DSM退出循环的stop处理仍未修改；整体优化目标未完成。

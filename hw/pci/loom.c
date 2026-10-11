@@ -1299,11 +1299,46 @@ void loom_pci_dispatch(const LoomPCIRequest *req, LoomPCIResponse *resp)
                 break;
             }
             stq_le_p(data, req->value);
-            resp->status = address_space_rw(
+            MemTxResult result = address_space_rw(
                 bar->type & PCI_BASE_ADDRESS_SPACE_IO ?
                 &address_space_io : &address_space_memory,
                 bar->addr + req->offset, MEMTXATTRS_UNSPECIFIED,
-                data, req->size, write) == MEMTX_OK ? 0 : -EIO;
+                data, req->size, write);
+            resp->status = result == MEMTX_OK ? 0 : -EIO;
+            if (result != MEMTX_OK) {
+                PCIBus *bus = pci_get_bus(dev);
+
+                error_report("Loom PCI owner BAR transaction failed: "
+                             "device=%u bus=%s bdf=%02x:%02x.%x "
+                             "bar=%u address=0x%" HWADDR_PRIx
+                             " offset=0x%" PRIx64 " size=%u write=%d "
+                             "command=0x%04x memtx=0x%x",
+                             req->device_id, bus->qbus.name,
+                             pci_dev_bus_num(dev), PCI_SLOT(dev->devfn),
+                             PCI_FUNC(dev->devfn), req->bar, bar->addr,
+                             req->offset, req->size, write,
+                             pci_get_word(dev->config + PCI_COMMAND), result);
+                /* The endpoint's BAR may be programmed while an upstream
+                 * bridge still hides it from the owner's address space. */
+                while (bus->parent_dev) {
+                    PCIDevice *bridge = bus->parent_dev;
+
+                    error_report("Loom PCI upstream bridge: bus=%s devfn=%02x "
+                                 "command=0x%04x primary=%u secondary=%u "
+                                 "subordinate=%u memory=0x%04x..0x%04x "
+                                 "prefetch=0x%04x..0x%04x",
+                                 pci_get_bus(bridge)->qbus.name, bridge->devfn,
+                                 pci_get_word(bridge->config + PCI_COMMAND),
+                                 bridge->config[PCI_PRIMARY_BUS],
+                                 bridge->config[PCI_SECONDARY_BUS],
+                                 bridge->config[PCI_SUBORDINATE_BUS],
+                                 pci_get_word(bridge->config + PCI_MEMORY_BASE),
+                                 pci_get_word(bridge->config + PCI_MEMORY_LIMIT),
+                                 pci_get_word(bridge->config + PCI_PREF_MEMORY_BASE),
+                                 pci_get_word(bridge->config + PCI_PREF_MEMORY_LIMIT));
+                    bus = pci_get_bus(bridge);
+                }
+            }
             if (!write && !resp->status) {
                 resp->value = 0;
                 memcpy(&resp->value, data, req->size);
