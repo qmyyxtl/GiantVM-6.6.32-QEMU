@@ -59,6 +59,7 @@ struct LoomVFIODMA {
     bool early_publication;
     bool batched_rx_publication;
     bool batched_rx_payload;
+    bool batched_rx_rearm;
     bool publication_failed;
 };
 
@@ -303,6 +304,9 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
         const char *payload = getenv("LOOM_VFIO_RX_PAYLOAD_BATCH");
 
         bc->loom_dma->batched_rx_payload = payload && !strcmp(payload, "1");
+        const char *rearm = getenv("LOOM_VFIO_RX_REARM_BATCH");
+
+        bc->loom_dma->batched_rx_rearm = rearm && !strcmp(rearm, "1");
         const char *buffers = getenv("LOOM_VFIO_BUFFER_RECYCLE");
         bc->loom_dma->recycle_buffers =
             !buffers || strcmp(buffers, "0");
@@ -1533,6 +1537,80 @@ int loom_vfio_dma_submit_snapshot(VFIOContainerBase *bc, hwaddr iova,
     }
     smp_wmb();
     return 0;
+}
+
+/*
+ * RX rearm may read two disjoint buffers from one RAM page in one transaction.
+ * Only the original buffer ranges are merged into staging/baselines; bytes in
+ * the intervening gap are not published. No pointer survives this invocation.
+ */
+int loom_vfio_dma_sync_rx_pair(VFIOContainerBase *bc, hwaddr first,
+                                hwaddr second, uint64_t size)
+{
+    MemoryRegionCache cache = { 0 };
+    uint8_t snapshot[4096];
+    hwaddr address[2] = { first, second }, lower, upper;
+    LoomDMABuffer *b, part[2];
+    uint64_t span;
+    int ret;
+
+    if (!bc || !bc->loom_dma) {
+        return -ENODEV;
+    }
+    if (!size || size > 4096 ||
+        first > UINT64_MAX - size || second > UINT64_MAX - size) {
+        return -EINVAL;
+    }
+    if (bc->loom_dma->publication_failed) {
+        return -EIO;
+    }
+    if (!bc->loom_dma->batched_rx_rearm || !bc->loom_physical ||
+        !bc->loom_dma->page_indexed || !bql_locked()) {
+        goto fallback;
+    }
+    lower = MIN(first, second);
+    upper = MAX(first, second) + size;
+    span = upper - lower;
+    if (MAX(first, second) - lower < size || span > 4096 ||
+        (lower & 4095) + span > 4096) {
+        goto fallback;
+    }
+    b = buffer_at(bc->loom_dma, first);
+    if (!b || b->direction == 2 ||
+        buffer_at(bc->loom_dma, second) != b) {
+        goto fallback;
+    }
+    for (unsigned n = 0; n < 2; n++) {
+        if (address[n] < b->iova || address[n] - b->iova > b->size ||
+            size > b->size - (address[n] - b->iova)) {
+            goto fallback;
+        }
+        part[n] = buffer_view(b, address[n] - b->iova, size);
+    }
+    if (((b->gpa + lower - b->iova) & 4095) + span > 4096) {
+        goto fallback;
+    }
+    rcu_read_lock();
+    if (address_space_cache_init(&cache, &address_space_memory,
+                                  b->gpa + lower - b->iova, span, false) != span ||
+        !memory_access_is_direct(cache.mrs.mr, false)) {
+        address_space_cache_destroy(&cache);
+        rcu_read_unlock();
+        goto fallback;
+    }
+    /* A DSM cache has no direct ptr and retains its mediated read path. */
+    ret = address_space_read_cached(&cache, 0, snapshot, span) == MEMTX_OK ?
+          0 : -EIO;
+    address_space_cache_destroy(&cache);
+    rcu_read_unlock();
+    for (unsigned n = 0; !ret && n < 2; n++) {
+        ret = merge_buffer(bc, &part[n], snapshot + address[n] - lower, true);
+    }
+    return ret;
+
+fallback:
+    ret = loom_vfio_dma_sync_to_device_range(bc, first, size);
+    return ret ? ret : loom_vfio_dma_sync_to_device_range(bc, second, size);
 }
 
 /*

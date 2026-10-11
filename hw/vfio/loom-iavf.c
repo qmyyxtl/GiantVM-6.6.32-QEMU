@@ -1525,14 +1525,38 @@ int loom_iavf_prepare_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value
             return -ENOTSUP;
         }
     }
-    for (unsigned n = 0; n < span; n++) {
+    for (unsigned n = 0; n < span; ) {
+        bool pair = rx && n + 1 < span && length[n] &&
+                    length[n] == length[n + 1] &&
+                    (payload[n] >> 12) == (payload[n + 1] >> 12) &&
+                    (payload[n] & 4095) + length[n] <= 4096 &&
+                    (payload[n + 1] & 4095) + length[n + 1] <= 4096 &&
+                    MAX(payload[n], payload[n + 1]) -
+                    MIN(payload[n], payload[n + 1]) >= length[n];
+
         if (!length[n]) {
+            n++;
             continue;
         }
-        ret = physical_stage(dev, payload[n], length[n]);
+        if (pair) {
+            /* Both dependencies exist before either snapshot is submitted. */
+            ret = loom_vfio_ram_materialize(dev->bcontainer, payload[n],
+                                             length[n], true);
+            if (!ret) {
+                ret = loom_vfio_ram_materialize(dev->bcontainer, payload[n + 1],
+                                                 length[n + 1], true);
+            }
+            if (!ret) {
+                ret = loom_vfio_dma_sync_rx_pair(dev->bcontainer,
+                                 payload[n], payload[n + 1], length[n]);
+            }
+        } else {
+            ret = physical_stage(dev, payload[n], length[n]);
+        }
         if (ret) {
             return ret;
         }
+        n += pair ? 2 : 1;
     }
     if (span) {
         ret = physical_stage_snapshot(dev, base + old * stride, desc,

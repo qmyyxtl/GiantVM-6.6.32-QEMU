@@ -63,4 +63,7 @@ int loom_vfio_physical_region(VFIOContainerBase *, MemoryRegionSection *, bool);
 int loom_vfio_dma_publish_rx_payload_pair(VFIOContainerBase *, hwaddr, hwaddr,
                                           const void *, uint64_t);
 
+/* Read two same-page RX buffers, merging only their individual ranges. */
+int loom_vfio_dma_sync_rx_pair(VFIOContainerBase *, hwaddr, hwaddr, uint64_t);
+
 #endif

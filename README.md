@@ -4281,3 +4281,31 @@ RX_PAYLOAD_BATCH=0，其余开关同上；保留默认关闭，后续可复测�
 RSS equal2恢复，中断配置正常。source收到STOPLOOM并EXIT0，aliases删除。
 未产生实验文件，未使用Lux，未改guest源码；本轮除了CPU offline诊断，
 未重跑已接受的磁盘聚合。下一步仍需降低rearm回读和逐变化区间处理成本。
+
+### 2026-10-11：RX rearm 同页回读（实验开关，默认关闭）
+
+既有 payload pair 降低 pin 次数，但 rearm 仍每 buffer 回读。
+本轮在 prepare_physical_data 上独立 BCC 邻接观察：3 x 256MiB 校验通过，
+559184 个 1536-byte buffer 可分为314541个连续同页组，最大组2；
+34949个非空准备调用均包含16个buffer。dropped/errors=0，
+outside=24（其它入口的同步）、pending=1（结束边界仍在途），
+所以不是全局完整路径计数，探针已detach/cleanup。观测吞吐不能用作性能值。
+
+新增 LOOM_VFIO_RX_REARM_BATCH=1（默认0），
+loom_vfio_dma_sync_rx_pair 对同一有效注册、同一4KiB IOVA/GPA页面、
+不重叠的两个RX buffer，在BQL/RCU下验证完整普通RAM映射，
+一次读取包括间隙的有界span，再按原buffer顺序分别merge到staging。
+间隙不提交、不改baseline，不改变device-only数据与未变化CPU字节的保护。
+DSM cache保持ptr=NULL，仍通过address_space_read_cached的DSM读路径；
+不直接访问未经授权的DSM RAM pointer，不跳过回读。
+不可用/跨页/非RAM/短映射等回退原逐buffer同步；读取错误不提交快照，
+部分staging写失败沿用原merge失败行为，BAR gate不能继续提交描述符/tail。
+物理RX tail先验证全部描述符、payload与sentinel，再准备两range的注册。
+TX、AdminQ与启动时RX全队列准备保持既有流程。
+
+Ezreal编译PASS。memfd提取实际生产sync_rx_pair、sync_to_device_range、
+sync_buffer、merge_buffer等函数做ASAN+UBSAN，18009 cases PASS：
+随机1..2048byte及完整2KiB pair、正逆序地址、间隙/原device-only字节保护、
+逐changed-run失败注入、开关关闭/非RAM/短映射/无BQL/非physical/
+非indexed/跨页/native回退、整批读取失败与原逐buffer第二次读取失败、
+参数错误与sticky failure。当前尚未验证硬件性能收益。
