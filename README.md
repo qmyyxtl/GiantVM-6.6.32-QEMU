@@ -3913,3 +3913,99 @@ payload先完成、metadata先于DD、release在所有写之后；
 须覆盖失败时部分baseline、dirty、unpin与停止VM语义。
 此处只记录证据与候选设计，尚未实现该新API或报告其收益。
 长期映射/失效/reset 恢复与双卡扩展目标仍未完成。
+
+## 2026-10-11：RX descriptor 共用有界 lease，保持 DD 最后发布
+
+代码 commit `65356823b0`，只改 QEMU 三个文件：
+hw/vfio/loom-dma.c、hw/vfio/loom-iavf.c、include/hw/vfio/loom-dma.h。
+guest/host kernel、HPET 没有修改，没有 Lux/磁盘重新测量或 host reboot。
+新增 `LOOM_VFIO_ORDERED_PUBLICATION=1`，默认关闭，首次建立 container 时读取；
+outer wrapper 的 sudo env 传给两端。PIN 仍需
+`LOOM_VFIO_PUBLICATION_PIN=1`，并沿用上文已核实 atomic-unpin kernel。
+`=0` 是对照路径，不能当运行时切换开关。
+
+新 publish_rx_descriptor 接收 caller 已捕获的不可变 32-byte X710 writeback。
+caller 已完成所有 payload 发布和 queue/lifetime/range 检查；
+本函数仍按[0,8)、[9,32)、wmb、[8,9)写变化片段，
+绝不复制整页/覆盖未变化的 CPU 字节。每段成功后更新 baseline 与 dirty/TB。
+仅 physical/BQL/cache、32-byte aligned IOVA、一个 device-writable buffer 完整
+覆盖时复用一次 RAM cache；完整可写普通 RAM、RCU 生命周期都检查。
+跨 registration、不对齐、cache 不可用等使用原来的三次发布；
+device-read-only 范围保持既有跳过行为。内核暂存映射/registration 不跨调用缓存。
+同页至多32字节、至少3段变化时，复用现有 write pin/unpin。
+无 PIN/native/shm/跨host页等仍采用 cache 原有访问方式，不强行提供直接指针。
+pin 负返回不发布任何新字节；0/正访问掩码均接受并必须释放；
+任一 cached write 失败停止后续范围，所以不会提前发布 DD。
+unpin 仍有 release barrier、清 pointer、失败sticky；既有 VFIO 调用方停止 VM。
+返回前销毁 cache、退出 RCU；没有 guest 修改或持久 DMA 直映 DSM RAM。
+
+抽取实际生产函数进行 memfd ASAN/UBSAN 测试，外部 cache/ioctl/registration
+为替身：有序路径108,018例、原有 fragmented pin 路径118,218例 PASS；
+包括随机 producer/CPU 字节、0/2 writable direction、正mask7/private0、
+每段写失败/partial baseline、DD时metadata已完成、dirty/释放顺序、
+pin负返回、unpin sticky、native/flag/readonly/missing/overflow/短cache、
+non-RAM/host page/shm/noKVM/不对齐/跨host页回退。实际常量也从源码抽取。
+边界测试曾误要求“所有 unaligned 回退不得 pin”，断言失败；
+既有 per-merge 路径允许在它自己的单页片段中 pin，因此修正测试期望：
+跨host页新lease必须无pin，legacy回退只要求成功pin全部释放。
+这不是新的生产代码故障。两端编译与 diff --check PASS。
+这些替身测试不能证明真实长期 coherence/故障恢复。
+
+同一最终 binary（每台各自保持），PIN1不变，仅ORDERED0→1→0。
+Garen master/Ezreal slave、#26、4CPU在线、4GiB/两NUMA、HPET，
+NIC 2 queues/RX512/TX128、RPS/XPS0，data IRQ按名称绑CPU0/1/2/3，
+IRQ编号随boot变化，未硬编码。Garen enp0s7 RX CPU0、parent0/1，
+Jinx10.3单连接256MiB×3、pattern/计数/source独立elapsed全部核实。
+这张表无探针：
+
+| RX MiB/s | r0 | r1 | r2 | median |
+| --- | ---: | ---: | ---: | ---: |
+| OFF | 157.431 | 158.671 | 153.888 | 157.431 |
+| ON | 188.460 | 189.189 | 138.463 | 188.460 |
+| OFF_RESTORED | 157.638 | 131.001 | 135.310 | 135.310 |
+
+开启中位数高于前后关闭组，但boot内存/DSM分配、host线程、TCP4tuple/RSS
+未固定；关闭组有波动、开启第三轮较慢。短固定pattern测试不等于稳态benchmark，
+不能归因为固定比例、所有非DSM CPU开销下降或完成整体聚合目标。
+
+额外对照在同一 binary 的 ON 与 OFF_RESTORED，各接收768MiB；
+BCC只过滤对应QEMU tgid，kprobe/kretprobe count MEMCPY/MEMPIN，
+同样的 uprobe/uretprobe count新API进入/返回。探针在所有这些组均开启，
+计数完整、errors/dropped/pending/ordered_pending均0。
+| 调用 | ORDERED0 | ORDERED1 |
+| --- | ---: | ---: |
+| write MEMCPY ≤8 bytes | 2845472 | 590531 |
+| MEMPIN acquire 所有长度 | 559926 | 1119498 |
+| MEMPIN release 所有长度 | 559926 | 1119498 |
+| acquire length32 | 0 | 559627 |
+| 新API返回 count | 559797 | 559541 |
+
+小复制减少79.25%；仅前三行合计减少28.64%，不含 read memcpy/其他syscall。
+32-byte acquire与新API count相近（还有其他32字节pin），结合源码说明
+有序发布实际在运行，不能把全部QEMU短写归为该API。
+流量字节数相等，窗口ON19.867s、OFF28.464s含idle margins，
+背景QEMU活动/ACK包数等仍有差异，不能当精确无扰动cycle测量。
+ON探针下三轮2.800/3.034/2.775s，OFF3.336/3.665/3.313s；
+uprobe与kernel探针显著影响吞吐，不混入上面无探针表。
+
+开启组双卡同时各收256MiB：G2.994096s/E4.387757s，计数/内容PASS。
+TX各卡2workers×6秒、每种1轮：G684.055/E634.886/双卡总403.005MiB/s，
+全部8条流内容/接收计数/独立时钟PASS。没有同一binary的TX开关性能对照，
+只报功能，不能归因发送收益；双卡吞吐仍低、TCP重传仍有。
+开启及回切组guest error级dmesg空，两NIC四项errors/drops均0，
+CPU0–3/HPET、两既有1GiB raw data disk枚举正常。磁盘带宽不重测。
+三组均正常guest poweroff，两端wrapper EXIT0并完成恢复原VF driver的finally路径；未见本次lease残留。
+原FAT/hrtimer warnings与跨CPU printk时间戳跳动仍可见，未改时钟/fsck；
+测试CPU固定、独立source elapsed核实，不推出全系统时钟正确性。
+source/sinks已STOP/EXIT0，Jinx临时IP删除、49161/49162无监听；
+探针cleanup/EXIT0，没有实验文件。最终恢复ORDERED1/PIN1，
+启动状态与配置在下文核实。default仍off，长期mapping/失效/reset恢复、
+fresh native对照与双卡扩展目标尚未完成。
+
+最终运行核实：Garen QEMU4114115/session45943、Ezreal769218/session77461，
+两端proc environ均PIN1/ORDERED1，QMP query-status均running；guest正常登录、
+CPU0–3/HPET、两NIC UP/2queues512128/data IRQ36/37/39/40→0/1/2/3，
+两既有1GiB盘枚举正常，error级dmesg与两NIC错误/丢包计数0。
+Garen独立worker-g4 PID6122仍运行、未操作；临时流量源和接收端均已退出。
+下一步定位剩余约59万次短写与CPU开销，并做同规格native对照；
+不把双卡吞吐问题或长期映射/reset限制当已解决。
