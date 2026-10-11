@@ -5369,3 +5369,76 @@ OFF/ON各134,338用例通过，比上一版增加10项身份边界：
 新候选尚未在新巨虚启动中做硬件/性能验收，下一步必须补齐。
 本轮测试已恢复TX idle OFF、四CPU在线、XPS0/RSS equal2、
 HPET，探针及Jinx收端退出并清理测试地址；不创建实验文件。
+
+## 2026-10-11 单页 TX 注册身份候选的实机验收
+
+源码/二进制 d24c99eb91，正常关机后两端启动，未重启host。
+Garen实际PID290061 / Ezreal847004，guest仍#26、四CPU、HPET，
+沿用NUMA0 host绑定、RX512/TX128、两队列，RX bounded OFF。
+G运行ELF与build ELF SHA256均为
+3a63707dd6d25ca95d9591b21943ea7bb5bd18919cd536f2a6141a5726af6037；
+DWARF验证队列跟踪字段offset182000。
+
+TX idle开启：两端单卡发送载荷/字节数校验通过；两端同时各接收
+256MiB通过；RX ring512→256→512后，每种配置两端各接收256MiB
+并完成发送端确认，共6次接收通过。此项覆盖队列重配置和正常收发，
+不是完整PCI FLR、任意DMA重映射或长期稳定性验收。
+
+让G队列0发送并排空，再将XPS/RSS固定到队列1，8连接、
+16MiB SO_SNDBUFFORCE做注册变化压力；guest代码仅在内存执行。
+判据探针包含训练及压力阶段：容器epoch8128→52882；
+队列0 tx_idle_valid有效81,179次，保存/实时身份都194，
+没有任何失效原因；队列1有效81,179次。读取错误0、活动帧0。
+按IOVA记录的generation探针还有1932/2832共3个样本，该辅助探针
+未按容器区分，不用于断言所有起始地址查询都属于同一ring；
+身份稳定结论来自实际tx_idle_valid的队列指针及参数。
+
+压力阶段另一个完成窗口26,900回调全返回1：
+TX0 ring读取0次，TX1读取15,705次/32,163,840B（少41.62%）。
+实际队列0包/IRQ增量0；队列1正常收发，载荷检查通过，
+错误、丢弃增量0；探针读取/ioctl错误及所有活动map均0，全部清理退出。
+证明全局epoch变化期间可以保持空队列跳过扫描。
+上述插桩压力吞吐不用于性能收益结论。
+
+移除全部探针后，同启动做6组成对开关，固定G队列1、
+CPU0/1两worker、每轮6s；交替OFF→ON / ON→OFF：
+| pair | OFF MiB/s | ON MiB/s | OFF host ms/MiB | ON host ms/MiB |
+|---|---:|---:|---:|---:|
+| 0 | 905.462 | 929.924 | 1.364049 | 1.361386 |
+| 1 | 914.991 | 896.521 | 1.389294 | 1.388479 |
+| 2 | 891.254 | 895.839 | 1.408553 | 1.391772 |
+| 3 | 872.691 | 906.306 | 1.460967 | 1.381436 |
+| 4 | 910.102 | 885.904 | 1.363224 | 1.410964 |
+| 5 | 902.926 | 901.609 | 1.421524 | 1.395944 |
+
+中位数 OFF904.194 / ON899.065 MiB/s（-0.57%）；
+owner QEMU user+system-guest的CPU消耗 OFF1.398923 /
+ON1.390125 ms/MiB（-0.63%）。3/6组ON带宽更高，5/6组CPU更低；
+所有12轮数据校验通过、队列0无流量、错误/丢弃增量0。
+本轮压力注册之后采样，不能和上节不同启动的949/956直接比较。
+扫描减少不代表吞吐或CPU显著改善，本轮不足以宣称稳定性能收益。
+候选继续默认关闭。
+
+为了定位更大的CPU成本，在同次启动恢复XPS0/RSS equal2，
+TX idle开启，G单卡CPU0/1四轮发送覆盖20s采样：
+perf6.8.12 cpu-clock:H 49Hz、DWARF8192，evlist确认exclude_guest1；
+输出仅memfd、禁用buildid及缓存，关闭fd；flow4轮载荷校验通过。
+1048个可解析调用栈样本，bad0；leaf unknown110。
+启发式互斥分类：DSM/ivy/krdma家族269，VFIO且无这些帧379，
+其他RPC13、其他387。krdma分类较宽，栈中没有DSM帧也不能证明
+相关操作与DSM无关；未知外层libc帧、其他PID及阻塞等待不在此统计。
+没有据此推算纯非DSM占比或实际网络传页量。
+
+inclusive帧（有重叠，不能相加）：bar_access465、
+loom_pci_dispatch435、vfio_region_write333、
+loom_iavf_physical_bar_write279、physical_data_write268、
+physical_stage/loom_iavf_prepare_physical_data208（19.85%）。
+下一步优先测TX提交准备：每批payload的materialize/sync/ioctl次数，
+区分页面真正传输与本地快路径/重复准备，评估安全批处理。
+此次只有G单卡CPU采样；采样吞吐不作未插桩性能结论。
+
+恢复两端TX idle OFF、RX bounded OFF、XPS0/RSS equal2、
+RX512/TX128，四CPU在线、HPET，guest error级dmesg为空。
+全部probe/perf/source/sink进程正常退出，Jinx测试IP清理；
+保留worker6122，不测Lux，不重复已接受磁盘性能，不改guest。
+整体降低非DSM额外开销目标仍未完成。
