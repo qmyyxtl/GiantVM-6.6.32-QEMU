@@ -5442,3 +5442,32 @@ RX512/TX128，四CPU在线、HPET，guest error级dmesg为空。
 全部probe/perf/source/sink进程正常退出，Jinx测试IP清理；
 保留worker6122，不测Lux，不重复已接受磁盘性能，不改guest。
 整体降低非DSM额外开销目标仍未完成。
+
+### TX 相邻载荷合并候选（默认关闭）
+
+开关 `LOOM_IAVF_TX_PAYLOAD_COALESCE=1`。只合并本次已验证描述符快照中
+地址严格连续的 TX payload；不跨 context，不包含间隙或重叠，
+最多覆盖16个4KiB页面，保留同步器的页索引查找路径。
+仅当整个范围已有可写、原生 IOVA=GPA 的映射时使用；每次重新检查，
+不缓存映射身份。BQL内保持映射生命周期，cold、只读、非原生等情况
+回退原逐描述符 materialize/stage。同步失败不发布描述符或转发tail。
+同一原生页面合并精确连续区间，不同步额外空洞；不同页面仍按同步器
+的注册顺序处理，全部payload先于描述符发布。不是取消DSM或零复制。
+
+依据：此前实际G TX prepare窗口38,297次均返回1；materialize
+314,964次，sync-range274,460次；连续地址调用138,321次（50.40%）。
+同页面等长/不等长非重叠对各0次，因此未选用同页面pair方案。
+materialize期间epoch改变仅24次，不能把每次调用当成重新注册。
+prepare累计inclusive耗时3.103s，materialize0.689s、sync-range1.738s；
+存在嵌套，不相加，也不是纯CPU时间或远端DSM传页量。
+范围内kvm_vm_ioctl_dsm入口688,357次，错误0。ioctl大小直方图map
+容量256，其总和可能截断，不作为完整MEMCPY次数/字节数结论。
+插桩会明显干扰吞吐，不用采样流量速度作性能对照。
+
+提取实际prepare/commit和完成处理代码的ASAN/UBSAN回归，
+四种 TX-idle / coalesce 开关组合各144,351例通过（RX bounded随idle）。
+覆盖连续区间、context、间隙、重叠、环回绕、16页限制、地址溢出、
+warm与cold回退、同步失败禁止描述符发布、精确载荷写入及发布顺序。
+外部DMA/硬件接口使用mock，不能代替实际网卡和DSM的正确性验证。
+Ezreal完整QEMU编译通过。实际硬件收发和未插桩成对性能对照尚待验证；
+默认关闭，不宣称性能收益，不改guest、HPET或磁盘配置。

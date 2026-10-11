@@ -27,6 +27,51 @@ typedef struct LoomIAVFTXIdle {
     bool armed, drained;
 } LoomIAVFTXIdle;
 
+static int tx_coalesce_mode = -1;
+
+static bool tx_coalesce_enabled(void)
+{
+    if (tx_coalesce_mode < 0) {
+        const char *mode = getenv("LOOM_IAVF_TX_PAYLOAD_COALESCE");
+
+        tx_coalesce_mode = mode && !strcmp(mode, "1");
+    }
+    return tx_coalesce_mode;
+}
+
+/*
+ * Input is the validated submission snapshot, including zero-length contexts.
+ * Combine only exact adjacent payloads: no gaps, overlap or context crossing.
+ * Stay within the DMA synchronizer's 16-page indexed lookup bound.
+ */
+static unsigned tx_payload_run(const uint64_t *address, const uint32_t *length,
+                               unsigned start, unsigned count, uint64_t *size)
+{
+    uint64_t total, base, limit;
+    unsigned n;
+
+    *size = 0;
+    if (start >= count || !length[start]) {
+        return 0;
+    }
+    base = address[start];
+    total = length[start];
+    if (!base || base > UINT64_MAX - total) {
+        return 0;
+    }
+    limit = 16 * 4096ULL - (base & 4095);
+    for (n = start + 1; n < count; n++) {
+        if (!length[n] || address[n] != base + total ||
+            total > limit || length[n] > limit - total ||
+            length[n] > UINT64_MAX - base - total) {
+            break;
+        }
+        total += length[n];
+    }
+    *size = total;
+    return n - start;
+}
+
 static int tx_idle_mode = -1;
 static uint64_t tx_idle_serial;
 
@@ -2088,6 +2133,28 @@ int loom_iavf_prepare_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value
         if (!length[n]) {
             n++;
             continue;
+        }
+        if (!rx && tx_coalesce_enabled()) {
+            uint64_t bytes;
+            unsigned run = tx_payload_run(payload, length, n, span, &bytes);
+
+            /*
+             * Warm writable identity mappings only. BQL keeps registrations
+             * alive until synchronization finishes; cold or translated ranges
+             * retain per-descriptor materialization. All data is synchronized
+             * before publishing descriptors and forwarding the hardware tail.
+             */
+            if (run > 1 &&
+                loom_vfio_ram_identity_range(dev->bcontainer, payload[n],
+                                             bytes)) {
+                ret = loom_vfio_dma_sync_to_device_range(dev->bcontainer,
+                                                        payload[n], bytes);
+                if (ret) {
+                    return ret;
+                }
+                n += run;
+                continue;
+            }
         }
         if (pair) {
             ret = loom_vfio_ram_materialize_pair(dev->bcontainer,
