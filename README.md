@@ -5086,3 +5086,71 @@ QEMU loom-iavf.c:1015 已验证长度不大于配置缓冲区，
 Garen 2048项快照有余项，不能由缺失项判定未映射；8192项扩大探针
 被 BPF verifier 拒绝，已 cleanup，无可用结果。SRAT 的逻辑 GPA NUMA
 不等于当前 DSM owner，尚不能据此判断跨网传页成本。
+
+### 2026-10-11：可选的 RX 有效前缀完成路径
+
+代码 9b1db26bc6，配对完整容量检查修正 d59ef7403c。
+LOOM_IAVF_RX_PAYLOAD_BOUNDED=1 在启动时选择；默认关闭。
+仅已验证的 DD+EOF、无错误、无 header split、非零且不超过容量的
+packet-only 完成，读取/发布 min(capacity, round_up(LENGTH_PBUF,128))。
+128 是保守处理粒度，不是声明硬件最多只写一个128字节块。
+Intel X710/XXV710/XL710 datasheet 332464 的7.2.2描述接收短帧补齐到60字节；
+此路径至少保留128字节。guest iavf 按 LENGTH_PBUF 同步和消费包。
+参考原始文档 https://cdrdv2.intel.com/v1/dl/getContent/332464 。
+不覆盖驱动消费范围之外的未定义尾部字节；不宣称可用于任意未知驱动。
+
+完整容量的注册、generation、payload/descriptor别名检查未缩小；
+两 payload 的配对页边界与不重叠检查仍按原 rx_buffer_size 判断，
+另要求前缀大小相同，不同长度退化到两个原有 scalar publish。
+零长度/错误/非EOF保留全容量，已有超长/分裂状态检查仍回退full sync。
+保持原来的不可变快照、先全部 payload 后描述符及 DD 的发布顺序；
+不引入持久 DSM 指针，不改 guest、HPET 或设备IRQ配置。
+
+测试：从真实源码提取 helper 和整个 sync_data_completion；
+外部注册/内存后端用 stub，ASan/UBSan 开/关各133072例，
+Ezreal/Garen均PASS。包括所有14位长度、DD/EOF/错误/header状态、
+环回绕、相等/不等前缀、重叠完整容量的禁止配对、跨页退化、
+校验失败/读取失败不得发布、超长/header状态回退、
+payload-before-DD、只改变已发布范围。它不是完整VFIO/DSM硬件证明。
+最初 harness typedef缺失及把env字符串0误作true导致两次测试失败，
+修正 harness 后重跑通过；没有通过修改生产逻辑掩盖测试失败。
+
+9b1db26bc6 二次重启前同boot、同4CPU/HPET/NUMA/VF、
+G两owner本地CPU0/1 worker、每次6秒向第三方Jinx发送，
+不带探针，OFF→ON→OFF各3次：
+吞吐 764.548/762.813/738.185 →949.528/751.216/769.405
+→760.604/758.646/784.999 MiB/s；
+中位762.813→769.405→760.604，仅+0.86%/+1.16%。
+QEMU实际/proc/PID/stat user+system-guest、HZ100，
+每阶段13599/14828/13833 MiB、CPU21.42/21.84/21.47秒，
+即1.575/1.473/1.552 ms/MiB（ON低6.49%/5.10%）。
+开启阶段第一样本949.528明显高且TCP重传集中在其中一个worker，
+总体只3samples，不能证明稳定吞吐或独立CPU优化收益，也不能称重传解决。
+该对照为9b1db26bc6，不能冒充修正d59的无探针对照。
+
+d59ef7403c 两端重新编译、旧两owner正常shutdown/EXIT0；
+新两owner以BOUNDED=1正常启动root，guest仍#26/四CPU/HPET。
+文件式gdb获取cached flag地址，实际/proc/PID/mem读回两端1；
+无gdb attach。无探针对照只在各轮之间guest空闲时对32位flag写0/1，
+函数每次调用捕获到局部bool；其它模式和设备不变。
+
+最终版本硬件证据：只在first payload read每128次抽样、
+第二配对payload不纳入（方法同上一节）。
+G 50810次请求、6503936字节；397成功样本，66×396+60×1，
+全部请求128。E 46524次请求、5955328字节；364样本，
+66×363+60×1，全部128。读取/无效状态/未匹配/抽样失败计数全部0，
+active0、detach/cleanup后探针EXIT0。
+两owner分别用本地两guest CPU发送内容校验PASS；带探针吞吐不作对照。
+将两张卡RX ring512→256后，两owner各接收256MiB内容校验PASS。
+恢复512后另验收发及最终清理结果另述。目标仍未完成，候选默认保持关闭。
+
+最终恢复512后，两VF再次各接收256MiB内容校验PASS，
+并各用本地两CPU发送约6秒，接收方内容校验PASS（功能检查，非新性能对照）。
+两端cached payload_bounded均实读1→0并读回0；本次启动env曾设1，
+保存的baseline启动配置没有该env，重启默认仍关闭。
+四CPU在线、HPET、XPS0、RSS equal2、RX512/TX128保持；
+guest error级dmesg空，两NIC rx/tx_errors和rx_dropped均0，
+G tx_dropped5、E0，未在reset前单独取基数，不能把5定位到某阶段或宣称零丢包。
+Jinx source/sinks STOP全部EXIT0，探针两端EXIT0/cleanup，alias/端口清理。
+不改host/guest内核、不测Lux、不重测已接受的磁盘性能，无实验文件；
+Garen现有worker PID6122保留。候选不改变默认和当前运行策略。
