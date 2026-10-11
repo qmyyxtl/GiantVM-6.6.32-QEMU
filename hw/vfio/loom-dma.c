@@ -2230,6 +2230,35 @@ rollback:
 }
 
 /*
+ * Warm RX pairs share an existing native page mapping. Validate it once.
+ * Cold or non-native layouts retain both calls, including their failure order.
+ */
+int loom_vfio_ram_materialize_pair(VFIOContainerBase *bc, hwaddr first,
+                                   hwaddr second, uint64_t size)
+{
+    hwaddr lower = MIN(first, second), upper;
+    int ret;
+
+    assert(bql_locked());
+    if (bc && bc->loom_dma && bc->loom_dma->page_indexed &&
+        size && size <= 4096 &&
+        first <= UINT64_MAX - size && second <= UINT64_MAX - size &&
+        first / 4096 == second / 4096 &&
+        (first & 4095) + size <= 4096 &&
+        (second & 4095) + size <= 4096 &&
+        MAX(first, second) - lower >= size &&
+        map_at(bc->loom_dma, lower)) {
+        upper = MAX(first, second) + size;
+        return loom_vfio_ram_materialize(bc, lower, upper - lower, true);
+    }
+    ret = loom_vfio_ram_materialize(bc, first, size, true);
+    if (!ret) {
+        ret = loom_vfio_ram_materialize(bc, second, size, true);
+    }
+    return ret;
+}
+
+/*
  * Backend removal first stops DMA access to every selected active page.
  * Preserve authority on failure and poison the mode: a caller cannot assume
  * retained metadata means that the old hardware mappings are still present.

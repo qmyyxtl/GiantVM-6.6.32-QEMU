@@ -1557,13 +1557,8 @@ int loom_iavf_prepare_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value
             continue;
         }
         if (pair) {
-            /* Both dependencies exist before either snapshot is submitted. */
-            ret = loom_vfio_ram_materialize(dev->bcontainer, payload[n],
-                                             length[n], true);
-            if (!ret) {
-                ret = loom_vfio_ram_materialize(dev->bcontainer, payload[n + 1],
-                                                 length[n + 1], true);
-            }
+            ret = loom_vfio_ram_materialize_pair(dev->bcontainer,
+                                 payload[n], payload[n + 1], length[n]);
             if (!ret) {
                 ret = loom_vfio_dma_sync_rx_pair(dev->bcontainer,
                                  payload[n], payload[n + 1], length[n]);

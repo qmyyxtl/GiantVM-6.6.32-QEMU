@@ -51,6 +51,8 @@ int loom_vfio_ram_remove(VFIOContainerBase *, hwaddr, uint64_t);
 int loom_vfio_ram_read_cpu(VFIOContainerBase *, hwaddr, void *, uint64_t);
 int loom_vfio_ram_materialize(VFIOContainerBase *, hwaddr, uint64_t,
                               bool device_writes);
+/* Same-page warm pair authority check; cold/unsupported retains scalar order. */
+int loom_vfio_ram_materialize_pair(VFIOContainerBase *, hwaddr, hwaddr, uint64_t);
 /* Startup only: 0 default, 1 physical prototype, negative invalid setting. */
 int loom_vfio_physical_mode(void);
 int loom_vfio_physical_attach(VFIODevice *, AddressSpace *);
