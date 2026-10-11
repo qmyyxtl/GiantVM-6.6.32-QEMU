@@ -1304,6 +1304,12 @@ bool loom_pci_handle_pio(uint16_t port, MemTxAttrs attrs, void *data,
                 PCIDevice *dev =
                     device_for_descriptor(&directory[owner].devices[index]);
 
+                /* Unnumbered subordinate buses must not alias 00:00.0:
+                 * chipset PAM writes still need the normal peer broadcast. */
+                if (dev && !pci_bus_is_root(pci_get_bus(dev)) &&
+                    !pci_dev_bus_num(dev)) {
+                    continue;
+                }
                 configuration |= dev &&
                     ((pci_dev_bus_num(dev) << 8) | dev->devfn) == bdf;
             }
