@@ -4894,7 +4894,7 @@ Jinx source/sinks STOPLOOM/EXIT0，测试alias及监听清理；
 下一步需要对单卡的数据处理、DMA同步及DSM成本作可区分的测量，
 不再以减少lookup次数直接推断带宽提升。
 
-### 16-byte 差分扫描原型（默认关闭）
+### 16-byte 差分扫描原型（历史实验，后续已撤回）
 
 LOOM_VFIO_VECTOR_BYTE_SCAN=1在SSE2 host启用；默认OFF，非SSE2沿用原scalar。
 只修改skip_matching_bytes的扫描实现：整16B块比较后以mask找到第一个
@@ -4929,3 +4929,35 @@ Garen NIC rx_dropped60与带采样后一组一致，Ezreal NIC error/drop0。
 所有perf FD/probes正常cleanup，Jinx source EXIT0、alias/监听移除；
 Lux/worker-g4不动，无实验文件。下一步新binary实机OFF/ON/OFF对照，
 同时验证两owner收发及热重配置；收益未证明前保持默认OFF。
+
+### 2026-10-11 vector scan 实机对照与撤回
+
+相同prototype binary adb54cc696三次正常启动OFF→ON→OFF，
+各9次256MiB固定内容接收(guest CPU0、RX RSS q1、IRQ q0/1到CPU0/1)，
+全部字节数/内容/ACK PASS；均无采样探针。
+吞吐中位271.502→253.207→267.901 MiB/s，
+owner QEMU host CPU(user+system-guest)10.29→10.79→10.53s，
+4.466→4.683→4.570 ms/MiB。开启相对前后关闭均没有收益。
+跨boot分配/调度/DSM等仍有漂移，不能把全部差异归因扫描指令。
+硬件rx_discards三组0→0、0→0、0→36；不宣称修复丢包。
+
+通过运行ELF objdump+只读/proc/PID/mem，OFF缓存vector值0、
+ON两端缓存值1，实际函数含pcmpeqb/pmovmskb；不是仅env意图。
+ON两卡各自与并发TX内容校验PASS(功能测试，未做同条件OFF TX对照)，
+RX512→256→512热重配置、IRQ恢复PASS，随后双卡各256MiB
+并发接收内容PASS(3.491/4.221s)，guest error级dmesg空。
+热重配置后tx_dropped4/2；该操作清硬件计数，不能用reset前后数字
+声称drop已解决。Jinx两IP共用一个10G口，不能用于证明线性链路容量。
+
+相同RX负载的TX队列包分布(包含TCP ACK及少量背景)也随boot变：
+前OFF q0/q1=6857/23796、ON24572/6620、后OFF14135/16726。
+现有XPS是0，IRQ affinity不决定skb使用哪个TX queue。
+这只是混杂因素证据，不证明RSS key或单一hash机制就是原因；
+后续用XPS明确worker CPU→owner本地TX queue并验证实际分布，
+再做同boot配置对照，guest OS源码不改。
+
+没有端到端收益证据，撤回6b00529008的扫描实现及SSE2 include，
+loom-dma.c逐字节验证恢复到b601391028版本，避免默认OFF也留新分支。
+原型与2303794 cases/mode验证仍可从6b00529008历史查看。
+当前source不再支持LOOM_VFIO_VECTOR_BYTE_SCAN；之前的默认OFF说明
+仅适用于历史原型，不代表当前支持。其他已验证路径不变。

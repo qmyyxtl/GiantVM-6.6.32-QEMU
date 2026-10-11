@@ -6,9 +6,6 @@
  * No hardware DMA mapping points at DSM-managed guest RAM in this mode.
  */
 #include "qemu/osdep.h"
-#if defined(__SSE2__)
-#include <emmintrin.h>
-#endif
 #include "qemu/units.h"
 #include "qemu/atomic.h"
 #include "qemu/cutils.h"
@@ -477,35 +474,10 @@ void loom_vfio_dma_free(VFIOContainerBase *bc)
  * The zero-byte test on XOR detects any unchanged byte; finish a mixed word
  * byte by byte so publication never includes an unchanged destination byte.
  * memcpy keeps unaligned buffers and short tails safe.
- * An opt-in SSE2 scan finds the same first stopping byte in 16-byte blocks.
- * Load only whole in-range blocks; short tails and other hosts stay scalar.
  */
 static uint64_t skip_matching_bytes(const uint8_t *a, const uint8_t *b,
                                     uint64_t pos, uint64_t size, bool equal)
 {
-
-#if defined(__SSE2__)
-    static int vector = -1;
-
-    if (vector < 0) {
-        const char *mode = getenv("LOOM_VFIO_VECTOR_BYTE_SCAN");
-
-        vector = mode && !strcmp(mode, "1");
-    }
-    if (vector) {
-        while (size - pos >= 16) {
-            __m128i x = _mm_loadu_si128((const __m128i *)(a + pos));
-            __m128i y = _mm_loadu_si128((const __m128i *)(b + pos));
-            unsigned mask = _mm_movemask_epi8(_mm_cmpeq_epi8(x, y));
-            unsigned stop = equal ? (~mask & 0xffffU) : mask;
-
-            if (stop) {
-                return pos + __builtin_ctz(stop);
-            }
-            pos += 16;
-        }
-    }
-#endif
     while (size - pos >= sizeof(uint64_t)) {
         uint64_t x, y;
         memcpy(&x, a + pos, sizeof(x));
