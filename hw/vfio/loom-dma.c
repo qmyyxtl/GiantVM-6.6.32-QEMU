@@ -56,6 +56,7 @@ struct LoomVFIODMA {
     bool cache_publication;
     bool pin_publication;
     bool ordered_publication;
+    bool early_publication;
     bool publication_failed;
 };
 
@@ -292,6 +293,8 @@ int loom_vfio_dma_map(VFIOContainerBase *bc, hwaddr iova, uint64_t size,
         bc->loom_dma->pin_publication = pin && !strcmp(pin, "1");
         const char *ordered = getenv("LOOM_VFIO_ORDERED_PUBLICATION");
         bc->loom_dma->ordered_publication = ordered && !strcmp(ordered, "1");
+        const char *early = getenv("LOOM_VFIO_PUBLICATION_EARLY_PIN");
+        bc->loom_dma->early_publication = early && !strcmp(early, "1");
         const char *buffers = getenv("LOOM_VFIO_BUFFER_RECYCLE");
         bc->loom_dma->recycle_buffers =
             !buffers || strcmp(buffers, "0");
@@ -619,16 +622,24 @@ static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b,
                                     snapshot + start, pos - start, true);
         } else {
             /*
-             * The first run pays no cache setup cost. For fragmented physical
-             * RAM publication, translate once from the second run onward.
+             * Normally the first run pays no cache setup cost. Opt-in dense,
+             * single-page publications may acquire the lease before that run;
+             * otherwise translate once from the second changed run onward.
              * This cache lives only for this merge, under BQL and RCU: no RAM
              * topology or DMA registration can outlive its invocation.
              * DSM caches normally use KVM_DSM_MEMCPY. An optional bounded
              * write pin may supply a direct pointer only after acquiring the
              * owner, and must release it before this invocation returns.
              */
-            if (++runs == 2 && bc->loom_physical &&
-                bc->loom_dma->cache_publication && bql_locked()) {
+            runs++;
+            if (!locked && bc->loom_physical &&
+                bc->loom_dma->cache_publication && bql_locked() &&
+                (runs == 2 ||
+                 (runs == 1 && bc->loom_dma->early_publication &&
+                  bc->loom_dma->pin_publication && b->size <= 4096 &&
+                  (b->gpa & 4095) + b->size <= 4096 &&
+                  publication_has_four_runs(snapshot, b->baseline,
+                                             start, b->size)))) {
                 rcu_read_lock();
                 locked = true;
                 cached = address_space_cache_init(&cache,
