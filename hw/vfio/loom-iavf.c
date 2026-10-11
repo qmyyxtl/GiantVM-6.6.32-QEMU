@@ -21,6 +21,108 @@ typedef struct LoomIAVFQueue {
     uint32_t rx_count, tx_count, rx_buffer_size;
 } LoomIAVFQueue;
 
+typedef struct LoomIAVFTXIdle {
+    uint64_t marker, epoch, serial;
+    uint64_t pending[64];
+    bool armed, drained;
+} LoomIAVFTXIdle;
+
+static int tx_idle_mode = -1;
+static uint64_t tx_idle_serial;
+
+static bool tx_idle_enabled(void)
+{
+    if (tx_idle_mode < 0) {
+        const char *mode = getenv("LOOM_IAVF_TX_IDLE_SKIP");
+
+        tx_idle_mode = mode && !strcmp(mode, "1");
+    }
+    return tx_idle_mode;
+}
+
+static void tx_idle_clear(LoomIAVFTXIdle *t)
+{
+    if (t->serial) {
+        memset(t, 0, sizeof(*t));
+    }
+}
+
+/* A submitted terminal data descriptor must request EOP and status writeback. */
+static bool tx_idle_terminal(uint64_t command)
+{
+    return (command & 15) == 0 && (command & 0x30) == 0x30;
+}
+
+static void tx_idle_prepare(LoomIAVFTXIdle *t, uint64_t marker, uint64_t epoch,
+                             uint64_t command)
+{
+    tx_idle_clear(t);
+    if (!epoch || !tx_idle_terminal(command) || !tx_idle_enabled() ||
+        tx_idle_serial == UINT64_MAX) {
+        return;
+    }
+    t->marker = marker;
+    t->epoch = epoch;
+    t->serial = ++tx_idle_serial;
+}
+
+static void tx_idle_commit(LoomIAVFTXIdle *t, uint64_t epoch)
+{
+    if (!tx_idle_enabled() || !t->marker || !t->serial || !epoch ||
+        t->epoch != epoch) {
+        tx_idle_clear(t);
+        return;
+    }
+    t->armed = true;
+}
+
+static bool tx_idle_valid(const LoomIAVFTXIdle *t, const LoomIAVFQueue *q,
+                           uint64_t epoch, bool preparing)
+{
+    return t->armed && t->serial && epoch && t->epoch == epoch &&
+           !preparing && q->tx_count && q->tx_count <= 4096 &&
+           t->marker >= q->tx_iova &&
+           t->marker - q->tx_iova < q->tx_count * 16ULL &&
+           !((t->marker - q->tx_iova) & 15);
+}
+
+/*
+ * Called only after successful publication of the complete validated snapshot.
+ * Track every RS data descriptor; seeing the latest RS complete alone does not
+ * prove earlier writebacks are visible. A new submission changes serial, so a
+ * reentrant callback's snapshot cannot drain a later hardware submission.
+ */
+static void tx_idle_published(LoomIAVFTXIdle *t, const LoomIAVFQueue *q,
+                               uint64_t epoch, bool preparing,
+                               uint64_t serial, const uint8_t *snapshot)
+{
+    bool pending = false;
+
+    if (!serial || t->serial != serial) {
+        return;
+    }
+    if (!tx_idle_valid(t, q, epoch, preparing)) {
+        tx_idle_clear(t);
+        return;
+    }
+    for (unsigned i = 0; i < q->tx_count; i++) {
+        uint64_t word = ldq_le_p(snapshot + i * 16 + 8);
+        uint64_t bit = UINT64_C(1) << (i % 64);
+        unsigned type = word & 15;
+
+        if (type == 0 && (word & 0x20)) {
+            t->pending[i / 64] |= bit;
+        } else if (type == 15) {
+            t->pending[i / 64] &= ~bit;
+        }
+    }
+    for (unsigned i = 0; i < (q->tx_count + 63) / 64; i++) {
+        pending |= t->pending[i] != 0;
+    }
+    t->drained = !pending &&
+        (ldq_le_p(snapshot + t->marker - q->tx_iova + 8) & 15) == 15;
+}
+
 typedef struct LoomIAVFRXSlot {
     uint64_t iova, first_generation, last_generation;
 } LoomIAVFRXSlot;
@@ -54,10 +156,12 @@ struct LoomIAVFQueues {
     LoomIAVFCompletion completion[VF_QUEUE_COUNT];
     uint8_t *completion_payload;
     LoomIAVFPhysicalData physical;
+    LoomIAVFTXIdle tx_idle[VF_QUEUE_COUNT];
 };
 
 static void completion_free(LoomIAVFQueues *s)
 {
+    memset(s->tx_idle, 0, sizeof(s->tx_idle));
     g_clear_pointer(&s->completion_payload, g_free);
     for (unsigned i = 0; i < VF_QUEUE_COUNT; i++) {
         LoomIAVFCompletion *c = &s->completion[i];
@@ -496,6 +600,10 @@ void loom_iavf_observe_write(VFIODevice *dev, hwaddr addr, uint32_t value)
         unsigned id = addr / 4;
         s = dev->loom_iavf_queues;
         if (s && (s->valid_mask & s->enabled_tx & (1U << id))) {
+            if (!(s->physical.tx_prepared_mask & (1U << id)) ||
+                s->physical.prepared_tx[id] != value) {
+                tx_idle_clear(&s->tx_idle[id]);
+            }
             if (value < s->queue[id].tx_count) {
                 s->tx_tail[id] = value;
                 s->tx_tail_known |= 1U << id;
@@ -929,7 +1037,9 @@ static uint64_t rx_payload_size(const uint8_t *snapshot, uint64_t capacity,
 int loom_iavf_sync_data_completion(VFIODevice *dev)
 {
     static int scoped = -1, descriptor_paired = -1, payload_bounded = -1;
-    bool bounded;
+    bool bounded, idle = tx_idle_enabled();
+    uint16_t skip_tx = 0;
+    uint64_t tx_serial[VF_QUEUE_COUNT] = { 0 };
     LoomIAVFQueues *s = dev->loom_iavf_queues;
     unsigned done[VF_QUEUE_COUNT] = { 0 }, devices = 0;
     VFIODevice *member;
@@ -976,13 +1086,23 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
                                               q->tx_count * 16ULL)) {
                 return 0;
             }
-            ret = loom_vfio_dma_read_pool(dev->bcontainer, q->tx_iova,
-                                          c->tx_snapshot, q->tx_count * 16ULL);
-            if (ret) {
-                return ret;
-            }
-            if (!tx_snapshot_types_valid(c->tx_snapshot, q->tx_count)) {
-                return 0;
+            LoomIAVFTXIdle *t = &s->tx_idle[id];
+
+            if (idle && t->drained &&
+                tx_idle_valid(t, q, loom_vfio_dma_epoch(dev->bcontainer),
+                               s->physical.tx_prepared_mask & (1U << id))) {
+                skip_tx |= 1U << id;
+            } else {
+                tx_serial[id] = t->serial;
+                ret = loom_vfio_dma_read_pool(dev->bcontainer, q->tx_iova,
+                                              c->tx_snapshot,
+                                              q->tx_count * 16ULL);
+                if (ret) {
+                    return ret;
+                }
+                if (!tx_snapshot_types_valid(c->tx_snapshot, q->tx_count)) {
+                    return 0;
+                }
             }
         }
         if (!(s->enabled_rx & (1U << id))) {
@@ -1095,11 +1215,17 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
         LoomIAVFQueue *q = &s->queue[id];
         LoomIAVFCompletion *c = &s->completion[id];
 
-        if (s->enabled_tx & (1U << id)) {
+        if ((s->enabled_tx & (1U << id)) && !(skip_tx & (1U << id))) {
             ret = loom_vfio_dma_publish_snapshot(dev->bcontainer, q->tx_iova,
                                           c->tx_snapshot, q->tx_count * 16ULL);
             if (ret) {
                 return ret;
+            }
+            if (idle) {
+                tx_idle_published(&s->tx_idle[id], q,
+                                   loom_vfio_dma_epoch(dev->bcontainer),
+                                   s->physical.tx_prepared_mask & (1U << id),
+                                   tx_serial[id], c->tx_snapshot);
             }
         }
         for (unsigned n = 0; n < done[id]; ) {
@@ -1799,6 +1925,7 @@ int loom_iavf_prepare_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value
     unsigned id, entries, stride, old, span, first;
     uint64_t base;
     uint8_t *desc, sentinel[8];
+    uint64_t terminal = 0;
     uint64_t *payload;
     uint32_t *length;
     int ret;
@@ -1817,6 +1944,9 @@ int loom_iavf_prepare_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value
         return 0;
     }
     s = queues_get(dev);
+    if (s && !rx) {
+        tx_idle_clear(&s->tx_idle[id]);
+    }
     if (!s || s->ambiguous || value >= 4096) {
         return -EINVAL;
     }
@@ -1865,6 +1995,9 @@ int loom_iavf_prepare_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value
     ret = physical_read_ring(dev, base, entries, stride, old, span, desc);
     if (ret) {
         return ret;
+    }
+    if (!rx && span) {
+        terminal = ldq_le_p(desc + (span - 1) * stride + 8);
     }
     for (unsigned n = 0; n < span; n++) {
         const uint8_t *d = desc + n * stride;
@@ -1964,6 +2097,11 @@ int loom_iavf_prepare_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value
     } else {
         s->physical.prepared_tx[id] = value;
         s->physical.tx_prepared_mask |= 1U << id;
+        if (span) {
+            tx_idle_prepare(&s->tx_idle[id],
+                             base + ((value + entries - 1) % entries) * 16ULL,
+                             loom_vfio_dma_epoch(dev->bcontainer), terminal);
+        }
     }
     return 1;
 }
@@ -2039,6 +2177,8 @@ int loom_iavf_commit_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value)
             return -ESTALE;
         }
         s->physical.tx_prepared_mask &= ~(1U << id);
+        tx_idle_commit(&s->tx_idle[id],
+                        loom_vfio_dma_epoch(dev->bcontainer));
         s->tx_tail[id] = value;
         s->tx_tail_known |= 1U << id;
     } else {
