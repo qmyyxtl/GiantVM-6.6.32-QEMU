@@ -4975,3 +4975,62 @@ Guest net/core/dev.c get_xps_queue/netdev_pick_tx核对：
 当前XPS0不能仅靠IRQ affinity固定TX queue。下一轮仅改配置验证
 owner本地CPU→TX queue后实际包/IRQ分布与同boot吞吐，guest源码不改。
 尚未完成“除DSM外其他开销尽量低”的目标。
+
+### 2026-10-11 XPS 配置、队列分布与同boot对照
+
+同一次启动175504/825299，functional f0dbd78424；
+不改guest源码/HPET/CPU规格/host内核，不用probe，无实验文件。
+guest CONFIG_XPS=y，iavf无ndo_select_queue覆盖；
+netdev_pick_tx先socket cached queue，需新queue时XPS→skb_tx_hash。
+新TCP连接实测TX queue分布，不能只由IRQ affinity推定TX queue。
+
+模式0=XPS全部0；模式1=G q0 cpumask1/q1 mask2，E q0 mask4/q1 mask8；
+模式2=每owner两CPU都送q1(G q0=0/q1=3，E q0=0/q1=c)；
+模式3=两CPU都送q0(G q0=3/q1=0，E q0=c/q1=0)。
+xps_rxqs保持0，RPS0，IRQ仍G q0/1→CPU0/1、E→CPU2/3。
+RX单worker固定G CPU0/E CPU2，RSS全部q1；
+每阶段3×256MiB，模式顺序交替，每项都校验内容/长度/ACK。
+G对照6pairs，host CPU窗口为QEMU(user+system-guest)/768MiB，
+窗口包含配置/metadata读取，不是纯函数CPU。
+
+G模式0 vs1：吞吐中位271.959 vs259.439 MiB/s，
+CPU中位4.674 vs4.857 ms/MiB；6/6pairs模式1更慢。
+模式1 ACK约96%进入q0、完成IRQ在接收worker CPU0，而RX IRQ CPU1；
+不能仅由这些结果拆分CPU抢占、合并中断及DSM等因素。
+
+G确定性q0 vsq1(模式3 vs2)：261.753 vs277.216 MiB/s，
+6/6pairs q1更快；CPU中位4.648 vs4.590 ms/MiB。
+队列IRQ总数135843 vs87109，少35.87%，全部IRQ在设定CPU；
+TX queue包记录确认模式3全q0、模式2全q1；两组discard新增0。
+这是固定q0/q1选择的对照，不是与原XPS0的收益证明。
+
+G另6pairs原XPS0 vs模式2：271.390 vs276.333 MiB/s(+1.82%)，
+5/6pairs模式2更快，CPU4.525 vs4.570 ms/MiB(未下降)，
+discard新增0 vs51。第一系列XPS0最初阶段另新增19，
+全boot当前G rx_dropped70，E0；不宣称丢包修复。
+
+G发送2worker CPU0/1、每轮6s，模式0/1/2循环变序各3次；
+中位748.753/765.267/783.408 MiB/s，CPU1.747/1.735/1.679 ms/MiB。
+实际queue分布：XPS0一次两个worker均q0，其他分散；
+模式1始终两queue，模式2全q1。所有内容校验PASS。
+只有3samples且重叠，不能当稳定发送收益或线性聚合证明。
+接收Jinx两测试IP仍共享同一10G物理端口。
+
+E模式0 vs2另3pairs，各阶段3×256MiB、worker CPU2；
+中位156.136 vs162.220 MiB/s，3/3pairs模式2更快；
+owner E CPU通过SSH读/proc/825299/stat，6.523 vs6.536 ms/MiB，
+窗口含SSH/配置，不同于G串口内窗口，不能跨host直接比CPU成本。
+实际mode2全部TX q1，所有内容PASS、discard新增0。
+G/E source线程分别绑Jinx CPU0-3/4-7，绝对跨owner吞吐差
+还含源端/DSM/分配等条件，不直接归因设备路由。
+
+恢复两owner XPS0/RSS equal2，四CPU/HPET，guest error级dmesg空，
+两盘1GiB保留，未再做已接受的磁盘性能测试。
+Jinx两source及两sink正常STOP/EXIT0、alias/端口清理，
+Garen worker6122保留，Lux不动。此轮不启用新默认策略。
+
+guest两NIC numa_node实测均-1，CPU NUMA0=0-1/NUMA1=2-3；
+iavf coherent ring用dma_alloc_coherent，page pool nid=NUMA_NO_NODE。
+这不证明实际DMA页落在哪个节点；下一步检查实际注册GPA/NUMA位置，
+判断E额外耗时哪些属于DSM，哪些仍为可降低的设备处理开销。
+目标尚未完成，不把IRQ数量减少解释成全部非DSM开销已消除。
