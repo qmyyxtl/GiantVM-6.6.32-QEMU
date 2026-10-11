@@ -907,9 +907,29 @@ static bool tx_snapshot_types_valid(const uint8_t *snapshot, unsigned count)
  * Capture every completion descriptor before publishing any payload, then
  * publish those immutable descriptors only after all selected payloads.
  */
+/*
+ * Packet-only RX queues use LENGTH_PBUF after DD. Retain a 128-byte-aligned
+ * prefix (including short-packet padding), bounded by the posted capacity.
+ * Unsupported/error/multi-buffer completions keep the original full range.
+ * Full registration, generation and alias validation remains in the caller.
+ */
+static uint64_t rx_payload_size(const uint8_t *snapshot, uint64_t capacity,
+                                 bool bounded)
+{
+    uint64_t word = ldq_le_p(snapshot + 8);
+    uint64_t length = (word >> 38) & 0x3fff;
+
+    if (!bounded || (word & 3) != 3 || (word & (0xffULL << 19)) ||
+        (word >> 52) || !length || length > capacity) {
+        return capacity;
+    }
+    return MIN(capacity, ROUND_UP(length, 128));
+}
+
 int loom_iavf_sync_data_completion(VFIODevice *dev)
 {
-    static int scoped = -1, descriptor_paired = -1;
+    static int scoped = -1, descriptor_paired = -1, payload_bounded = -1;
+    bool bounded;
     LoomIAVFQueues *s = dev->loom_iavf_queues;
     unsigned done[VF_QUEUE_COUNT] = { 0 }, devices = 0;
     VFIODevice *member;
@@ -925,6 +945,12 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
 
         descriptor_paired = mode && !strcmp(mode, "1");
     }
+    if (payload_bounded < 0) {
+        const char *mode = getenv("LOOM_IAVF_RX_PAYLOAD_BOUNDED");
+
+        payload_bounded = mode && !strcmp(mode, "1");
+    }
+    bounded = payload_bounded;
     if (!scoped || !dev->loom_iavf_irq_control || !dev->bcontainer ||
         !s || !s->valid_mask || !(s->enabled_rx | s->enabled_tx) ||
         s->pending || s->enable_pending || s->ambiguous ||
@@ -1028,14 +1054,18 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
         for (unsigned n = 0; n < done[id]; ) {
             unsigned slot = (c->rx_next + n) % q->rx_count;
             uint64_t address = c->rx_slot[slot].iova;
-            uint64_t second = 0, size = q->rx_buffer_size;
+            uint64_t second = 0;
+            uint64_t size = rx_payload_size(c->rx_snapshot + slot * 32,
+                                             q->rx_buffer_size, bounded);
             bool pair = false;
 
             if (n + 1 < done[id]) {
                 unsigned next = (slot + 1) % q->rx_count;
 
                 second = c->rx_slot[next].iova;
-                pair = (address >> 12) == (second >> 12) &&
+                pair = size == rx_payload_size(c->rx_snapshot + next * 32,
+                                                 q->rx_buffer_size, bounded) &&
+                       (address >> 12) == (second >> 12) &&
                        (address & 4095) + size <= 4096 &&
                        (second & 4095) + size <= 4096 &&
                        MAX(address, second) - MIN(address, second) >= size;
