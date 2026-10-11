@@ -4309,3 +4309,55 @@ sync_buffer、merge_buffer等函数做ASAN+UBSAN，18009 cases PASS：
 逐changed-run失败注入、开关关闭/非RAM/短映射/无BQL/非physical/
 非indexed/跨页/native回退、整批读取失败与原逐buffer第二次读取失败、
 参数错误与sticky failure。当前尚未验证硬件性能收益。
+
+### RX rearm batch 硬件验证（功能版本 d2384d9eba）
+
+同一binary OFF -> ON -> OFF，固定host numactl CPU/memory node0，
+各9 x 256MiB，无性能探针；沿用固定guest端口50042、RSS全q1、IRQ CPU1、
+receiver CPU0，四CPU、4GiB、两guest NUMA、#26、HPET不变。
+EARLY/PIN/ORDERED/RX_PAGE_BATCH=1、RX_PAYLOAD_BATCH=0一致，
+只切换RX_REARM_BATCH。27 flows精确长度、内容与sender ACK全PASS。
+
+| Rearm batch | 接收中位数 MiB/s | owner QEMU host CPU ms/MiB |
+| --- | ---: | ---: |
+| off | 220.215 | 5.039 |
+| on | 243.610 | 5.004 |
+| off2 | 225.059 | 5.304 |
+
+每轮秒数：
+```
+off: 1.16959157, 1.18126917, 1.11802360, 1.12037718, 1.17517417, 1.16250282, 1.13983047, 1.17590422, 1.14153388
+on: 1.01563975, 1.01747408, 1.07195030, 1.05086042, 1.05522892, 1.03498411, 1.01861165, 1.05863193, 1.07826694
+off2: 1.13747960, 1.12556712, 1.21230274, 1.26045865, 1.11559176, 1.14488293, 1.23112985, 1.07976969, 1.13443954
+```
+
+owner host CPU秒分别11.61/11.53/12.22，窗口10.862/10.015/10.884秒，
+仍是进程组(user+system-guest)/CLK_TCK，不是纯VFIO或纯非DSM成本。
+ON吞吐比两个OFF高约10.6%/8.2%，CPU低约0.7%/5.6%，
+尚未证明长时间稳定收益，也未达到native普通VM接收吞吐。
+
+独立BCC ON/OFF各3 x 256MiB计数轮都PASS：
+OFF read2048bucket558976次/858587136bytes，read4096bucket4676次/19152896bytes；
+ON read2048bucket69848次/107286528bytes，read4096bucket245203次/879183872bytes。
+两个bucket合计读取调用563652 ->315051，减少44.105%；
+字节合计877740032 ->986470400，增加12.387%，包括page gap及少量背景读取。
+这不是跳过回读或减少同等比例数据搬运，完整注册、CPU owner、基线仍保留。
+计数窗口OFF9.655/ON8.865秒，背景不同，bucket不是精确独占RX归属。
+全部观测API errors/dropped/pending/ordered_pending为0，探针已cleanup；
+elapsed_ns包含等待与探针成本，不作CPU或吞吐依据。
+
+另一独立新API观察轮记录244517次size1536的sync_rx_pair，
+以及244517次3584-byte CPU读取；结束errors/dropped/pending/contexts为0。
+该上下文还出现34931次1536-byte及5次4096-byte读取，不将上下文集合
+解释为独占/完整rearm来源；全量kernel bucket与代码路径一起判断变化。
+probe throughput不计入性能对照。
+
+ON时两卡同时收各256MiB，Garen3.018s/Ezreal4.458s，内容校验PASS，
+不是聚合带宽或线性扩展验证。三个性能阶段hardware rx_discards末值0/7/0，
+未消除TCP重传/丢包。结束留在OFF回测：Garen actualQEMU27523、
+Ezreal actualQEMU793245，REARM_BATCH=0、PAYLOAD_BATCH=0，代码默认均关闭。
+最终两卡guest rx_errors/rx_dropped/tx_errors/tx_dropped为0，dmesg error为空，
+四CPU、HPET、两块原1GiB数据盘仍在，RSS equal2恢复。
+source STOPLOOM / EXIT0、aliases删除、所有本轮探针退出，未产生实验文件。
+未动Lux、guest源码和磁盘；下一步需检查逐changed-run处理与完成发布成本，
+并验证两个同页优化组合，而非直接宣称只剩DSM额外开销。
