@@ -4893,3 +4893,29 @@ Jinx source/sinks STOPLOOM/EXIT0，测试alias及监听清理；
 未动Lux或Garen worker-g4，未创建实验文件。
 下一步需要对单卡的数据处理、DMA同步及DSM成本作可区分的测量，
 不再以减少lookup次数直接推断带宽提升。
+
+### 16-byte 差分扫描原型（默认关闭）
+
+LOOM_VFIO_VECTOR_BYTE_SCAN=1在SSE2 host启用；默认OFF，非SSE2沿用原scalar。
+只修改skip_matching_bytes的扫描实现：整16B块比较后以mask找到第一个
+不符合equal/unequal要求的字节，短尾原8B/byte逻辑；不扩大读区间、不改变
+发布run边界、基线合并、DMA barrier或DSM权限。guest/HPET不改。
+
+本次单卡RX owner CPU_CLOCK199Hz全线程采样3312份：
+用户态966，其中skip_matching_bytes74、hash lookup70、
+BAR owner scan37、TX descriptor type32；DSM相关kernel405。
+KVM/VMX出口样本1578，软件事件存在guest退出/中断采样偏差，
+不把这些数量解释成纯host CPU占比或DSM等待时间。
+第一次全row输出被工具截断，其分组作废；上述为服务器端完整计数汇总。
+27+9次256MiB内容校验PASS，后一组硬件rx_discards新增60；
+这些为带采样运行，非性能对照。
+
+memfd提取实际修改helper，与保留的原helper及逐字节oracle差分：
+每mode OFF/ON/invalid各2303794 cases，ASAN+UBSAN PASS；
+强制#undef SSE2的scalar fallback同2303794 cases PASS。
+覆盖所有65536个16B equality masks、16种unaligned offset、
+100000组0..4096B随机size/start/byte值、PROT_NONE页尾guard及0..80B短尾。
+Ezreal build PASS。CPU时间微基准4轮交替、200000次相同run扫描：
+实际ON full-changed1536B耗时约减少36%，mixed1536B约15%，descriptor32B约12%；
+全相同1536B约慢7%。均只为纯扫描微基准，不是整卡/DSM改善证明。
+实机开启及端到端对照待验证；保持默认OFF。
