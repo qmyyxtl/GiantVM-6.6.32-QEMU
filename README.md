@@ -4961,3 +4961,17 @@ loom-dma.c逐字节验证恢复到b601391028版本，避免默认OFF也留新分
 原型与2303794 cases/mode验证仍可从6b00529008历史查看。
 当前source不再支持LOOM_VFIO_VECTOR_BYTE_SCAN；之前的默认OFF说明
 仅适用于历史原型，不代表当前支持。其他已验证路径不变。
+
+撤回后两端重新构建，按不含VECTOR env的baseline正常启动：
+Garen175504/Ezreal825299，source f0dbd78424，两端loom-dma.c均
+逐字节验证等于b601391028版本；CPU0-3/HPET、RSS equal2，
+两owner各256MiB并发RX内容PASS(3.603/4.703s)，guest errors空、
+当前boot两卡error/drop0、两raw数据盘各1GiB。
+前后各对照VM均正常关机、两QEMU退出0；无host重启。
+Jinx source及双sink STOPLOOM/EXIT0，49161/49162及两个alias已移除，
+无probe、无实验文件，Lux未动，Garen worker6122保留。
+Guest net/core/dev.c get_xps_queue/netdev_pick_tx核对：
+先用socket缓存queue，需选新queue时先XPS RXQ/CPU映射，再skb_tx_hash。
+当前XPS0不能仅靠IRQ affinity固定TX queue。下一轮仅改配置验证
+owner本地CPU→TX queue后实际包/IRQ分布与同boot吞吐，guest源码不改。
+尚未完成“除DSM外其他开销尽量低”的目标。
