@@ -86,28 +86,46 @@ static void completion_init(LoomIAVFQueues *s)
 }
 
 static bool rx_slot_set(VFIODevice *dev, const LoomIAVFQueue *q,
-                         LoomIAVFRXSlot *slot, uint64_t iova)
+                        LoomIAVFRXSlot *slot, uint64_t iova)
 {
+    uint64_t last;
+
     *slot = (LoomIAVFRXSlot) { .iova = iova };
     if (!iova || !q->rx_buffer_size || q->rx_buffer_size > 4096 ||
         iova > UINT64_MAX - q->rx_buffer_size) {
         return false;
     }
+    last = iova + q->rx_buffer_size - 1;
     slot->first_generation = loom_vfio_dma_page_generation(dev->bcontainer,
                                                           iova);
-    slot->last_generation = loom_vfio_dma_page_generation(dev->bcontainer,
-                                         iova + q->rx_buffer_size - 1);
+    /* Page-indexed registrations have one generation for the whole 4KiB. */
+    slot->last_generation = iova / 4096 == last / 4096 ?
+        slot->first_generation :
+        loom_vfio_dma_page_generation(dev->bcontainer, last);
     return slot->first_generation && slot->last_generation;
 }
 
 static bool rx_slot_valid(VFIODevice *dev, const LoomIAVFQueue *q,
-                           const LoomIAVFRXSlot *slot)
+                          const LoomIAVFRXSlot *slot)
 {
-    return slot->iova && slot->first_generation &&
-        slot->first_generation == loom_vfio_dma_page_generation(dev->bcontainer,
-                                                                 slot->iova) &&
-        slot->last_generation == loom_vfio_dma_page_generation(dev->bcontainer,
-                                  slot->iova + q->rx_buffer_size - 1);
+    uint64_t first_generation, last, last_generation;
+
+    if (!slot->iova || !slot->first_generation || !q->rx_buffer_size ||
+        q->rx_buffer_size > 4096 ||
+        slot->iova > UINT64_MAX - q->rx_buffer_size) {
+        return false;
+    }
+    first_generation = loom_vfio_dma_page_generation(dev->bcontainer,
+                                                     slot->iova);
+    if (slot->first_generation != first_generation) {
+        return false;
+    }
+    last = slot->iova + q->rx_buffer_size - 1;
+    /* Still validate both saved endpoints; retain no lookup across calls. */
+    last_generation = slot->iova / 4096 == last / 4096 ?
+        first_generation :
+        loom_vfio_dma_page_generation(dev->bcontainer, last);
+    return slot->last_generation == last_generation;
 }
 
 /* Capture addresses before ENABLE_QUEUES can let hardware erase them. */
