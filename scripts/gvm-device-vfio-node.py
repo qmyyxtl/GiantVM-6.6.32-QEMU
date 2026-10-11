@@ -87,15 +87,20 @@ try:
         raise RuntimeError("guest kernel does not exist")
     topology = []
     endpoint_bus = ""
+    endpoint_addr = f"0{7 + args.node}.0"
     if args.device_numa_roots:
         for node in range(2):
             topology += ["-device",
                          f"pxb-pcie,id=device-root-{node},bus=pcie.0,"
                          f"addr={0x0b + node:02x}.0,bus_nr={32 + node * 32},"
-                         f"numa_node={node}"]
-        endpoint_bus = f"bus=device-root-{args.node},"
+                         f"numa_node={node}",
+                         "-device", f"pcie-root-port,id=device-port-{node},"
+                         f"bus=device-root-{node},addr=00.0,chassis={node + 1},"
+                         f"slot={node + 1}"]
+        endpoint_bus = f"bus=device-port-{args.node},"
+        endpoint_addr = "00.0"
     endpoint = (f"vfio-pci,host={args.host},id=vfio-vf-owner-{args.node},"
-                f"{endpoint_bus}addr=0{7 + args.node}.0,rombar=0,x-no-mmap=on,"
+                f"{endpoint_bus}addr={endpoint_addr},rombar=0,x-no-mmap=on,"
                 "x-no-kvm-msi=on,x-no-kvm-msix=on,"
                 f"loom-aggregate=on,loom-numa-node={args.node}")
     bridge = (f"loom-dma-bridge,id=dma-owner-{args.node},"
