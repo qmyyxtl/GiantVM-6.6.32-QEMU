@@ -6380,3 +6380,63 @@ guest error-level dmesg为空。
 下一步需要实际事件计数/堆栈确认新分支的命中占比与消耗，不能仅凭
 QMP开关或源码调用关系宣称热路径占比。然后按非DSM CPU热点选择修改，
 而不是扩大一项尚无稳定收益的路由优化。整体目标仍未完成。
+
+#### 单卡900 MiB/s记录核对、当前单/双卡匹配基线与down计数定位（2026-10-11）
+
+用户询问单卡，先前引用758.310/615.419是另一组RSS/XPS及receiver
+配置的旧中位数，不是此前固定q1单卡的最佳匹配记录。
+README已有G→Jinx单卡固定q1、两worker、四CPU在线：
+949.053/955.727、904.194/899.065、963.469/968.157 MiB/s，
+各是不同实验的OFF/ON中位数，不跨启动相减作为收益。
+因此单卡确曾达到约900–960 MiB/s，不能误报为单卡只有758。
+
+当前633640bbb6 binary，PID G52069/E15976、#26、HPET、
+4CPU/4GiB/两NUMA根桥；三路由属性OFF、byte SIMD ON保持。
+补做无profile的六组单G/单E/dual，组间正反顺序，
+G仅CPU0/1两个worker，E仅CPU2/3两个worker，dual四worker。
+其余guestCPU一直在线，不执行offline。各worker CPU本地预分配
+32个独立1MiB buffer，每MiB变化内容，每轮6秒。
+两NIC都发第三方Jinx：G10.3/E11.3，receiver CPU8-11/12-15。
+先恢复RPS0、XPS G3/Ec及按名字配置IRQ G42/43→0/1、
+E38/39→2/3，没有再down/up，combined2/RX512/TX128/RSS固定q1。
+
+| group | G single MiB/s | E single MiB/s | dual MiB/s |
+|---|---:|---:|---:|
+| 0 | 943.999 | 730.103 | 571.293 |
+| 1 | 943.303 | 684.833 | 573.417 |
+| 2 | 923.154 | 725.261 | 550.735 |
+| 3 | 944.898 | 708.429 | 517.732 |
+| 4 | 923.085 | 700.997 | 548.043 |
+| 5 | 925.050 | 682.807 | 575.704 |
+
+中位数 G934.177、E704.713、
+dual561.014 MiB/s。
+18轮48条连接内容/字节数全部验证PASS，全部error/drop增量0；
+两端单卡之和归一化约34.23%。
+Jinx同一物理10Gbps口，归一化百分比不是可达上限效率，
+不能用它证明可线性达到两张10Gbps满带宽。
+不过当前dual低于G单卡，不能仅把下降归因于单个接收口的总线速上限。
+这次同条件基线说明当前G单卡仍在900级别，双卡并行下降仍未解决。
+不可把当前934与旧963跨启动作新代码收益/损耗定量结论。
+
+另在route OFF、无主动benchmark流量时逐操作采计数：
+初始两卡tx_dropped各2；G ip link down后立即+2，
+E down后+1，随后equal1命令窗口再+1（可能异步计数）；
+combined2、rings、RSS weight0,1、up及settle窗口均无增量，
+最后两卡各4，rx/tx_errors和rx_dropped始终0。
+ethtool -S 两卡硬件tx_discards/rx_discards均0；后续18轮传输完
+仍软件tx_dropped各4、硬件discads0，guest error-level dmesg为空。
+
+未修改的guest源码：iavf_virtchnl.c GET_STATS将netdev->stats.tx_dropped
+设为PF stats.tx_discards；iavf_ethtool.c直接输出current_stats.tx_discards。
+net/core/dev.c dev_get_stats另外累加perCPU core_stats.tx_dropped。
+故软件计数与硬件计数差、关闭阶段增长、稳定传输不增长的证据
+指向guest网络核心关闭期间的drop，而非本次VF硬件丢弃。
+__dev_queue_xmit在ENETDOWN路径确有core drop计数，但没trace具体skb，
+不宣称已证明发包进程/包类型或唯一调用点，不压掉计数/改guest源码。
+源码工作树已有他人fair.c及旧bzImage变更，未碰它们；运行guest仍#26。
+
+两个receiver正常STOP exit0、Jinx临时地址/49161监听清除，
+新巨虚及worker-g4保留。stdin/memfd，无实验文件/新盘/磁盘测试/Lux。
+既有host dirty-page warning未修复。下一步以这个匹配单/双卡基线定位
+并发增加的DSM与非DSM成本；当前仍不能宣称设备聚合性能目标完成。
