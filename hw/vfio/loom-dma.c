@@ -840,9 +840,6 @@ int loom_vfio_dma_sync_to_device_range(VFIOContainerBase *bc, hwaddr iova,
     }
     ctx = bc->loom_dma;
     end = iova + size;
-    if (!loom_vfio_dma_range_covered(bc, iova, size)) {
-        return -ENOENT;
-    }
     /*
      * Keep the general path's newest-registration-first publication order,
      * including failure behavior and distinct IOVAs aliasing one guest page.
@@ -855,7 +852,13 @@ int loom_vfio_dma_sync_to_device_range(VFIOContainerBase *bc, hwaddr iova,
 
         for (hwaddr pos = iova; pos < end; ) {
             LoomDMABuffer *b = buffer_at(ctx, pos);
-            unsigned n = count++;
+            unsigned n;
+
+            /* Validate every page before publishing, without a second lookup. */
+            if (!b) {
+                return -ENOENT;
+            }
+            n = count++;
 
             while (n && selected[n - 1]->registration_sequence <
                         b->registration_sequence) {
@@ -877,6 +880,9 @@ int loom_vfio_dma_sync_to_device_range(VFIOContainerBase *bc, hwaddr iova,
             }
         }
         return 0;
+    }
+    if (!loom_vfio_dma_range_covered(bc, iova, size)) {
+        return -ENOENT;
     }
     for (GList *p = ctx->buffers; p; p = p->next) {
         LoomDMABuffer *b = p->data;
