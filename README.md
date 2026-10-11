@@ -4275,7 +4275,7 @@ ON/OFF观察窗口6.228/13.911秒，空闲边缘不同，不能比较ns总和或
 ON时两张卡并发接收各256MiB内容校验通过，Garen2.508s/Ezreal4.030s，
 该功能检查不是聚合带宽验证。三个性能阶段硬件rx_discards末值0/24/0，
 不能宣称消除丢包。当前运行留在OFF回测：
-Garen actual QEMU15059、Ezreal actual QEMU789957，
+Garen actual QEMU15059、Ezreal actual QEMU789956，
 RX_PAYLOAD_BATCH=0，其余开关同上；保留默认关闭，后续可复测启用。
 最终四CPU在线、HPET、两卡guest错误/丢弃统计为0、dmesg error为空，
 RSS equal2恢复，中断配置正常。source收到STOPLOOM并EXIT0，aliases删除。
