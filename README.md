@@ -6237,3 +6237,7 @@ offset0..15、count0..129、每位置全部256种 byte 与独立标量 reference
 本节记录时新 helper 尚未替换运行进程；仍需两端构建及真实收发回归。
 整体目标未完成；下一步确认实际 binary 的功能/CPU 成本，再审查其它
 设备热路径，DSM 占比独立列出。Garen 已知 dirty-page warning 未修复。
+
+补充：881ac7afd6 已 push origin，Garen FF 同步，两端 ninja -j8
+构建均 exit0。运行 PID22361/5038 仍为旧功能 binary，未把编译
+通过计作新 binary 收发验证。下一步正常停止/启动巨虚并做双向回归。
