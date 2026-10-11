@@ -6368,7 +6368,11 @@ CPU ms/MiB中位数 OFF4.72728/ON4.78587（+1.24%，更高）。
 额外在ON状态执行两NIC down/队列配置/up，全部成功；
 并行RX各32MiB完整校验PASS，elapsed G0.354/E0.396s，
 源收到两次OK。这验证常规队列重建，不替代真实PCI reset/BAR移动并发验证。
-最后两NIC UP、NUMA0/1、四项error/drop累计0，guest error-level dmesg为空。
+最终复查两NIC UP、NUMA0/1，rx_errors/tx_errors/rx_dropped均0，
+但tx_dropped各2；此前十二轮TX期间所有计数增量0。
+增长发生在其后的ON下队列重建/RX阶段，未细分阶段，原因未定位，
+不能归因于新路由或直接忽略。全零assert失败，工具exit0不是该assert通过；
+guest error-level dmesg为空。
 已知Garen dirty-page warning没有修复，本轮host日志尾部无新增WARNING/Oops。
 所有receiver/source STOP exit0，Jinx临时10.3/11.3移除、49161/49162监听消失，
 保留新巨虚和worker-g4。stdin/memfd，无实验文件/新盘/磁盘测试/Lux。
