@@ -5,6 +5,7 @@
 #include "qemu/osdep.h"
 #include "qemu/cutils.h"
 #include "qemu/atomic.h"
+#include "qemu/rcu.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
@@ -104,6 +105,24 @@ static bool local_bar_lock_batch;
 static bool bar_negative_filter;
 static bool local_bar_route;
 
+/* A miss-only index never supplies a route, generation or device pointer. */
+typedef struct LoomBARRange {
+    hwaddr first, last;
+    bool io;
+} LoomBARRange;
+
+typedef struct LoomBARIndex {
+    struct rcu_head rcu;
+    uint64_t revision;
+    unsigned count, mem_count;
+    LoomBARRange ranges[LOOM_MAX_NODES * LOOM_MAX_DEVICES * PCI_NUM_REGIONS];
+} LoomBARIndex;
+
+static LoomBARIndex *bar_index;
+static uint64_t bar_index_revision;
+static bool bar_miss_index;
+static unsigned bar_index_control_depth;
+
 G_STATIC_ASSERT(sizeof(LoomPCIDescriptor) == 4352);
 /* Only this prefix changes BAR mappings. Extended config reads use owner RPC. */
 #define LOOM_DESCRIPTOR_PREFIX \
@@ -193,6 +212,178 @@ static void fatal_error(const char *message)
     exit(EXIT_FAILURE);
 }
 
+/*
+ * Local writers hold BQL; independent remote publishers hold directory_lock.
+ * Use a shared atomic revision so neither writer can lose an invalidation.
+ */
+static void bar_index_invalidate(void)
+{
+    uint64_t old = qatomic_read(&bar_index_revision);
+
+    for (;;) {
+        uint64_t seen;
+
+        if (old == UINT64_MAX) {
+            fatal_error("BAR index revision exhausted; restart the aggregate");
+        }
+        seen = qatomic_cmpxchg(&bar_index_revision, old, old + 1);
+        if (seen == old) {
+            return;
+        }
+        old = seen;
+    }
+}
+
+static void bar_index_free(LoomBARIndex *index)
+{
+    g_free(index);
+}
+
+static int bar_range_compare(const void *a, const void *b)
+{
+    const LoomBARRange *x = a, *y = b;
+
+    if (x->io != y->io) {
+        return x->io ? 1 : -1;
+    }
+    return (x->first > y->first) - (x->first < y->first);
+}
+
+/* Called only while refresh_remote_mappings() holds BQL. */
+static void bar_index_refresh(void)
+{
+    LoomBARIndex *next, *old;
+    unsigned count = 0;
+
+    assert(bql_locked());
+    if (!qatomic_read(&bar_miss_index) ||
+        !qatomic_load_acquire(&directory_control_active) ||
+        qatomic_read(&bar_index_control_depth)) {
+        return;
+    }
+    old = qatomic_read(&bar_index);
+    if (old && old->revision ==
+               qatomic_load_acquire(&bar_index_revision)) {
+        return;
+    }
+
+    qemu_mutex_lock(&directory_lock);
+    if (qatomic_read(&directory_epoch) != applied_directory_epoch) {
+        qemu_mutex_unlock(&directory_lock);
+        return;
+    }
+    next = g_new0(LoomBARIndex, 1);
+    next->revision = qatomic_load_acquire(&bar_index_revision);
+    for (unsigned owner = 0; owner < node_count; owner++) {
+        for (unsigned index = 0; index < directory[owner].count; index++) {
+            const LoomPCIDescriptor *d;
+
+            if (owner == local_node) {
+                d = &directory[owner].devices[index];
+                if (!owned[index]) {
+                    goto unavailable;
+                }
+                for (unsigned bar = 0; bar < PCI_NUM_REGIONS; bar++) {
+                    const PCIIORegion *r = &owned[index]->io_regions[bar];
+
+                    if (d->bars[bar].address != r->addr ||
+                        d->bars[bar].size != r->size ||
+                        d->bars[bar].type != r->type) {
+                        goto unavailable;
+                    }
+                }
+            } else {
+                if (!incoming_valid[owner][index]) {
+                    goto unavailable;
+                }
+                d = &incoming_directory[owner].devices[index];
+            }
+            if (d->sequence & 1) {
+                goto unavailable;
+            }
+            for (unsigned bar = 0; bar < PCI_NUM_REGIONS; bar++) {
+                const LoomBAR *b = &d->bars[bar];
+
+                if (!b->size || b->address == PCI_BAR_UNMAPPED) {
+                    continue;
+                }
+                if (b->size - 1 > UINT64_MAX - b->address) {
+                    goto unavailable;
+                }
+                assert(count < ARRAY_SIZE(next->ranges));
+                next->ranges[count++] = (LoomBARRange) {
+                    .first = b->address,
+                    .last = b->address + b->size - 1,
+                    .io = !!(b->type & PCI_BASE_ADDRESS_SPACE_IO),
+                };
+            }
+        }
+    }
+    qsort(next->ranges, count, sizeof(next->ranges[0]), bar_range_compare);
+    for (unsigned i = 0; i < count; i++) {
+        LoomBARRange r = next->ranges[i];
+        LoomBARRange *last = next->count ?
+                             &next->ranges[next->count - 1] : NULL;
+
+        if (last && last->io == r.io &&
+            (r.first <= last->last ||
+             (last->last != UINT64_MAX && r.first == last->last + 1))) {
+            last->last = MAX(last->last, r.last);
+        } else {
+            next->ranges[next->count++] = r;
+            next->mem_count += !r.io;
+        }
+    }
+    qatomic_rcu_set(&bar_index, next);
+    qemu_mutex_unlock(&directory_lock);
+    if (old) {
+        call_rcu(old, bar_index_free, rcu);
+    }
+    return;
+
+unavailable:
+    qemu_mutex_unlock(&directory_lock);
+    g_free(next);
+}
+
+/*
+ * A stable miss linearizes at the final revision read. A later control update
+ * may start after that point, just as it may after the legacy lookup drops BQL.
+ * An in-flight or newer update, unknown/reset prefix, or unapplied mapping
+ * never creates a new usable index. No RPC or BQL is taken on a stable miss.
+ */
+static bool bar_index_may_match(hwaddr addr, bool io)
+{
+    RCU_READ_LOCK_GUARD();
+    uint64_t revision = qatomic_load_acquire(&bar_index_revision);
+    const LoomBARIndex *index = qatomic_rcu_read(&bar_index);
+    unsigned low, high;
+    bool match = false;
+
+    if (!index || index->revision != revision ||
+        qatomic_read(&bar_index_control_depth)) {
+        return true;
+    }
+    low = io ? index->mem_count : 0;
+    high = io ? index->count : index->mem_count;
+    while (low < high) {
+        unsigned mid = low + (high - low) / 2;
+        const LoomBARRange *r = &index->ranges[mid];
+
+        if (addr < r->first) {
+            high = mid;
+        } else if (addr > r->last) {
+            low = mid + 1;
+        } else {
+            match = true;
+            break;
+        }
+    }
+    smp_rmb();
+    return match || qatomic_read(&bar_index_control_depth) ||
+           revision != qatomic_load_acquire(&bar_index_revision);
+}
+
 static int owned_index(PCIDevice *dev)
 {
     for (unsigned i = 0; directory && i < owned_count; i++) {
@@ -203,6 +394,31 @@ static int owned_index(PCIDevice *dev)
     return -1;
 }
 
+/* Config writes can remap BARs before loom_pci_publish() is called. */
+void loom_pci_config_update_begin(PCIDevice *dev)
+{
+    if (directory &&
+        (owned_index(dev) >= 0 ||
+         object_dynamic_cast(OBJECT(dev), TYPE_LOOM_REMOTE_PCI))) {
+        assert(bql_locked());
+        if (qatomic_read(&bar_index_control_depth) == UINT_MAX) {
+            fatal_error("BAR index control nesting exhausted");
+        }
+        qatomic_inc(&bar_index_control_depth);
+        bar_index_invalidate();
+    }
+}
+
+void loom_pci_config_update_end(PCIDevice *dev)
+{
+    if (directory &&
+        (owned_index(dev) >= 0 ||
+         object_dynamic_cast(OBJECT(dev), TYPE_LOOM_REMOTE_PCI))) {
+        assert(bql_locked() && qatomic_read(&bar_index_control_depth));
+        qatomic_dec(&bar_index_control_depth);
+    }
+}
+
 void loom_pci_reset_begin(PCIDevice *dev)
 {
     int i = owned_index(dev);
@@ -210,6 +426,7 @@ void loom_pci_reset_begin(PCIDevice *dev)
     if (i < 0 || owned_reset_depth[i]++) {
         return;
     }
+    bar_index_invalidate();
     if (owned_generation[i] == UINT32_MAX) {
         fatal_error("device generation exhausted; restart the aggregate");
     }
@@ -407,6 +624,7 @@ int loom_pci_directory_update_dispatch(unsigned peer, unsigned device_id,
     qemu_mutex_lock(&directory_lock);
     cached = &incoming_directory[peer].devices[index];
     if (!incoming_valid[peer][index] || update.sequence >= cached->sequence) {
+        bar_index_invalidate();
         memcpy(cached, &update, size);
         incoming_valid[peer][index] = true;
         qatomic_inc(&directory_epoch);
@@ -521,6 +739,7 @@ void loom_pci_publish(PCIDevice *dev)
     if (owned_reset_depth[i]) {
         return;
     }
+    bar_index_invalidate();
     d = &directory[local_node].devices[i];
     sequence = qatomic_read(&d->sequence) | 1;
     qatomic_set(&d->sequence, sequence);
@@ -601,6 +820,16 @@ static void set_local_bar_route(Object *obj, bool enabled, Error **errp)
     qatomic_set(&local_bar_route, enabled);
 }
 
+static bool get_bar_miss_index(Object *obj, Error **errp)
+{
+    return qatomic_read(&bar_miss_index);
+}
+
+static void set_bar_miss_index(Object *obj, bool enabled, Error **errp)
+{
+    qatomic_set(&bar_miss_index, enabled);
+}
+
 void loom_pci_prepare(void)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
@@ -625,6 +854,8 @@ void loom_pci_prepare(void)
                              set_local_bar_lock_batch);
     object_property_add_bool(OBJECT(ms), "loom-local-bar-route",
                              get_local_bar_route, set_local_bar_route);
+    object_property_add_bool(OBJECT(ms), "loom-bar-miss-index",
+                             get_bar_miss_index, set_bar_miss_index);
     local_node = ms->local_cpu_start_index / ms->local_cpus;
     node_count = ms->qemu_nums;
     if (local_node >= node_count) {
@@ -1101,6 +1332,7 @@ static void refresh_remote_mappings(void)
     epoch = qatomic_read(&directory_epoch);
     if (qatomic_load_acquire(&directory_control_active) &&
         epoch == applied_directory_epoch) {
+        bar_index_refresh();
         if (!locked) {
             bql_unlock();
         }
@@ -1122,6 +1354,7 @@ static void refresh_remote_mappings(void)
         }
     }
     applied_directory_epoch = epoch;
+    bar_index_refresh();
     if (!locked) {
         bql_unlock();
     }
@@ -1273,6 +1506,9 @@ static bool bar_access(hwaddr addr, bool io, uint8_t *data,
     }
     if (!(size == 1 || size == 2 || size == 4 || size == 8)) {
         fatal_error("unsupported BAR access width");
+    }
+    if (qatomic_read(&bar_miss_index) && !bar_index_may_match(addr, io)) {
+        return false;
     }
     if (qatomic_read(&local_bar_route)) {
         bool locked = bql_locked();

@@ -48,6 +48,8 @@ bool loom_pci_enabled(void);
 void loom_pci_prepare(void);
 void loom_pci_bootstrap(void);
 void loom_pci_publish(PCIDevice *dev);
+void loom_pci_config_update_begin(PCIDevice *dev);
+void loom_pci_config_update_end(PCIDevice *dev);
 void loom_pci_config_address(uint32_t value);
 bool loom_pci_handle_pio(uint16_t port, MemTxAttrs attrs, void *data,
                          int direction, int size, uint32_t count);

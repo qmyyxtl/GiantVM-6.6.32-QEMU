@@ -94,6 +94,7 @@ void pci_host_config_write_common(PCIDevice *pci_dev, uint32_t addr,
     trace_pci_cfg_write(pci_dev->name, pci_dev_bus_num(pci_dev),
                         PCI_SLOT(pci_dev->devfn),
                         PCI_FUNC(pci_dev->devfn), addr, val);
+    loom_pci_config_update_begin(pci_dev);
     bool reset = loom_pci_config_will_reset(pci_dev, addr, val, len);
     if (reset) {
         loom_pci_reset_begin(pci_dev);
@@ -104,6 +105,7 @@ void pci_host_config_write_common(PCIDevice *pci_dev, uint32_t addr,
     } else {
         loom_pci_publish(pci_dev);
     }
+    loom_pci_config_update_end(pci_dev);
 }
 
 uint32_t pci_host_config_read_common(PCIDevice *pci_dev, uint32_t addr,

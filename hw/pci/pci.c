@@ -1524,6 +1524,7 @@ void pci_update_mappings(PCIDevice *d)
     int i;
     pcibus_t new_addr;
 
+    loom_pci_config_update_begin(d);
     for(i = 0; i < PCI_NUM_REGIONS; i++) {
         r = &d->io_regions[i];
 
@@ -1560,6 +1561,7 @@ void pci_update_mappings(PCIDevice *d)
     }
 
     pci_update_vga(d);
+    loom_pci_config_update_end(d);
 }
 
 static inline int pci_irq_disabled(PCIDevice *d)

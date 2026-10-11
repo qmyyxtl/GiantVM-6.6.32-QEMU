@@ -6958,3 +6958,38 @@ BCC探针及Jinx receiver退出0、临时地址/49161清除，
 guest错误级dmesg为空、CPU0-3/HPET保持，
 巨虚和worker-g4 PID6969运行；host既有warning未修复。
 没有新实验文件、新盘、磁盘/Lux测试；整体目标仍未完成。
+
+### 2026-10-11：BAR 稳定未命中索引候选（默认关闭，待运行设备验证）
+
+新增机器属性loom-bar-miss-index，默认false，使用QMP qom-set/qom-get设置。
+只对稳定且确定不属于任何聚合PCI BAR的PIO/MMIO返回未命中；
+命中、不确定、索引失效时仍走原有BAR路由、generation与设备owner验证。
+IOMMU专用地址和PCI配置PIO处理仍先于此过滤。索引不提供设备指针或路由。
+
+控制面改变前递增独立atomic revision：
+本地及proxy配置写、pci_update_mappings、owner reset begin；
+本地publish和独立远端前缀接收也失效。
+配置/映射begin/end维护嵌套depth，控制操作中不能重建或使用索引；
+直接映射变化而尚未publish时，实际owner BAR与目录不一致也禁止重建。
+这同时覆盖本地更新与远端publication，未复用仅覆盖远端的directory_epoch。
+build在已有refresh_remote_mappings持有BQL时执行，并持directory_lock，
+要求远端映射已应用、前缀完整/even、本地BAR与真实io_regions一致。
+索引为排序/合并的PIO、MMIO闭区间，用RCU发布及回收；
+读侧双重revision与depth检查，稳定未命中不获取BQL、不RPC。
+后续control开始可发生在lookup线性化点之后，与旧查找释放BQL后的情形相同；
+未增加整个设备I/O与重配置的全局事务保证。
+revision及控制嵌套计数到上限时终止，不允许回绕误用旧快照。
+
+Ezreal完整QEMU编译和diff --check通过。
+测试从实际修改源码抽取区间/失效/重建/查询helper与实际descriptor类型，
+链接当前build/libqemuutil.a的真实RCU、atomic、线程及互斥实现；
+仅BQL包装与PCI模型字段为独立fixture，未替代RCU实现。
+ASAN+UBSAN和O2各757214个随机/边界/PIO-MMIO分离判断通过；
+包括空集合、重叠/相邻区间、UINT64末端、溢出回退、
+missing/odd前缀、未应用epoch、控制depth、未发布本地映射回退。
+每次另有3线程总1800000次查询与1000次RCU重建，
+2线程共200000次revision失效，drain_call_rcu完成。
+工具初次常量缺失和libqom链接依赖修正后才产生上述PASS，
+不把编译失败或早期缺少depth的测试版本作为最终源码证明。
+此测试不证明真实PCI重配置/设备模型/DSM路径，仍须运行验证。
+运行实例目前为旧功能02fd3bf635，候选没有启用；guest/HPET未改。
