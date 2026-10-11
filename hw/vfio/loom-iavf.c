@@ -1383,6 +1383,29 @@ out:
 }
 
 /*
+ * Completion before a known native AdminQ/control write. Submission still
+ * passes through the existing physical AdminQ prepare/write gate.
+ */
+int loom_iavf_sync_control_write(VFIORegion *region, hwaddr addr, unsigned size)
+{
+    static int scoped = -1;
+    VFIODevice *dev = region->vbasedev;
+
+    if (scoped < 0) {
+        const char *mode = getenv("LOOM_IAVF_ADMIN_WRITE_SCOPED");
+
+        scoped = mode && !strcmp(mode, "1");
+    }
+    if (!scoped || region->nr || size != 4 ||
+        dev->type != VFIO_DEVICE_TYPE_PCI || !dev->loom_iavf_irq_control ||
+        (addr != 0x5000 && addr != 0x5c00 &&
+         addr != 0x7000 && addr != 0x8400)) {
+        return 0;
+    }
+    return loom_iavf_sync_control_completion(dev);
+}
+
+/*
  * Physical AdminQ dependency preparation. These functions never write a BAR;
  * the enable/tail gate may proceed only after this callback returns zero.
  */

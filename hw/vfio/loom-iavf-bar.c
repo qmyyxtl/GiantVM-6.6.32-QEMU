@@ -178,7 +178,8 @@ int loom_iavf_physical_bar_write(VFIORegion *r, hwaddr addr,
         goto fail;
     }
     data = addr <= 0x3c || (addr >= 0x2000 && addr <= 0x203c);
-    ret = data ? loom_iavf_sync_data_completion(dev) : 0;
+    ret = data ? loom_iavf_sync_data_completion(dev) :
+                 loom_iavf_sync_control_write(r, addr, size);
     if (ret < 0) {
         goto fail;
     }

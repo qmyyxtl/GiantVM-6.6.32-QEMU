@@ -4731,3 +4731,29 @@ final guest CPU0-3、HPET、RSS equal2，两盘仍各1GiB；
 LOOM_IAVF_ADMIN_SCOPED=1仅本次显式启用，source默认OFF。
 所有探针终止cleanup，Jinx sink/source STOPLOOM/EXIT0及aliases移除；
 未动Lux、worker-g4，未创建实验文件。目标仍未完成。
+
+
+### Native AdminQ/control writes 限定同步原型（默认关闭）
+
+新增 LOOM_IAVF_ADMIN_WRITE_SCOPED=1，且需要原
+LOOM_IAVF_ADMIN_SCOPED=1使control completion有效。
+仅native PCI X710 VF、BAR0、4-byte、5000/5c00/7000/8400；
+新API loom_iavf_sync_control_write复用已有AQ+data immutable capture、
+identity/alias/queue状态验证和fatal publication语义。
+物理ARQT/ATQT仍在completion后走原prepare/observe/admin write gate；
+startup、LEN/BASE/HEAD/reset/未知写不扩展，ret0仍完整fallback。
+helpers仅在5000成功scoped completion之后跳过原full CPU→device：
+guest iavf register/main确认这是ICR0_ENA/AdminQ interrupt mask，不提交DMA地址；
+scoped失败/关闭时原full completion与full submit保持不变。
+5c00原本已不提交DMA，但旧路径completion使用full，现在可scope。
+
+真实运行baseline三轮RX PASS：full writes5000 from13/to13，
+5c00 from13、7000 from8、8400 from8；另2次MSI fallback；
+总非read from44/to13，probe12.368s，非性能证据。
+原生产API与helpers full函数/physical_bar_write提取编译ASAN+UBSAN，
+884762 cases每模式OFF/ON/invalid均PASS：
+地址/大小/BAR/type/irq全矩阵、success/fallback/error、
+物理tail仍经prepare gate入口、启动配置full、data completion不变、
+full失败/控制发布失败/提交失败停止、失败状态不再提交。
+外部DMA、AdminQ gate本体用stub验证调用顺序及错误，不是完整硬件等价证明。
+Ezreal build PASS。实机开启/失效/性能验证待后续本节记录；source默认OFF。
