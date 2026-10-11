@@ -1056,20 +1056,20 @@ static bool tx_snapshot_types_valid(const uint8_t *snapshot, unsigned count)
 {
     unsigned n = 0;
 
-    /* Pack four little-endian descriptor type bytes into independent lanes.
-     * Only 0/1 (CPU descriptors) and 15 (hardware writeback) are supported.
-     * Each add is below 256, so carries cannot cross byte lanes.
+    /*
+     * Pack four little-endian descriptor type bytes into independent lanes.
+     * Rotating each nibble by one maps supported types 15/0/1 to 0/1/2.
+     * Adding 125 sets bit 7 exactly for unsupported rotated values 3..15.
+     * Both additions stay below 256, so carries cannot cross byte lanes.
      */
     for (; count - n >= 4; n += 4) {
         const uint8_t *p = snapshot + n * 16 + 8;
         uint32_t types = (p[0] & 15) | ((p[16] & 15) << 8) |
                          ((p[32] & 15) << 16) | ((p[48] & 15) << 24);
-        uint32_t not01 = ((types & UINT32_C(0x0e0e0e0e)) +
-                          UINT32_C(0x7f7f7f7f)) & UINT32_C(0x80808080);
-        uint32_t not15 = ((types ^ UINT32_C(0x0f0f0f0f)) +
-                          UINT32_C(0x7f7f7f7f)) & UINT32_C(0x80808080);
+        uint32_t rotated = (types + UINT32_C(0x01010101)) &
+                           UINT32_C(0x0f0f0f0f);
 
-        if (not01 & not15) {
+        if ((rotated + UINT32_C(0x7d7d7d7d)) & UINT32_C(0x80808080)) {
             return false;
         }
     }

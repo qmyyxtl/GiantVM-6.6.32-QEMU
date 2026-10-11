@@ -6189,3 +6189,51 @@ __kvm_write_guest_page 写页时没有running vCPU。
 设备NUMA识别/真实两端功能这一项已有证据；吞吐是否改善、
 DMA页是否归属owner、非DSM开销是否最低均尚未验证。
 下一步以同条件测量页面放置/处理成本，避免把拓扑成功当性能成功。
+
+#### 根桥 NUMA 配置后的 owner CPU 成本与 TX 类型运算简化（2026-10-11）
+
+当前运行的是 c7353f5f18 功能代码（README HEAD cf545477d0），
+真实 QEMU Garen22361/Ezreal5038；guest #26、HPET、四 CPU、
+两 NIC NUMA0/1、队列/IRQ 配置不变。未测磁盘/Lux。
+
+先前 20 秒的 profile 输出被终端预算截断，不用于完整锁/扫描归因。
+随后用同样变化内容、CPU 本地预分配 buffer 的四 worker 流量，
+单独采集 12 秒、49Hz cpu-clock:H、DWARF8192 的 PID 范围 host 样本：
+Garen617、Ezreal543，均无空样本；涉及 DSM/ivy/krdma 堆栈
+分别281/617（45.5%）、285/543（52.5%）。
+无 DSM 帧且涉及设备的样本分别156/617、94/543；不能把其余样本
+全部归为可删除的设备开销。主要锁栈是 DSM page acquire 的
+dsm_lock/mutex_spin_on_owner，以及 DSM fetch 的 mlx5 CQ 轮询，
+不是仅凭自旋函数名字推断 QEMU BQL 争用。
+
+对 perf 报出的 SSE2 内联函数，按该地址所在 QEMU ELF 的实际
+nm -S 函数区间归到 enclosing function；不再漏记 _mm_cmpeq_epi8。
+skip_matching_bytes 第一栈帧 G11/E8（1.78%/1.47%），
+TX 类型检查第一栈帧 G17/E8（2.76%/1.47%），栈可对应
+MSI completion 或 native doorbell。未知 shared DSO 仅标 DSO_ONLY，
+不猜隐藏函数；G unknown leaf27/E3。采样是 CPU 事件比例，
+不是 wall-clock 等待时间或全系统成本，有限样本也不证明成本已最低。
+
+该 20 秒流量完整字节/变化内容验证 PASS，四项 NIC error/drop 增量0，
+观察到538.806 MiB/s；另一带 profile 的30秒样本496.332 MiB/s。
+接收方向仍 G→Jinx、E→Garen host；有 profiler 和 receiver 放置差异，
+不能与旧拓扑吞吐直接比较或宣称 NUMA 性能收益。
+两次 receiver 均 STOP 正常 exit0，临时地址由 finally 删除；
+使用 stdin/memfd，没有实验文件/新磁盘。
+
+保留完整 TX snapshot 检查，仅将四 byte lane 的合法类型判定简化：
+每 lane 的 t∈[0,15] 经 (t+1)&15 后，合法15/0/1映射为0/1/2；
+加125后 bit7 仅在非法3..15置位。两次 lane 加法都不跨 byte
+进位，尾部逐项判定不变，失败仍走原 fallback。
+没有减少 descriptor 读取/发布或修改 DMA 同步顺序。
+
+两 host 源码候选 O2 对照通过：四项全部65536种低 nibble 组合，
+offset0..15、count0..129、每位置全部256种 byte 与独立标量 reference
+一致。Ezreal 修改后的实际 helper 再提取，ASan/UBSan 同范围通过。
+固定 hostCPU10，noinline/noipa，400000 次/轮，七轮：
+128项中位数 G22.8979→20.8816ms，E22.8805→20.8462ms；
+512项 G90.9240→82.1980ms，E90.8502→81.8028ms。
+仅约8.8%–10.0%的检查循环改善，不是总体吞吐或 owner CPU 改善。
+本节记录时新 helper 尚未替换运行进程；仍需两端构建及真实收发回归。
+整体目标未完成；下一步确认实际 binary 的功能/CPU 成本，再审查其它
+设备热路径，DSM 占比独立列出。Garen 已知 dirty-page warning 未修复。
