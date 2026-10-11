@@ -5154,3 +5154,47 @@ G tx_dropped5、E0，未在reset前单独取基数，不能把5定位到某阶�
 Jinx source/sinks STOP全部EXIT0，探针两端EXIT0/cleanup，alias/端口清理。
 不改host/guest内核、不测Lux、不重测已接受的磁盘性能，无实验文件；
 Garen现有worker PID6122保留。候选不改变默认和当前运行策略。
+
+### 2026-10-11：最终 bounded 版本逐轮配对与队列混杂控制
+
+当前代码 d59ef7403c（docs6d71ad134b），同boot Garen226864、
+Ezreal835692；host/guest内核、HPET、4CPU、NUMA、VF不变。
+只Garen enp0s7两worker CPU0/1，每次6秒发送到第三方Jinx10.3，
+无探针/实验文件。6pairs各含OFF/ON，奇偶pair交替顺序，
+每轮实际读取flag确认，/proc/QEMU/stat user+system-guest计CPU，
+同步记录ethtool包数/discard、netdev errors/drops、IRQ四CPU计数。
+两组共24轮内容校验全部PASS，每轮所有discard/errors/drop增量0。
+每次CPU窗口含相同串口和计数读取开销，不等于纯payload函数CPU。
+
+原XPS0/RSS equal2：
+OFF吞吐757.921,765.668,950.021,801.344,786.481,790.268；
+ON831.169,754.985,966.087,773.634,790.999,801.016 MiB/s。
+中位788.375 vs796.007（+0.97%），CPU中位1.741036 vs1.720040
+ms/MiB（-1.21%），ON4/6pairs吞吐更高、4/6CPU更低；
+样本明显重叠。IRQ总数536307 vs534362。
+实际新TCP连接的ACK队列及TX分布变化，不能把相邻差全归于flag。
+
+随后保持同boot，将G TX q0 XPS0/q1 XPS3，RSS weight0,1，
+两CPU流量全部经同一q1，IRQ仍在owner CPU1。
+E配置不改。再6pairs OFF/ON交替：实际所有TX/RX q0包数0，
+q0 IRQ0，q1 IRQ全部CPU1；两模式工作路径可比。
+OFF吞吐976.973,969.469,959.819,978.594,957.989,971.322；
+ON963.821,997.861,956.495,977.191,960.953,965.747。
+中位970.395 vs964.784 MiB/s（-0.58%）；
+CPU中位1.302549 vs1.293593 ms/MiB（-0.69%）；
+ON仅2/6吞吐更高、4/6CPU更低。IRQ282862 vs280549。
+因此最终版本也没有稳定收益证据，bounded默认/当前继续OFF。
+
+两组OFF相比，固定q1吞吐中位较原组高约23.09%，
+CPU/MiB约低25.19%，全部6个固定q1样本高于原组最高950.021；
+每轮IRQ约从8.94万降为4.71万。
+这是两个先后配置组，并非配置的逐轮ABA证明；每轮发送字节数不同，
+不能将IRQ总数比例当作同流量的成本比例。
+还没有DSM计数，队列改变也会改变DMA页使用，不能称纯非DSM因果分离。
+这说明下一步优先量化活跃队列/完成回调的工作和DSM，
+而不是因缩减ACK读取范围就宣称带宽改善。
+
+driver finally实际恢复flag0、G XPS0/RSS equal2，回到原配置；
+E始终flag0/XPS0/RSS equal2。两组测试正常EXIT0，
+Jinx两sink STOP/EXIT0，拥有的两个测试IP均删除、端口清理。
+四CPU/HPET保持，Garen worker6122保留，Lux不动；无新增实验文件。
