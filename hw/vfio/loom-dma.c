@@ -632,11 +632,12 @@ static int merge_buffer(VFIOContainerBase *bc, LoomDMABuffer *b,
              * owner, and must release it before this invocation returns.
              */
             runs++;
-            if (!locked && bc->loom_physical &&
+            if ((runs == 2 ||
+                 (runs == 1 && bc->loom_dma->early_publication)) &&
+                !locked && bc->loom_physical &&
                 bc->loom_dma->cache_publication && bql_locked() &&
                 (runs == 2 ||
-                 (runs == 1 && bc->loom_dma->early_publication &&
-                  bc->loom_dma->pin_publication && b->size <= 4096 &&
+                 (bc->loom_dma->pin_publication && b->size <= 4096 &&
                   (b->gpa & 4095) + b->size <= 4096 &&
                   publication_has_four_runs(snapshot, b->baseline,
                                              start, b->size)))) {
