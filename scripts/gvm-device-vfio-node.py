@@ -122,7 +122,9 @@ try:
                   "-drive", f"file={args.data_disk},format=raw,if=none,"
                  f"id=data-owner-{args.node},cache=none,aio=threads",
                  "-device", f"virtio-blk-pci,drive=data-owner-{args.node},"
-                 f"id=data-owner-{args.node},addr=0{9 + args.node:x}.0,"
+                 f"id=data-owner-{args.node},"
+                 + ("bus=pcie.0," if args.device_numa_roots else "") +
+                 f"addr=0{9 + args.node:x}.0,"
                  f"serial=GVM-DATA-OWNER{args.node},ioeventfd=on,vectors=5,"
                  f"loom-aggregate=on,loom-numa-node={args.node},"
                  "iothread=owner-io"]
