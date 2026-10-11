@@ -4757,3 +4757,64 @@ scoped失败/关闭时原full completion与full submit保持不变。
 full失败/控制发布失败/提交失败停止、失败状态不再提交。
 外部DMA、AdminQ gate本体用stub验证调用顺序及错误，不是完整硬件等价证明。
 Ezreal build PASS。实机开启/失效/性能验证待后续本节记录；source默认OFF。
+
+
+### Native control writes 实机验证与保留关闭（2026-10-11）
+
+functional 0f135beaf0；b8753a3269补充scoped完成后原AdminQ observer顺序。
+修正后OFF/ON/invalid每模式884762 cases ASAN+UBSAN PASS BOTH，build PASS BOTH。
+0f135版本的早期OFF基线与未修正ON启动仅作调试，不纳入最终性能对照；
+最终同二进制b8753a3269，仅WRITE_SCOPED=0→1，原ADMIN_SCOPED=1保持。
+guest/host内核、四CPU、4GiB、HPET、host bind0、两VF与原两1GiB盘不改。
+
+Garen单卡、CPU0、RSS allqueue1、9×256MiB无probe内容/长度/ACK均PASS：
+OFF median 269.650 MiB/s，owner host CPU 10.31s /
+4.474826 ms/MiB；
+ON median 267.644 MiB/s，owner host CPU 10.39s /
+4.509549 ms/MiB。
+ON约-0.744%吞吐、+0.776%CPU，没有性能收益证据，不认定稳定退化。
+一对跨启动、RSSkey变化但queue固定、样本重叠；
+OFF/ON九轮rx_discards从0分别增长74/88，不能忽略或归因优化。
+观察到全量扫描减少并未带来这组吞吐或CPU改善，不能宣称瓶颈已解决。
+
+独立probe三轮各256MiB PASS：
+OFF WRITE_FULL 5000 from12/to12、5c00 from12、
+7000 from9、8400 from9；control_write ret0=42。
+非read full from44（其中MSI2）、to12；read full0；
+control_completion成功118/回退2、data_completion成功75868。
+ON control_write成功66/回退0/negative0，WRITE_FULL空、active_writes0。
+full只剩read6400一次和MSI一次，to0；control_completion成功260/回退2，
+data_completion成功82493，均没有负返回。
+OFF full snapshot候选83108页/340410368bytes，实际snapshot_ready copy4页/16384bytes；
+ON候选3938页/16130048bytes，实际copy同为4页/16384bytes。
+不是scoped AQ/data capture/publish的总复制量；
+候选bytes并非实际copy/CPU，两个窗口13.019/27.185s包含不同背景，
+不把候选差或时长当精确速度收益。所有probe正常cleanup，active reads/snapshots0。
+
+ON TX G/E/DUAL一轮6s八连接内容/长度均PASS，
+768.281/619.865/456.857MiB/s；仅功能、无对应OFF吞吐，
+Jinx两IP共享一10G物理口，不证明双卡线性扩展。
+随后两卡RX ring 512→256→512成功，CONFIG ACK mask0x3两端再次观察到，
+恢复2queues/RX512/TX128和owner IRQ亲和性，post-reset同时RX各256MiB PASS
+G2.953s/E3.792s。error级dmesg空、CPU0-3、HPET、两盘各1GiB。
+post-reset NIC rx/tx_errors0、rx_dropped0，但tx_dropped G4/E3；
+reset可清零NIC统计，不能用post-reset rx0宣称之前74/88discard已解决。
+没有精确记录这些TX drop的起始时点，不据此定位原因。
+
+ON正常poweroff两端EXIT0，随后同二进制恢复WRITE_SCOPED=0，
+新路径source默认OFF保持，READ的ADMIN_SCOPED=1保留原实验配置。
+当前actual QEMU Garen122238(wrapper29536)/Ezreal813813(wrapper63607)。
+最终恢复启动、队列配置、两owner ping、diagnostics另由本轮完成核实。
+全部probe、Jinx临时source/sinks/aliases清理，未动Lux/worker-g4，
+未创建实验文件。磁盘已接受性能未重复测试。
+
+下一步回到每包数据路径做成本计数：现有RX completion对每个ready slot
+先read_pool 8-byte DD状态、dma read barrier，再read_pool完整32-byte descriptor并
+复核status未变化；此处可能重复同一mapping查找。先量化再考虑合并查找，
+保留DD→dma_rmb→完整immutable snapshot→status复核、冷路径和失效回退。
+尚未实现这项；无法声明只剩DSM额外成本。
+
+最终恢复核实：两端进程environ WRITE_SCOPED=0、ADMIN_SCOPED=1；
+两owner各ping3/3 PASS，四CPU在线、HPET、RSS equal2、两盘各1GiB；
+新boot两卡error/drop计数0、guest error级dmesg空。这不覆盖上一boot的discard。
+Jinx两个sink与source均STOPLOOM OK/EXIT0，ports及两alias移除；worker6122仍存活。
