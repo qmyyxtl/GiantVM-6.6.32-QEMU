@@ -5517,3 +5517,104 @@ sync错误0，所有probe活动map为0，detach/cleanup退出0。
 source/sink正常退出，Jinx测试地址及监听器清理。
 下一步定位每页读取、差分merge/复制及等待成本，
 解释同步调用数量大降为何未转成稳定CPU/带宽收益；整体目标尚未完成。
+
+### 两张独立网卡：独立链路、DSM 热页与 worker 创建位置
+
+保留 OS 枚举两张独立 VFIO 网卡，不合并设备。两端功能代码
+da88d77cfb，guest 6.12.0-vanilla-vfio #26、四 CPU 在线、HPET 不变；
+XPS0、RSS equal2，RX512/TX128；TX idle、RX bounded、TX coalesce 均关闭。
+
+Garen guest enp0s7 的两个 worker CPU0/1 向 Jinx 198.18.10.3 发送；
+Ezreal guest enp0s8 的两个 worker CPU2/3 向 Garen host 198.18.11.1
+发送，接收进程绑 host CPU8–11。使用两个物理10G接收链路，避免
+Jinx单口上限，但第二接收端与Garen设备owner共用host；不能排除host竞争，
+也不是两个完全独立的第三方接收端。未触碰Lux或worker6122。
+
+无插桩六组、单卡各两worker/双卡四worker，每轮6秒，交替顺序：
+G单卡中位数758.310、E单卡615.419、双卡455.561 MiB/s；
+双卡为两个单卡中位数之和的33.16%。18轮接收端内容/字节数校验通过，
+guest网卡错误/丢弃增量为0。TCP重传仍存在，本项未处理。
+这些数字不与此前固定队列1的单卡结果直接比较。
+
+#### 实际 DSM 请求及热页
+
+BPF在 kvm_dsm_fetch 入口读取真实请求类型/GFN；按owner QEMU TGID过滤。
+worker就绪后START启用，完成后STOP停用并排空；原子计数，entries与各类型
+之和及returns一致，错误、嵌套、map溢出及pending均0。统计的是实际请求
+调用，不是唯一page fault，不覆盖其他TGID的服务线程，也不是全链路RDMA字节数。
+采样本身干扰吞吐，以下仅比较请求密度和热页，不作未插桩带宽结论。
+
+| 场景 | 两端请求总数 | 载荷 MiB | 请求/MiB | 累计fetch ms/MiB |
+|---|---:|---:|---:|---:|
+| G单卡 |125311|4708|26.6166|0.431873|
+| E单卡 |78439|3563|22.0149|0.373647|
+| 双卡，child内绑核 |609868|2105|289.7235|4.765717|
+| 双卡，parent创建前绑核 |475345|2856|166.4373|2.713348|
+
+累计fetch耗时包含等待、可跨线程重叠，不是wall-time百分比或纯CPU；
+一次插桩前后对比不能证明稳定比例。双卡请求密度相对单卡明显增加。
+
+guest只读 /proc/kpageflags、/proc/kcore，并按当前源码/配置核实struct布局、
+以sysfs object_size交叉验证：PFN34449/34452同属head34448的
+task_struct slab，object_size3776；18183属于kmalloc-512；
+34435/34439/33187属于kmalloc-2k。这是流量完成后的页归类，
+不证明某个具体指令或对象写入了整页。
+静态PFN11270共置hpet、mmlist_lock、tasklist_lock、softirq_vec、pidmap_lock；
+不能仅因HPET在此就将该页所有流量归因于时钟。未修改HPET。
+
+#### 创建进程前先绑核，无 guest 源码修改
+
+原测试仅在child内绑核，task_struct已在fork时分配。
+当前guest kernel/fork.c的dup_task_struct，在普通父进程没有指定节点时
+以numa_node_id选择分配节点。因此在创建每个worker前将parent绑到目标CPU，
+创建后恢复parent原亲和性；child仍自行绑核并first-touch数据。
+这会影响进程结构及其他创建阶段分配，不能把全部收益归因于task_struct。
+修正后原task_struct两页不再进入该次请求top30，不代表请求绝对为0。
+
+同启动、无插桩、六组交替旧/新创建方式，双卡均四worker：
+| pair | child内绑核 MiB/s | parent创建前绑核 MiB/s |
+|---|---:|---:|
+|0|501.273|534.642|
+|1|504.682|480.452|
+|2|360.734|527.123|
+|3|485.936|513.056|
+|4|431.404|528.041|
+|5|412.615|501.566|
+
+中位数458.670→520.090 MiB/s，+13.39%，5/6组更快，12轮载荷/字节数
+校验通过。属于测试进程配置改善，不是新的QEMU代码优化；
+未重测新创建方式下单卡基线，不能据此给出匹配的聚合效率。
+此前一组测试接收端TTL到期导致BrokenPipe，整组作废，重建接收服务后
+上述12轮才全部完成；没有因此重启guest或host。
+
+仍需区分设备本地扫描/复制、MMIO/中断处理、锁竞争与DSM路径。
+不改guest源码、不改HPET，不重复已接受的磁盘性能测试；
+尚未证明非DSM额外成本已经降到目标水平。
+
+#### 双卡 host CPU 采样：锁竞争归属
+
+两端同时perf cpu-clock:H 49Hz、DWARF8192采样20秒；数据仅memfd，
+关闭buildid写入/缓存，解析后关闭fd，没有实验文件。三轮双卡四worker、
+提前parent绑核流量内容/字节数全部通过。采样吞吐不作未插桩性能结论；
+窗口包括worker创建与轮间操作，按owner TGID采样，不包括全部host线程。
+
+Garen942个可解析样本、bad0；互斥启发式分类DSM家族442（46.9%）、
+设备路径但无DSM帧198（21.0%）、其他RPC12、其他290。
+inclusive按去重函数名计数：prepare125、physical_stage102、
+bar_access215；这些调用有重叠不能相加。tx_snapshot_types_valid
+leaf11（1.17%），不足以支持把优化全环类型扫描当成主要吞吐解决方案。
+
+锁等待示例确认 mutex_spin_on_owner→mutex_lock→dsm_lock→
+__kvm_dsm_acquire_page→kvm_dsm_vcpu_acquire_page；
+另有krdma_send锁和publication_acquire→kvm_dsm_mempin的锁路径。
+因此观察到锁竞争不等于设备目录或QEMU BQL竞争，不能混作非DSM成本。
+
+Ezreal初次模块/QEMU符号未解析，不能使用初次OTHER分类。
+后续在内存解析/proc/kallsyms补模块符号，867样本，DSM栈446；
+锁等待示例也明确进入dsm_lock。QEMU用户栈仍有未知帧/展开不足，
+故其“无DSM”分类不完整，不拿两端分类相加计算系统纯非DSM比例。
+guest执行、阻塞等待、其他TGID均不在这些host CPU样本中。
+
+当前证据支持将DSM页竞争与设备路径额外成本分别处理，
+但不证明非DSM成本已最小化。下一步在设备owner本地准备/完成路径
+测量调用密度及本地CPU成本，优先验证能安全消除的重复处理。
