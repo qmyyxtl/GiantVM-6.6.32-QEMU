@@ -102,6 +102,7 @@ static uint32_t config_address;
 static bool owner_iommu_present;
 static bool local_bar_lock_batch;
 static bool bar_negative_filter;
+static bool local_bar_route;
 
 G_STATIC_ASSERT(sizeof(LoomPCIDescriptor) == 4352);
 /* Only this prefix changes BAR mappings. Extended config reads use owner RPC. */
@@ -590,6 +591,16 @@ static void set_local_bar_lock_batch(Object *obj, bool enabled, Error **errp)
     qatomic_set(&local_bar_lock_batch, enabled);
 }
 
+static bool get_local_bar_route(Object *obj, Error **errp)
+{
+    return qatomic_read(&local_bar_route);
+}
+
+static void set_local_bar_route(Object *obj, bool enabled, Error **errp)
+{
+    qatomic_set(&local_bar_route, enabled);
+}
+
 void loom_pci_prepare(void)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
@@ -612,6 +623,8 @@ void loom_pci_prepare(void)
     object_property_add_bool(OBJECT(ms), "loom-local-bar-lock-batch",
                              get_local_bar_lock_batch,
                              set_local_bar_lock_batch);
+    object_property_add_bool(OBJECT(ms), "loom-local-bar-route",
+                             get_local_bar_route, set_local_bar_route);
     local_node = ms->local_cpu_start_index / ms->local_cpus;
     node_count = ms->qemu_nums;
     if (local_node >= node_count) {
@@ -1115,15 +1128,26 @@ static void refresh_remote_mappings(void)
 }
 
 static bool bar_access_owner_scan(unsigned owner, hwaddr addr, bool io,
-                                  uint8_t *data, unsigned size, bool write)
+                                  uint8_t *data, unsigned size, bool write,
+                                  bool local_authoritative)
 {
     unsigned index, bar;
 
     for (index = 0; index < directory[owner].count; index++) {
-        LoomPCIDescriptor d;
-        snapshot_bars(&directory[owner].devices[index], &d);
+        LoomPCIDescriptor copy;
+        LoomPCIDescriptor *d = &copy;
+
+        if (local_authoritative) {
+            assert(owner == local_node && bql_locked());
+            d = &directory[owner].devices[index];
+            if (d->sequence & 1) {
+                fatal_error("device reset snapshot unavailable; aggregate must stop");
+            }
+        } else {
+            snapshot_bars(&directory[owner].devices[index], d);
+        }
         for (bar = 0; bar < PCI_NUM_REGIONS; bar++) {
-            LoomBAR *b = &d.bars[bar];
+            LoomBAR *b = &d->bars[bar];
             LoomPCIRequest req;
             LoomPCIResponse resp;
             if (!b->size || b->address == PCI_BAR_UNMAPPED ||
@@ -1134,7 +1158,7 @@ static bool bar_access_owner_scan(unsigned owner, hwaddr addr, bool io,
             req = (LoomPCIRequest) {
                 .operation = write ? LOOM_PCI_BAR_WRITE : LOOM_PCI_BAR_READ,
                 .device_id = owner * LOOM_MAX_DEVICES + index,
-                .generation = d.generation, .bar = bar,
+                .generation = d->generation, .bar = bar,
                 .offset = addr - b->address, .size = size,
             };
             if (write) {
@@ -1171,7 +1195,8 @@ static bool bar_access_owner(unsigned owner, hwaddr addr, bool io,
     if (take_lock) {
         bql_lock();
     }
-    handled = bar_access_owner_scan(owner, addr, io, data, size, write);
+    handled = bar_access_owner_scan(owner, addr, io, data, size, write,
+                                    false);
     if (take_lock) {
         bql_unlock();
     }
@@ -1185,7 +1210,7 @@ static bool bar_access_owner(unsigned owner, hwaddr addr, bool io,
  * A pending mapping update, missing prefix or odd reset sequence falls back
  * to the original snapshot/refresh/validation path.
  */
-static bool bar_access_may_match(hwaddr addr, bool io)
+static bool bar_access_may_match(hwaddr addr, bool io, bool skip_local)
 {
     bool locked = bql_locked();
     bool possible = true;
@@ -1201,6 +1226,9 @@ static bool bar_access_may_match(hwaddr addr, bool io)
         goto out;
     }
     for (unsigned owner = 0; owner < node_count; owner++) {
+        if (skip_local && owner == local_node) {
+            continue;
+        }
         for (unsigned index = 0; index < directory[owner].count; index++) {
             LoomPCIDescriptor *d;
 
@@ -1246,16 +1274,46 @@ static bool bar_access(hwaddr addr, bool io, uint8_t *data,
     if (!(size == 1 || size == 2 || size == 4 || size == 8)) {
         fatal_error("unsupported BAR access width");
     }
-    if (qatomic_read(&bar_negative_filter) && !bar_access_may_match(addr, io)) {
-        return false;
-    }
-    /*
-     * Owner-local descriptors are authoritative and published under the BQL.
-     * Local access still validates the generation in loom_pci_dispatch(), but
-     * must not wait for an unrelated peer's configuration snapshot.
-     */
-    if (bar_access_owner(local_node, addr, io, data, size, write)) {
-        return true;
+    if (qatomic_read(&local_bar_route)) {
+        bool locked = bql_locked();
+        bool handled, possible = true;
+
+        /*
+         * Inspect the authoritative local descriptors once under BQL. A local
+         * hit needs no remote prefix or directory_lock. On a miss, retain BQL
+         * for the remote-only stable-miss filter, avoiding both a second local
+         * scan and another BQL acquisition for non-PCI addresses.
+         *
+         * No pointer/route survives this scope. Remote refresh/RPC starts only
+         * after restoring the caller's original BQL state.
+         */
+        if (!locked) {
+            bql_lock();
+        }
+        handled = bar_access_owner_scan(local_node, addr, io, data, size,
+                                         write, true);
+        if (!handled) {
+            possible = bar_access_may_match(addr, io, true);
+        }
+        if (!locked) {
+            bql_unlock();
+        }
+        if (handled || !possible) {
+            return handled;
+        }
+    } else {
+        if (qatomic_read(&bar_negative_filter) &&
+            !bar_access_may_match(addr, io, false)) {
+            return false;
+        }
+        /*
+         * Local descriptors are authoritative and published under BQL.
+         * Access still validates the generation in loom_pci_dispatch(), but
+         * must not wait for an unrelated peer's configuration snapshot.
+         */
+        if (bar_access_owner(local_node, addr, io, data, size, write)) {
+            return true;
+        }
     }
 
     /*

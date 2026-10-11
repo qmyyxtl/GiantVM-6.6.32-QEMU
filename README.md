@@ -6279,3 +6279,39 @@ guest error-level dmesg为空，NEW_BINARY_DUAL_NIC_REGRESSION_PASS。
 新代码构建/真实启动/TX/RX已验证；总体性能收益仍需匹配对照。
 下一步审查 BAR/完成路径的查找和同步成本，先确认事件/失效语义，
 不能跳过正在运行的 DMA 完成或仅因 snapshot 未变化缓存检查结果。
+
+#### 本地 BAR 优先路由候选（2026-10-11）
+
+审查 c71908d1dd 的实际运行 QMP：两端 loom-bar-negative-filter 和
+loom-local-bar-lock-batch 均 false，byte SIMD true。这与先前没有稳定
+端到端收益、保留默认OFF的决定一致，不是重启丢失已证明的配置。
+因此此前profile不能说本地doorbell已实际经过negative filter；
+源码中该filter开启时先查本地/远端缓存，再做本地snapshot路由。
+
+新增运行时布尔属性 /machine loom-local-bar-route，默认 false。
+打开后，一次 BQL 范围内扫描 authoritative local descriptor：
+不复制 prefix，不获取 directory_lock；命中仍经 execute →
+loom_pci_dispatch 的 generation、BAR extent 和设备回调检查。
+本地 sequence odd 仍 fatal，不借 reset 省掉检查。
+未命中时同一个 BQL 范围内检查 remote-only stable-miss filter，
+不重复扫描本地，也不重复获取 BQL。控制未启用、epoch未应用、
+远端prefix缺失或odd均保守返回possible，继续原refresh/snapshot路径。
+远端 refresh/RPC 前恢复调用原本的 BQL 状态；没有新地址缓存，
+没有跨调用保留descriptor指针，没有改BAR发布/reset机制。
+关闭新属性仍走原路径，旧两个属性和协议VERSION4保持。
+
+从本次实际 C 源提取路由四函数，与 c71908d1dd 的函数逐案对照，
+20000组经 GCC ASan/UBSan 通过。覆盖local/remote/read/write、
+1/2/4/8B、MMIO/PIO、caller原本持锁/不持锁、旧两属性组合、
+控制开/关、epoch pending、remote BAR变化、缺失/odd、
+local odd、unmapped/zero extent、边界/跨extent/uint64高地址。
+比对是否命中、失败、请求字段和读返回数据；mock检查锁顺序与
+远端RPC前调用者锁状态。专门断言新local命中一个BQL、
+零directory lock/零snapshot；稳定HPET地址miss一个BQL、
+一个directory lock、零snapshot/零refresh。
+
+该验证替换了设备回调/控制传输为mock，不能证明真实并发reset、
+BAR迁移、固件启动或端到端性能。Ezreal QEMU初次构建exit0。
+新代码此处尚未部署到两端运行进程；后续两端构建/启动，再以同一
+binary的属性OFF/ON匹配流量和CPU成本，不能把锁调用减少直接算带宽收益。
+guest、HPET、KVM源码均未改；未测磁盘/Lux，也无实验文件。
