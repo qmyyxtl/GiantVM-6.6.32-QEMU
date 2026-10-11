@@ -159,6 +159,35 @@ struct LoomIAVFQueues {
     LoomIAVFTXIdle tx_idle[VF_QUEUE_COUNT];
 };
 
+
+/*
+ * A single-page ring has one registration identity. Unrelated payload mappings
+ * must not invalidate its published drain state. Compare both endpoints to
+ * reject partial registrations. Multi-page rings retain the global epoch until
+ * every participating registration can be tracked without losing invalidation.
+ */
+static uint64_t tx_idle_registration(VFIODevice *dev, const LoomIAVFQueue *q)
+{
+    uint64_t size, last, first_generation, last_generation;
+
+    if (!q->tx_count || q->tx_count > 4096) {
+        return 0;
+    }
+    size = q->tx_count * 16ULL;
+    if (q->tx_iova > UINT64_MAX - (size - 1)) {
+        return 0;
+    }
+    last = q->tx_iova + size - 1;
+    if (q->tx_iova / 4096 != last / 4096) {
+        return loom_vfio_dma_epoch(dev->bcontainer);
+    }
+    first_generation = loom_vfio_dma_page_generation(dev->bcontainer,
+                                                     q->tx_iova);
+    last_generation = loom_vfio_dma_page_generation(dev->bcontainer, last);
+    return first_generation && first_generation == last_generation ?
+        first_generation : 0;
+}
+
 static void completion_free(LoomIAVFQueues *s)
 {
     memset(s->tx_idle, 0, sizeof(s->tx_idle));
@@ -1089,7 +1118,7 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
             LoomIAVFTXIdle *t = &s->tx_idle[id];
 
             if (idle && t->drained &&
-                tx_idle_valid(t, q, loom_vfio_dma_epoch(dev->bcontainer),
+                tx_idle_valid(t, q, tx_idle_registration(dev, q),
                                s->physical.tx_prepared_mask & (1U << id))) {
                 skip_tx |= 1U << id;
             } else {
@@ -1223,7 +1252,7 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
             }
             if (idle) {
                 tx_idle_published(&s->tx_idle[id], q,
-                                   loom_vfio_dma_epoch(dev->bcontainer),
+                                   tx_idle_registration(dev, q),
                                    s->physical.tx_prepared_mask & (1U << id),
                                    tx_serial[id], c->tx_snapshot);
             }
@@ -2097,10 +2126,10 @@ int loom_iavf_prepare_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value
     } else {
         s->physical.prepared_tx[id] = value;
         s->physical.tx_prepared_mask |= 1U << id;
-        if (span) {
+        if (span && tx_idle_enabled()) {
             tx_idle_prepare(&s->tx_idle[id],
                              base + ((value + entries - 1) % entries) * 16ULL,
-                             loom_vfio_dma_epoch(dev->bcontainer), terminal);
+                             tx_idle_registration(dev, q), terminal);
         }
     }
     return 1;
@@ -2178,7 +2207,8 @@ int loom_iavf_commit_physical_data(VFIODevice *dev, hwaddr addr, uint32_t value)
         }
         s->physical.tx_prepared_mask &= ~(1U << id);
         tx_idle_commit(&s->tx_idle[id],
-                        loom_vfio_dma_epoch(dev->bcontainer));
+                        tx_idle_enabled() ?
+                        tx_idle_registration(dev, &s->queue[id]) : 0);
         s->tx_tail[id] = value;
         s->tx_tail_known |= 1U << id;
     } else {
