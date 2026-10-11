@@ -6315,3 +6315,64 @@ BAR迁移、固件启动或端到端性能。Ezreal QEMU初次构建exit0。
 新代码此处尚未部署到两端运行进程；后续两端构建/启动，再以同一
 binary的属性OFF/ON匹配流量和CPU成本，不能把锁调用减少直接算带宽收益。
 guest、HPET、KVM源码均未改；未测磁盘/Lux，也无实验文件。
+
+#### 本地 BAR 路由真实启动与同次启动开关对照（2026-10-11）
+
+两端633640bbb6构建均exit0，各自20000组实际helper的ASan/UBSan通过。
+正常poweroff后旧owners退出、VF恢复iavf，使用同一NUMA根桥配置启动；
+未重启host，worker-g4 PID6969保持。
+当前实际QEMU Garen52069（wrapper80806）、Ezreal15976（wrapper80265），
+各自/proc/exe SHA与build一致：
+G038358a52f5438dd9ab62ecfc5853e36576b0008e32e682fd6e3b4441d9888ab，
+E1d24ebdf9bef6708a837c4d75d54c54cec44ce1dff5bc5058e7982c83290e1d3。
+guest仍#26、HPET、CPU0-3、两iavf根桥NUMA0/1。
+NICcombined2/RX512/TX128、RSS固定q1、RPS0/XPS G3/Ec；
+此次按IRQ名称配置G42/43→CPU0/1、E38/39→CPU2/3。
+
+同一binary/同次启动，六对OFF/ON交替顺序，旧negative-filter与
+local-bar-lock-batch始终OFF且逐次QMP readback验证。
+两张NIC都向第三方Jinx发送：G198.18.10.3/E198.18.11.3，
+receiver分开绑定hostCPU8-11/12-15。Jinx同一物理口，存在共同链路
+上限；这是新路径的匹配对照，不作为两张10Gbps网卡最大线性能力证明。
+四guestCPU各一worker，buffer在对应CPU预分配32个独立1MiB块，
+每块内容变化。workers全部ready后才采CPU并GO；每轮发送8秒。
+以最大workerelapsed求聚合MiB/s，逐流完整内容/字节数验证，
+十二轮48条流全部PASS，四项NIC error/drop增量均0。
+
+CPU来自两端实际进程/proc/PID/stat的(utime+stime-guest_time)/CLK_TCK，
+扣除guest执行时间，仍包含KVM/DSM及其它owner线程。
+统计从GO前到读取END后，窗口11.353–11.701秒，包含结束观察等待；
+不是纯设备函数时间，未剔除DSM，不能从这里归因某一类开销。
+
+| pair | route | MiB/s | 两端host CPU ms/MiB |
+|---|---|---:|---:|
+| 0 | OFF | 461.231 | 4.80790 |
+| 0 | ON | 474.694 | 4.58508 |
+| 1 | ON | 508.414 | 4.35583 |
+| 1 | OFF | 469.563 | 4.64665 |
+| 2 | OFF | 462.890 | 4.83279 |
+| 2 | ON | 483.151 | 4.75711 |
+| 3 | ON | 479.872 | 4.86866 |
+| 3 | OFF | 472.339 | 4.93393 |
+| 4 | OFF | 519.508 | 4.58323 |
+| 4 | ON | 488.269 | 4.81463 |
+| 5 | ON | 473.439 | 4.82341 |
+| 5 | OFF | 514.848 | 4.48351 |
+
+吞吐中位数 OFF470.951/ON481.511（+2.24%），四对改善、两对下降；
+CPU ms/MiB中位数 OFF4.72728/ON4.78587（+1.24%，更高）。
+四对CPU成本降低，两对升高5.05%/7.58%。
+因此没有稳定端到端收益证据；不修改default false，最后两端QMP
+显式恢复OFF并readback。不能把锁调用减少直接当作性能提升。
+
+额外在ON状态执行两NIC down/队列配置/up，全部成功；
+并行RX各32MiB完整校验PASS，elapsed G0.354/E0.396s，
+源收到两次OK。这验证常规队列重建，不替代真实PCI reset/BAR移动并发验证。
+最后两NIC UP、NUMA0/1、四项error/drop累计0，guest error-level dmesg为空。
+已知Garen dirty-page warning没有修复，本轮host日志尾部无新增WARNING/Oops。
+所有receiver/source STOP exit0，Jinx临时10.3/11.3移除、49161/49162监听消失，
+保留新巨虚和worker-g4。stdin/memfd，无实验文件/新盘/磁盘测试/Lux。
+
+下一步需要实际事件计数/堆栈确认新分支的命中占比与消耗，不能仅凭
+QMP开关或源码调用关系宣称热路径占比。然后按非DSM CPU热点选择修改，
+而不是扩大一项尚无稳定收益的路由优化。整体目标仍未完成。
