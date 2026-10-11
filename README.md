@@ -6657,3 +6657,48 @@ request receiver当前为CQ事件模式，与回复CQ的usleep轮询是不同路
 发送FIFO、错误与关闭drain；目前没有实施。
 之前双方CQ统一5us短spin收益不稳定，保持0，没有重复开关宣称解决。
 整体目标未完成，guest与HPET保持。
+
+#### master服务分段与DSM归因边界（2026-10-11）
+
+沿用实际G52069/E15976和功能633640bbb6；用户指出不对称可能主要来自DSM，
+因此不能将远端MMIO/RPC调用累计墙钟全部当作独立于DSM的纯传输损失。
+先前记录证明额外RPC路径存在，不证明它主导934/705的单卡差距。
+
+master G PID52069上采handle_directory_control入口到
+handle_incoming_message入口、handler入口/返回、rdma_send_msg入口/返回、
+bql_lock_impl入口/返回，共7个uprobe，按peer1/typeMMIO/HPET读/sequence关联。
+gate8.000188秒，89607条anchor全部完成handler，nested0、残留队列/active0。
+anchor在control检查前、实际calloc/worker lock/enqueue前，
+因此所谓queue含入队前处理和worker调度，并非纯队列排队。
+累计anchor→handler746.463347ms、handler2532.461815ms、
+其中SEND411.265786ms、BQL获取范围1293.711138ms。
+BQL调用716856次，即每个HPET请求8次；每次入口/返回探针开销也被计入，
+不能将1.294秒当纯锁竞争，handler/SEND/BQL嵌套不能相加。
+代码显示通用HPET路径先调用loom_pci_handle_mmio/bar_access，
+BAR三个候选仍OFF，非PCI地址也会扫描本地/远端目录并多次取得BQL。
+目录控制更新由已有协议维护，未发现这里直接发新的目录RPC，
+不能仅凭扫描远端目录就将它说成DSM传页。
+
+随后单独8.000220秒G PID52069 kprobe三个KVM API，
+并标记本线程BQL持有与HPET handler上下文：
+E单卡流量下，G vCPU0 vcpu_acquire68865次/1015.326058ms，
+vCPU1 25281次/438.058957ms，说明非发包端仍有明显DSM API活动。
+G memcpy共3136次，累计14.235246ms，观测到的调用均在本线程BQL标记内；
+ivy/vcpu_acquire/memcpy可能嵌套，不应将这些时间直接相加，
+也不能把所有API调用当实际跨网页面fault。
+本版本HPET-context相关DSM统计为0，但未输出匹配handler数量，
+且kretprobe missed未在cleanup前读取；因此不把0当完整排除证明。
+后续collector补了HPET标记进入/完成计数和cleanup前kprobe_profile读取，
+新版本尚未运行；当前数据不足以排除间接DSM竞争或另一端等待。
+两端同条件单卡KVM API次数/耗时对照仍需补齐，未给主因结论。
+
+两个带探针流量观察584.645/553.830 MiB/s均只作功能记录，
+不可与无探针中位数作损失或优化定量比较。
+每次两条流内容/字节校验PASS，两卡全部error/drop增量0。
+所有collector正常cleanup，两个receiver正常STOP exit0，
+Jinx地址/49161清理，保留巨虚与worker-g4。
+未修改guest/HPET/QEMU功能源码或运行配置，无实验文件/新盘/Lux/磁盘测试。
+
+下一步优先同条件G单/E单、两host同步测DSM API频率和耗时，
+区分直接调用、BQL持有期间调用与间接竞争，再选择非DSM优化。
+HPET远端RPC路径与DSM代价可同时存在，当前整体性能目标未完成。
