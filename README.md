@@ -6241,3 +6241,41 @@ offset0..15、count0..129、每位置全部256种 byte 与独立标量 reference
 补充：881ac7afd6 已 push origin，Garen FF 同步，两端 ninja -j8
 构建均 exit0。运行 PID22361/5038 仍为旧功能 binary，未把编译
 通过计作新 binary 收发验证。下一步正常停止/启动巨虚并做双向回归。
+
+#### 新 TX validator binary 的两端真实收发回归（2026-10-11）
+
+正常 guest poweroff 后，两端旧 QEMU 均 exit0，实验 VF 恢复 iavf。
+没有重启 host，Garen worker-g4 PID6969 保持。
+用同一 --device-numa-roots、physical DMA、四 CPU/四 GiB/两节点配置
+启动新构建，功能代码881ac7afd6，README HEAD50e1fb8c21。
+新真实进程 Garen40993（wrapper12264）、Ezreal10867（wrapper68095）。
+各自 /proc/exe 与本地 build binary SHA 一致：
+G38035264e12e72f6439bb4f8b6993df2e354670d33df60d652c09c450f76c8bc，
+E08429a0884d56a8e04fe011280c6b1f87d2a3d52a78b4bea6bbf11d94b9dce22。
+
+guest登录仍6.12.0-vanilla-vfio #26，HPET、CPU0-3，源码未改。
+两 iavf 仍 enp33s0 NUMA0/enp65s0 NUMA1、10Gbps Link UP。
+CPU0/2配置对应 NIC：combined2/RX512/TX128、RSS weight0,1，
+RPS0、XPS G3/Ec；本次 IRQ 按名称识别为 G38/39→CPU0/1，
+E41/42→CPU2/3，未硬编码沿用上次 IRQ 编号。
+
+四 CPU 各一个独立预分配32MiB的变化内容 TX worker，20秒，
+四条连接全部内容/字节数验证 PASS，NIC error/drop增量0，
+观察572.958 MiB/s。该样本没有 profiler、没有同轮旧 binary 对照，
+不能与此前带 profile 的538.806或496.332直接比较并归因于validator。
+方向保持 G→Jinx、E→Garen host，仅回归功能和观察值。
+
+两卡并行 RX 各32MiB，CPU0/2预先pin父进程再fork，
+完整内容校验 PASS（elapsed G0.392/E0.410s）；Jinx同一个物理口
+提供两 source IP，不作聚合带宽结论，源收到两次OK。
+最后两 NIC均UP，numa0/1，四项 error/drop计数全部0，
+guest error-level dmesg为空，NEW_BINARY_DUAL_NIC_REGRESSION_PASS。
+本次启动guest有 FAT sda15未正常卸载 warning，不等同于error-level为空；
+未修改文件系统或自动修复。Garen既有dirty-page warning未修复，
+本轮host尾部未见新增WARNING/Oops，不能据此保证长期稳定。
+
+所有TX/RX服务正常STOP exit0，临时地址删除，监听消失；
+新巨虚与worker-g4保留。stdin/memfd，无实验文件/新盘/磁盘测试/Lux。
+新代码构建/真实启动/TX/RX已验证；总体性能收益仍需匹配对照。
+下一步审查 BAR/完成路径的查找和同步成本，先确认事件/失效语义，
+不能跳过正在运行的 DMA 完成或仅因 snapshot 未变化缓存检查结果。
