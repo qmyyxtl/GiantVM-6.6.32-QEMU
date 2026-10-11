@@ -4133,3 +4133,64 @@ BCC uprobe 观察到 559019 个 RX 描述符，可分为 27896 个连续同页�
 pending/dropped/outside/errors 均为 0。
 该统计说明存在摊薄调用的机会；probe 本身影响时序，
 不能把理论减少比例当成已实现的 ioctl 或吞吐提升。
+
+#### 同一 QEMU 二进制的 OFF / ON / OFF / ON 验证
+
+功能代码 `2fb129b5b1` 已在 Ezreal、Garen 编译。仅正常关闭/启动 giant guest，
+没有 host reboot、host kernel/module 切换或 guest 源码修改；四个 guest CPU 均在线，
+4GiB / 两 NUMA 节点、guest #26、HPET、两张 X710 VF 与两个现有 1GiB raw 后端不变。
+
+每阶段接收 9 x 256MiB；固定 guest 198.18.10.2:50042 与 Jinx
+198.18.10.3:49162，SO_REUSEADDR、RX RSS 全部导向队列 1，
+IRQ q0/q1 -> CPU0/1，接收进程 CPU0，RPS/XPS 为 0，
+RX/TX ring 512/128、两 queues。无 BCC/perf probe 的性能轮：
+
+| RX page batch | 接收中位数 MiB/s | Garen owner host CPU ms/MiB |
+| --- | ---: | ---: |
+| OFF | 189.952 | 6.194 |
+| ON | 213.665 | 5.378 |
+| OFF 回测 | 172.070 | 6.706 |
+| ON 再测 | 208.967 | 5.729 |
+
+36 个 flow 的精确字节数和固定内容校验均通过，Jinx sender 也收到成功 ACK。
+实际 per-flow 秒数（每行依次对应上表）：
+```
+1.34770664, 1.32799241, 1.38586588, 1.34412617, 1.26758769, 1.31594354, 1.36575653, 1.41490025, 1.40481190
+1.20559569, 1.19813588, 1.15733405, 1.20997279, 1.19124968, 1.14217056, 1.23688604, 1.16616214, 1.28029926
+1.38489367, 1.49469693, 1.48776230, 1.48340989, 1.49156951, 1.56066234, 1.47048406, 1.55277927, 1.45726843
+1.19128794, 1.25143365, 1.22507261, 1.23664967, 1.26829366, 1.17857364, 1.16383369, 1.20808921, 1.24207535
+```
+
+CPU 来源是 QEMU 进程组 /proc/PID/stat 的
+(user + system - guest) / CLK_TCK；内核 account_guest_time 同时增加
+utime/gtime，故减去 guest time。四个阶段分别消耗 14.27、12.39、15.45、
+13.20 host CPU 秒，采样窗口 12.748、11.347、13.875、11.407 秒。
+这些是 NIC owner QEMU 的整体 host CPU，包含它的 DSM/VFIO/其它处理，
+不包含 Ezreal slave 总成本或独立 kernel threads，也不能称为纯非 DSM 成本。
+RSS key 每次启动变化，但所有 entries 均强制为 1；host 线程与内存落点仍可能变化，
+所以当前结果支持优化方向，不保证固定提升比例或长时间稳定吞吐。
+
+独立 BCC 计数轮（每阶段另收 3 x 256MiB，均校验通过；不作性能比较）：
+- OFF pin/unpin 各 1117892 次，ON 各 584095 次，减少 47.750%。
+- OFF 32-byte pin 558704 次，ON 1819 次；ON 增加的较长 pin
+  包含按页分批的 RX 描述符，不能把“32-byte pin减少”直接当作总调用下降。
+- 所有 kernel copy / pin / unpin 与被观测的单描述符 API 返回错误为 0，
+  BPF dropped / pending / ordered_pending 均为 0，结束后 detach / cleanup。
+- 小范围 payload 写仍然存在，OFF/ON <=8-byte write 579265 / 588620 次；
+  payload read 约 559k 次、payload pin/unpin 仍占主要剩余调用。
+  需要继续定位，不能把当前改动视为已经实现“只剩 DSM 开销”。
+
+ON 状态下两卡并发接收各 256MiB 通过（Garen 2.691s，Ezreal 4.342s）；
+最终 ON guest 又完成 G/E/DUAL 三种发送功能检查，各卡两 workers、每种 6 秒，
+共 8 flow，Jinx 字节数和内容全部匹配。单轮 G/E/DUAL 分别
+779.085/622.190/353.666 MiB/s，仅作功能记录，没有对应 OFF TX 对照。
+Jinx 两目标地址共享一条 10GbE 链路，这不是双卡线性扩展验证。
+
+四阶段硬件 rx_discards 末值分别 53/0/0/51；最终 enp0s7 rx_dropped=51、
+enp0s8=0，两卡 rx_errors/tx_errors/tx_dropped=0，guest dmesg error 为空。
+因此不能宣称已消除丢包或 TCP 重传；本轮未修改重传处理。
+结束后 enp0s7 RSS equal 2 已恢复（0/1交替），四 CPU 在线、HPET、
+IRQ q0/q1 local / remote 分布不变。两 host 当前保留
+`LOOM_VFIO_RX_PAGE_BATCH=1`（代码默认仍关闭），PIN=1、ORDERED=1、EARLY=0。
+测试 source/sinks 均收到 STOPLOOM 并 EXIT0，Jinx aliases 删除，未留实验文件。
+Garen 无关 worker-g4 PID6122 未动；未使用 Lux，未重测已接受的磁盘读写。
