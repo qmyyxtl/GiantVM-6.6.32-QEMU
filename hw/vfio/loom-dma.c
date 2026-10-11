@@ -1488,6 +1488,28 @@ int loom_vfio_dma_read_pool(VFIOContainerBase *bc, hwaddr iova,
     if (!destination || !size || iova + size < iova) {
         return -EINVAL;
     }
+    /*
+     * Native single-page reads can validate the registration and reuse its
+     * staging pointer with one lookup. The pointer is already maintained by
+     * registration/slicing; invalidation retires buffers before pool storage.
+     * Cross-page and legacy layouts retain full preflight before any copy.
+     */
+    if (bc->loom_dma->page_indexed && size <= 4096 &&
+        (iova & 4095) + size <= 4096) {
+        LoomDMABuffer *b = buffer_at(bc->loom_dma, iova);
+
+        if (!b) {
+            return -ENOENT;
+        }
+        if (b->pool && iova >= b->iova &&
+            iova - b->iova <= b->size &&
+            size <= b->size - (iova - b->iova)) {
+            smp_rmb();
+            memcpy(destination, b->pool + iova - b->iova, size);
+            smp_rmb();
+            return 0;
+        }
+    }
     if (!loom_vfio_dma_range_covered(bc, iova, size)) {
         return -ENOENT;
     }
