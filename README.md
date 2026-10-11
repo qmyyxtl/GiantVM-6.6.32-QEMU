@@ -5885,3 +5885,90 @@ PF统计异步更新，不能仅凭观察窗口确定真实丢弃发生的具体
 全部测试stdin/memfd，无实验文件/新盘，不测Lux/磁盘。
 整体目标仍未完成，下一步需要按实际完成路径量化剩余描述符扫描、
 重复快照/发布及本地锁定成本，区分DSM等待后再选优化。
+
+### 当前版本 CPU 栈与变化内容对照：扫描不是最大热点
+
+功能版本仍68e1ecf5a7，两端QEMU PID405757/870197；
+guest #26、四CPU、HPET、combined2、RSS/XPS固定q1及owner开启配置不变。
+本轮不改guest或QEMU功能源码，不重启，不测Lux/磁盘。
+
+双卡四worker、parent创建前绑核，发送持续30秒；
+G→Jinx10.3、E→Garenhost11.1（后者host与Gowner共用）。
+两端perf cpu-clock:H、49Hz、DWARF8192，TGID范围、采样20秒，
+record及script均退出0，perf数据保存在memfd，不生成perf.data文件。
+完整报告轮G1023/E958个有栈样本，bad0。
+这只覆盖owner QEMU TGID的host CPU，不覆盖guest CPU、其他TGID，
+不计off-CPU等待；采样占比不能直接当吞吐或壁钟时间占比。
+
+|调用栈分类|G样本|E样本|
+|---|---:|---:|
+|含DSM/ivy_/krdma函数|451|450|
+|设备路径且栈中无上述函数|235|203|
+|其他RDMA router RPC|11|35|
+|其他|326|270|
+
+约44.1%/47.0%样本含DSM家族函数；这是互斥的栈匹配分类，
+不证明“设备且无DSM帧”是全部纯设备成本，调用栈可能不完整。
+真实符号来自perf、kernel kallsyms、已验证加载地址的QEMU nm size；
+对stripped共享库的addr2line返回值仅作符号提示，可能指最近导出符号。
+例如G libc的pthread_condattr_setpshared/__nss_database_lookup提示
+不能据此当线程真实函数或DNS热点。报告里的unknown_leaf0只表示
+提示替换了文本，不证明共享库每个隐藏函数已经准确解析。
+QEMU扫描函数和下列kernel DSM锁路径不依赖这些共享库提示。
+
+G mutex_spin_on_owner第一栈帧86个，其中至少80明确为
+mutex_lock→dsm_lock→__kvm_dsm_acquire_page→KVM page fault；
+E66个，其中至少58为相同路径。
+G _raw_spin_unlock_irqrestore150个，其中88沿
+mlx5_ib_poll_cq→krdma_poll→krdma_send→kvm_dsm_fetch，
+另21沿同路径并包含kvm_dsm_invalidate。
+E140个，至少84+9+9+6沿DSM fetch的poll/send/receive/post_send路径。
+没有把这些锁热点归因于QEMU BQL；也没有改DSM或RDMA锁。
+
+TX类型检查tx_snapshot_types_valid第一栈帧G14/E21，
+约1.37%/2.19%；skip_matching_bytes G18/E16，约1.76%/1.67%。
+扫描栈分别来自MSI-X完成、队列doorbell、interrupt-control BAR写；
+不能仅因存在多个调用点就认定同一次BAR写重复执行：
+helpers.c:vfio_region_write在physical handler返回成功时goto written，
+不会继续执行vfio_loom_sync_write。physical_critical之外的interrupt
+控制写走后者，这是不同操作。未删除任何完成同步或硬件写回检查。
+源码确实遍历全部enabled TX队列；跳过低流量队列仍需正确的
+提交/写回/注册失效证明，当前数据不支持把它当主要吞吐瓶颈。
+
+两轮带perf的30秒流量约598.810/606.606 MiB/s，内容/字节数PASS，
+错误/丢弃增量0；带采样，不作为新旧版本性能收益结论。
+第一轮报告因输出限额截断，不用它做完整栈归因；
+第二轮保留完整报告并增加锁/扫描栈和共享库提示解析。
+服务到TTL后正常退出0、清理IP；之后发STOP遇到超时/拒绝连接，
+检查session确认已经终止，没有据观察失败重启或重开原服务。
+
+#### 匹配内存规模的重复内容 vs 变化内容
+
+原发送测试每worker使用重复字节，可能让baseline比较跳过payload复制；
+不能只用该模式评估本地复制成本。本轮对照两种模式每worker都在
+GO前、对应CPU上创建32个独立1MiB bytes对象，合计32MiB；
+四worker合计128MiB，parent创建前绑核、四CPU、每轮6秒。
+都按32块循环发送；重复模式块内容相同，变化模式每块字节标签不同，
+worker标签空间分开。生成不在发送计时窗口，没有边发边填buffer。
+接收方按绝对流位置核验每个1MiB块，并处理recv跨块边界；
+可以检测跨块陈旧内容，不声称这是逐包序号/任意随机内容验证。
+两模式都采用同一接收检查代码，不改队列、IRQ或启动配置。
+
+|pair|重复 MiB/s|变化 MiB/s|
+|---|---:|---:|
+|0|630.006|596.293|
+|1|654.599|599.975|
+|2|631.547|624.668|
+
+三组交替顺序，变化模式三组均低；
+中位数631.547/599.975，变化低约5.00%。
+六轮24条流全内容/字节数PASS，流量窗口错误/丢弃增量均0。
+样本少、分配页/DSM/调度和接收检查开销仍可能影响结果；
+没有测复制总字节或DSM密度，不能把5%全部归因于memcpy/merge。
+也不能与此前单1MiB发送buffer约610直接相减，内存规模不同。
+下一步应对两模式量化实际staging复制字节/变化区间数，
+再决定是否优化merge/publication，避免继续追逐只占少量样本的检查。
+
+新接收服务STOP正常退出0，Jinx临时IP删除，监听消失；
+guest内核/HPET保持，两个聚合owner及worker6122保留。
+测试仅stdin/memfd，无实验文件/新盘。整体目标尚未完成。
