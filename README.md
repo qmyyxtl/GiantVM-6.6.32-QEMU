@@ -4478,3 +4478,53 @@ Garen NIC guest rx_dropped=1（本轮开始已有1，结束仍1），其他NIC e
 两块原1GiB盘仍在。运行保留两个组合开关ON；代码默认仍均OFF。
 Garen实际QEMU35567、Ezreal794998。Jinx source/sinks STOPLOOM后EXIT0，aliases清理。
 未动Lux，未重启host，未改guest源码；本轮只有README更新。
+
+### RX registration generation 同页查询复用（67315bb40b）
+
+rx_slot_set/valid对同4KiB页的首尾地址在单次调用中复用generation；
+仍校验两个保存endpoint，不保留跨调用pointer/cache，跨页仍独立查询。
+valid补齐size/overflow防御；缺失、write-only/nonindexed返回0、unmap与重新注册
+代次变化保持失效。底层page_generation只在page_indexed情况下返回代次，
+buffer_at以iova/4096为key；现有序列化调用中同页两endpoint等价。
+
+Ezreal/Garen编译与diff-check PASS。memfd提取生产函数和a2adc5481b旧函数做
+ASAN+UBSAN差分264004 cases两端PASS：1..4096随机长度、跨页/同页、
+高地址、stale首/尾代次、撤销/重新注册/不可用映射、非法长度与overflow。
+正常同页set/valid各2->1查询；跨页保持2；未改变DMA/descriptor发布顺序。
+
+实机各9x256MiB无探针，旧运行binary d2384d9eba -> 新binary 67315bb40b，
+组合REARM/PAYLOAD/PAGE/EARLY/PIN/ORDERED=1；host CPU/memory node0，
+四guest CPU/4GiB/两NUMA/#26/HPET，RSS全q1/IRQ CPU1/receiver CPU0/端口50042。
+
+| 代码 | RX中位数 MiB/s | owner host CPU ms/MiB |
+| --- | ---: | ---: |
+| old | 262.099 | 4.484 |
+| new | 251.094 | 4.870 |
+
+未证明吞吐或CPU收益，本轮新代码读吞吐较低、CPU消耗较高。
+旧运行经历之前CPU offline/restore且uptime较长，新运行重新启动；
+启动时间/内存分配/RSS key有差异；只有一次跨启动对照，不能隔离代码因果。
+保留正确且可证明少一次查询的改动，不能当作网卡已提速证据。
+原始每flow秒数：
+```
+old: 0.94378758, 0.90328401, 0.96428568, 1.02464068, 1.00610260, 0.93085878, 0.97673097, 1.00468695, 1.00315521
+new: 0.92323437, 0.91769624, 1.01953699, 1.02241172, 1.02625192, 1.04012225, 0.93074669, 1.06619572, 0.92135540
+```
+owner hostCPU seconds old 10.33/new 11.22，
+(user+system-guest)/CLK_TCK；非全机、非纯非DSM。
+18个单卡性能flow精确长度/内容/ACK全部PASS；
+另两卡同时接收各256MiB，Garen4.399s/Ezreal4.959s，内容PASS，仅功能验证。
+
+独立带BCC的3x256MiB轮全部PASS，owner进程：
+2048/4096bucket读取合计315789次；write-pin 312202次，与unpin数一致；
+全部observed errors/dropped/pending/ordered_pending=0，probe正常cleanup。
+该窗口18.355s包含背景，bucket不精确独占RX；elapsed_ns包括等待与探针，
+不用作性能/CPU证明。未做匹配旧代码计数，未归因于本次generation修改。
+这验证组合优化仍生效，但每MiB仍有较多copy/pin ioctl边界，下一步应审查
+调用批处理或完成扫描成本，保留DSM ownership与失效机制。
+
+最终四CPU在线、HPET/RSS equal2、两原1GiB盘保持；
+两卡guest error/drop计数0、dmesg error为空。
+Garen实际QEMU46128（wrapper9747），Ezreal797466（wrapper33710），运行新代码。
+Jinx source STOPLOOM/EXIT0、测试aliases删除，探针均退出。
+未改guest源码、未动Lux/host内核、未创建实验文件；仅改QEMU源及README。
