@@ -4361,3 +4361,120 @@ Ezreal actualQEMU793245，REARM_BATCH=0、PAYLOAD_BATCH=0，代码默认均关�
 source STOPLOOM / EXIT0、aliases删除、所有本轮探针退出，未产生实验文件。
 未动Lux、guest源码和磁盘；下一步需检查逐changed-run处理与完成发布成本，
 并验证两个同页优化组合，而非直接宣称只剩DSM额外开销。
+
+### RX 两个同页优化组合及远端 CPU offline 对照（2026-10-11）
+
+功能版本 d2384d9eba，同一 binary，RX_REARM_BATCH/RX_PAYLOAD_BATCH 同时
+OFF -> ON -> OFF -> ON，各9 x 256MiB；性能轮不加探针。
+固定host CPU/memory node0、guest四CPU/4GiB/两NUMA/#26/HPET，
+receiver CPU0、RSS全q1、IRQ CPU1、端口50042。其他PAGE/EARLY/PIN/ORDERED均1。
+第一次OFF沿用已有启动；后三阶段重新启动，uptime不同。
+
+| 组合 | 接收中位数 MiB/s | owner host CPU ms/MiB |
+| --- | ---: | ---: |
+| off | 242.323 | 5.048 |
+| on | 259.701 | 4.701 |
+| off2 | 224.198 | 5.425 |
+| on2 | 253.199 | 4.779 |
+
+36 flows长度、内容、sender ACK全PASS。owner host CPU=(user+system-guest)/CLK_TCK，
+不是整机或纯非DSM成本；OFF基线有波动，不宣称精确或长期稳定的提升。
+每flow秒数：
+```
+off: 1.09384634, 1.09980687, 1.05644299, 1.12041736, 1.01797175, 1.04879838, 1.05395756, 1.12626601, 1.02766606
+on: 1.16241642, 0.97753121, 0.98574720, 1.02884295, 1.03063891, 0.98160796, 0.96580648, 1.06443645, 0.97011530
+off2: 1.36560704, 1.17015009, 1.18932120, 1.09523087, 1.23013156, 1.08221713, 1.11904657, 1.13707402, 1.14184684
+on2: 0.96310990, 1.04397155, 1.01106311, 0.96838712, 1.08896009, 0.98002767, 0.96368242, 1.08714649, 1.07978479
+```
+
+独立24s、99Hz owner CPU perf采样（带探针轮不纳入带宽对比）：
+2035有效samples，无bad sample。inclusive pair payload约11.06%、rearm pair约6.54%、
+g_hash_table_lookup约4.42%、skip_matching_bytes约3.59%、invalidate_and_set_dirty约1.08%。
+这些inclusive比例重叠，不能相加，也不代表等待时间；仅采样owner QEMU。
+按栈中名称分类不能完整排除DSM；ioctl中可能包含DSM。未证明只剩DSM。
+同页buffer首尾注册generation查询仍重复，是下一步可审查的优化点，本轮未改该代码。
+ON2两卡单独/同时TX功能共8flows精确长度及内容校验PASS；无匹配OFF TX性能轮，
+不作为组合优化的TX收益证据。performance阶段hardware rx_discards末值0/0/0/1，
+未宣称消除丢包或TCP重传。
+
+随后保持ON2同一次启动，guest CPU0/1固定本地任务；CPU2/3在线 -> offline -> 恢复在线。
+确认lscpu node0=CPU0/1、node1=CPU2/3。本地Garen VF enp0s7 TX到Jinx，
+2workers各6s、每phase3轮；读取Garen owner vda（原1GiB raw），
+O_DIRECT/libaio、1MiB、QD4/worker、2workers、warm2s+measure8s、每phase3轮。
+没有改guest源码，没有产生实验文件；该raw后端结果不等同真实物理盘极限。
+
+| guest CPU | 单卡TX中位数 MiB/s | 本地单盘read中位数 MiB/s |
+| --- | ---: | ---: |
+| ONLINE_BEFORE | 805.593 | 1997.500 |
+| REMOTE_OFFLINE | 1098.108 | 2022.250 |
+| ONLINE_RESTORED | 722.091 | 1988.375 |
+
+原始samples：
+```
+{
+  "ONLINE_BEFORE": {
+    "NIC": {
+      "samples": [
+        805.5931660525573,
+        695.1546878472865,
+        964.9407434821591
+      ],
+      "median": 805.5931660525573
+    },
+    "DISK": {
+      "samples": [
+        2000,
+        1931.125,
+        1997.5
+      ],
+      "median": 1997.5
+    }
+  },
+  "REMOTE_OFFLINE": {
+    "NIC": {
+      "samples": [
+        845.6008832878584,
+        1098.1081024784962,
+        1098.2044405695128
+      ],
+      "median": 1098.1081024784962
+    },
+    "DISK": {
+      "samples": [
+        2023.25,
+        1958.5,
+        2022.25
+      ],
+      "median": 2022.25
+    }
+  },
+  "ONLINE_RESTORED": {
+    "NIC": {
+      "samples": [
+        807.5847062946585,
+        722.0907896340591,
+        714.8652639826252
+      ],
+      "median": 722.0907896340591
+    },
+    "DISK": {
+      "samples": [
+        1988.375,
+        1915.125,
+        1991.125
+      ],
+      "median": 1988.375
+    }
+  }
+}
+```
+
+此轮offline TX明显提高且恢复后回落；读盘仅约1.24%变化。
+每phase只有3轮、TX端口/RSS流分布及TCP重传有变化，未同步采集DSM计数，
+不能据此证明DSM因果或长期稳定收益。offline不关闭slave QEMU/设备owner/DSM，
+也不禁止访问远端memory；不能用它替代设备聚合优化。
+最后CPU0-3、IRQ原亲和性、RSS equal2均恢复，HPET不变，guest dmesg error为空。
+Garen NIC guest rx_dropped=1（本轮开始已有1，结束仍1），其他NIC error/drop计数0。
+两块原1GiB盘仍在。运行保留两个组合开关ON；代码默认仍均OFF。
+Garen实际QEMU35567、Ezreal794998。Jinx source/sinks STOPLOOM后EXIT0，aliases清理。
+未动Lux，未重启host，未改guest源码；本轮只有README更新。
