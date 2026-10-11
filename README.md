@@ -4009,3 +4009,92 @@ CPU0–3/HPET、两NIC UP/2queues512128/data IRQ36/37/39/40→0/1/2/3，
 Garen独立worker-g4 PID6122仍运行、未操作；临时流量源和接收端均已退出。
 下一步定位剩余约59万次短写与CPU开销，并做同规格native对照；
 不把双卡吞吐问题或长期映射/reset限制当已解决。
+
+## 2026-10-11：剩余短写归因与提前 payload pin（暂不启用）
+
+候选 `398ab02b19`、默认快速判断修正 `4b6bc5f6fb`；
+仅 hw/vfio/loom-dma.c，guest/host kernel/HPET 均未改、未操作Lux或重新测磁盘。
+上文 ordered descriptor 与 bounded pin 保持开启。
+新 `LOOM_VFIO_PUBLICATION_EARLY_PIN=1` 默认关闭，
+仅在 container 创建时读取，wrapper sudo env传入；0为旧发布策略。
+
+先在上轮正在运行的PIN1/ORDERED1进程4114115采样：
+uprobe/uretprobe跟踪 publish_snapshot 的 size，
+kernel probe跟踪同线程进入/返回 kvm_dsm_memcpy 的≤8-byte write。
+768MiB单卡RX，总592,327次短写，其中559,181在size1536的发布上下文，
+占94.40%；该size的API调用559,222次，约每次payload一次。
+size2048为TX ring等发布，不与RX payload混为一类。
+errors/dropped/pending/context残留均0。实际代码确认first changed run独立
+MEMCPY，second run以后才考虑cache/pin，因此不是仅凭栈名猜测。
+这里的归因probe有额外开销，不作为带宽测量。
+
+新候选在physical/BQL/cache/pin条件下，完整view≤4096、
+GPA范围在一4KiB页、至少4段变化时，允许第一段就初始化cache并pin。
+仍由既有acquire核实真实host页/普通可写RAM/DSM/非shared布局、
+接受非负返回；只写变化字节、每段更新baseline/dirty、返回前unpin/RCU cleanup。
+!locked确保成功初始化后第二段不会重复lock/cache/pin。
+pin负返回在第一段之前失败，无部分新写；写失败仍释放，
+unpin失败仍sticky并由VFIO调用方停止VM。unsupported/flag0按既有路径处理。
+first-pin不会扩大为整页复制，DD发布仍由上一节有序API保证。
+最终guard修正将runs/early开关判断前置，EARLY0第一段不查额外
+physical/cache/BQL/page条件；只是等价gate重排，没有改变资格或写顺序。
+ASAN/UBSAN抽取生产函数+外部接口替身：
+merge/pin161,422例、有序发布108,018例PASS（guard后重验），两端build/diff check PASS。
+测试覆盖同时开启/关闭early、CPU未变字节保留、每段失败/partialbaseline、
+正返回7/0、第一段pin负返回、第一段写失败仍unpin、unpin sticky、
+4KiB/跨页/短cache/readonly等回退。替身不证明所有真实长期/异常生命周期。
+
+实际对照binary均为398ab02b19（gate重排前），EARLY0→1→0；
+PIN1/ORDERED1固定，4CPU在线、4GiB/2NUMA、#26、HPET、
+两NIC2queues512/128、RPS/XPS0、data IRQ按名称绑0/1/2/3。
+Jinx10.3→G enp0s7 CPU0，单连接256MiB×3，计数/内容/独立source elapsed均PASS。
+以下无探针，不能用gate修正后的boot替换这些数据：
+| RX MiB/s | r0 | r1 | r2 | median |
+| --- | ---: | ---: | ---: | ---: |
+| OFF | 147.020 | 167.261 | 157.832 | 157.832 |
+| ON | 160.953 | 136.398 | 138.533 | 138.533 |
+| OFF_RESTORED | 150.040 | 142.496 | 171.835 | 150.040 |
+ON低于前后OFF中位数，没有证明带宽改善，故最终**EARLY0**；
+不能归因确定性能回退：host线程/内存落点、DSM状态、TCP4tuple/RSS未固定，
+每组仅短3轮。候选保留用于诊断，不把小syscall减少当成性能收益。
+
+同一候选binary ON/OFF_RESTORED各768MiB，使用相同的copy/pin/orderedAPI probes：
+| 调用 | EARLY0 | EARLY1 |
+| --- | ---: | ---: |
+| write MEMCPY ≤8 | 582759 | 27532 |
+| pin acquire | 1120780 | 1116154 |
+| pin release | 1120780 | 1116154 |
+errors/dropped/pending/ordered_pending均0，pin/release各自平衡。
+前三行合计减少19.99%，只是这些调用数、不是CPU/全syscall/吞吐收益。
+窗口ON22.423s/OFF47.363s有不同idle margins及background/ACK，
+流量相同但不能认为全部其他状态一致；采样速度不并入无探针表。
+
+EARLY1另做24s perf cpu-clock:H/DWARF、memfd、exclude_guest=1已核实，
+2185 samples/22.071 sampled hostCPU seconds；guest重复RX19×256MiB约28s全部PASS，
+窗口不同不能按全部19轮除出CPU/MiB。
+named DSM body19.268%、VFIO_without_namedbody44.439%、OTHER35.103%、RPC1.190%；
+VFIO_ioctl_boundary inclusive24.943%与DSM等重叠，
+VFIO_without_namedbody含ioctl/SRCU/DSM wrapper，**不是纯非DSM CPU**。
+叶子syscall_enter3.753%、mutex_unlock3.616%、mutex_lock2.838%、ioctl3.295%；
+skip_matching_bytes仅约0.412%hostCPU；unknown8.696%仍需归因。
+不能据此继续盲改字节扫描，也不把CPU采样比例当带宽损失比例。
+
+开启组dualRX各256MiB G3.429530s/E5.260372s计数/内容PASS。
+TX各卡2workers×6s每种1轮 G773.348/E554.185/双卡408.827MiB/s，
+8流内容/计数/独立clock PASS，TCP重传仍有；不是TX开关对照或收益证明。
+guest errors空、NIC errors/drops0、4CPU/HPET、两既有1GiB盘枚举正常。
+OFF/ON/OFF_RESTORED均正常poweroff，两端wrapper EXIT0完成VF原driver恢复finally，
+最终gate修正后重新以EARLY0/PIN1/ORDERED1启动；其启动配置核实如下。
+source/sinksSTOP EXIT0、probes cleanup、memfd关闭，没有实验文件/新盘/host reboot。
+FAT/hrtimer/跨CPU printk时间戳warning仍可见，未fsck/未动时钟；
+不能把局部源端clock核实扩展成全系统clock正确性。
+下一步先固定TCP四元组/核对RSS落队列，再做同规格native与hostCPU时间对照，
+区分调度/内存位置/DSM等波动。可再用跨数据块变化的payload补内容校验。
+未知叶子/长期mapping与失效/reset恢复、双卡扩展目标仍未完成。
+
+最终4b6bc5f6fb运行核实：Garen4138637/session7977、Ezreal774756/session80525；
+两端environ均PIN1/ORDERED1/EARLY0、QMP running。guest #26正常登录、
+CPU0–3/HPET、两NIC UP/2queues512128，NIC IRQ37/38/39/40→2/0/3/1，
+两1GiB盘枚举正常，error级dmesg空、NIC四项errors/drops均0。
+Garen worker-g4 PID6122仍运行、未操作；Jinx只剩原管理IP、49161/49162无监听。
+最终gate修正binary只做启动/配置核实，以上性能/流量对照均明确来自398ab02b19。
