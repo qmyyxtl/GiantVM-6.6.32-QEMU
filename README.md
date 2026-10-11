@@ -5972,3 +5972,86 @@ worker标签空间分开。生成不在发送计时窗口，没有边发边填bu
 新接收服务STOP正常退出0，Jinx临时IP删除，监听消失；
 guest内核/HPET保持，两个聚合owner及worker6122保留。
 测试仅stdin/memfd，无实验文件/新盘。整体目标尚未完成。
+
+#### staging 写入量与精确字节扫描（2026-10-11）
+
+在 68e1ecf5a7 的运行实例上，按 TGID 对 buffer_pool_copy 入口/返回挂载
+uprobes。四个 worker 在各自 CPU 上完成 32 MiB 分配并 ready 后才打开
+统计窗口，GO 后发送 6 秒，收到 payload ACK、join 后关闭窗口。
+重复/变化内容使用相同内存规模和接收检查。两端 entry=return，
+错误/嵌套/溢出计数及 pending 均为 0，探针正常卸载。
+
+|模式|payload MiB|成功 staging 写调用|staging 写字节/payload 字节|不超过64B的调用占比|
+|---|---:|---:|---:|---:|
+|重复内容|2157|1149762|0.430967|78.0969%|
+|变化内容|1791|1267487|0.993047|61.9997%|
+
+小写平均分别 3.889/3.916 B，占写字节 0.3582%/0.1650%。
+这些是 helper 的成功 write=true 字节，包括初始化、描述符、控制和
+重复写，不是独立 payload 字节，也不是所有复制的总量；没有包含
+guest→scratch、baseline memcpy、直接 read_pool 等路径。
+带 uprobes 吞吐约 358/298 MiB/s，探针开销明显，不能用于性能收益结论。
+所有流内容/字节数 PASS，错误/丢弃增量 0。
+
+另用变化内容运行、两端各采样 20 秒 cpu-clock:H 49Hz DWARF：
+Garen 1019、Ezreal 930 个样本；第一栈帧 skip_matching_bytes
+分别 32/26（3.14%/2.80%），tx_snapshot_types_valid 18/12。
+扫描主要沿 merge_buffer→sync_to_device_range→physical_stage→BAR 写。
+互斥栈分类 DSM 为 445/484，设备且无 DSM 帧 263/168；
+栈匹配不是整个巨虚成本的准确拆分，不能把其他锁归因于 BQL。
+变化内容吞吐 611.891 MiB/s，采样窗口非性能对照。
+
+代码 a01b18e463 给 skip_matching_bytes 增加 SSE2 16B 比较：
+仍返回第一个相同/不同字节，精确保留原 changed-byte runs，
+不扩大写区间、不跳过 publication、不修改注册/失效或 DSM。
+无 SSE2 时保留标量实现。两端编译和 diff --check 通过。
+QOM /machine 的 loom-dma-byte-scan-simd 在首个 DMA map 创建时动态注册，
+可通过 QMP qom-set/qom-get 切换；它不是启动 -machine 参数。
+SSE2 构建默认开启，无 SSE2 构建默认关闭且拒绝开启。
+
+两端各执行 80000 个随机参考比较用例，覆盖两种谓词、两个模式、
+0..4096 字节、起始位置/尾部/16B lane，以及紧邻 PROT_NONE 的缓冲区
+与另一缓冲区 0..15 非对齐偏移。ASAN/UBSAN、优化构建和
+-U__SSE2__ 的标量编译路径均通过；不是完整非 x86 QEMU 构建验证。
+隔离的“扫描+两次 memcpy”模型还与实际旧函数比较，2048/4096B、
+全变化/稀疏变化/每32B变化4B 三种内容，每组合交替 7 轮，
+两端 SIMD 均 7/7 更快。该模型不包含实际 publication/DSM，
+不能用它推算整个 I/O 收益。
+
+正常关闭旧巨虚并启动新二进制；没有重启 host，guest 源码和
+6.12.0-vanilla-vfio #26、四 CPU、HPET、队列/IRQ 配置保持。
+Garen worker-g4 PID6122 保留。新 owner PID445360/878463，
+两端 /proc/exe 与本次编译 binary hash 一致。
+
+同次启动、变化内容、无探针/无 perf，六组交替 QMP OFF/ON，
+开始前四 worker 已完成分配/连接/ready；窗口到接收 ACK 和 join。
+CPU 为两端 QEMU /proc/PID/stat 的 user+system-guest，HZ=100，
+包括 DSM 和其他 owner 线程，排除 guest CPU，并非纯非 DSM 成本。
+
+|pair|标量 OFF MiB/s|SIMD ON MiB/s|OFF host CPU ms/MiB|ON host CPU ms/MiB|
+|---|---:|---:|---:|---:|
+|0|557.990|569.041|4.367919|3.988304|
+|1|558.684|594.679|3.898154|3.634330|
+|2|560.622|562.148|4.168646|4.166913|
+|3|575.894|559.579|4.258885|4.143367|
+|4|548.900|592.730|4.264929|4.063991|
+|5|556.116|565.234|4.257929|4.234393|
+
+带宽中位数 558.337→567.137 MiB/s（约+1.58%，5/6组更高）；
+host CPU/MiB 中位数 4.258407→4.103679（约-3.63%，6/6组更低）。
+OFF 是新二进制的标量模式，含新模式分支成本，不等同旧二进制；
+旧函数比较仅见前述隔离模型。六组无置信区间，
+不能将全部 CPU 下降归因于扫描，也没有证明线性聚合。
+十二轮 48 条流内容/字节数均 PASS，流量窗口错误/丢弃增量均 0。
+G→Jinx 198.18.10.3，E→Garen host 198.18.11.1：
+后者与 G owner 同 host，仍有接收侧共置限制。
+
+SIMD 开启后两张 NIC 同时接收各 256 MiB，
+G 3.410s/E 3.943s，完整内容 PASS；源两条路径共用 Jinx 一张
+物理 10G NIC，因此这项仅作 RX 功能验证，不作聚合带宽证明。
+结束时 QMP 两端恢复 true，临时接收/发送/CPU 服务监听消失，
+Jinx 临时 IP 删除。最终 guest 两卡 UP、错误/丢弃计数均 0，
+dmesg 错误检查为空，HPET/guest kernel 保持。
+实验仅 stdin/memfd，没有实验文件/新盘，也没有访问 Lux。
+总体目标仍未完成；下一步审查描述符验证的扫描范围和失效条件，
+不依据小比例样本直接删除正确性检查。
