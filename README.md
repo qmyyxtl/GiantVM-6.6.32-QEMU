@@ -4818,3 +4818,35 @@ ON正常poweroff两端EXIT0，随后同二进制恢复WRITE_SCOPED=0，
 两owner各ping3/3 PASS，四CPU在线、HPET、RSS equal2、两盘各1GiB；
 新boot两卡error/drop计数0、guest error级dmesg空。这不覆盖上一boot的discard。
 Jinx两个sink与source均STOPLOOM OK/EXIT0，ports及两alias移除；worker6122仍存活。
+
+
+### RX DD + descriptor 同调用映射复用原型（默认关闭）
+
+LOOM_VFIO_RX_DESC_READ_PAIR=1启用，默认OFF；guest/HPET不改。
+新的loom_vfio_dma_read_rx_descriptor先读8-byte DD状态、原DMA read barrier，
+DD为1时再捕获完整32-byte immutable descriptor；caller仍比较snapshot status
+与先采样word，仍执行长度/status/generation/alias等原检查。
+两个原read_pool barrier pairs全保留。DD0 snapshot不写。
+仅BQL持有、page_indexed、32B对齐、现有同4KiB buffer/map及pool指针一致
+复用本次局部pool地址；不跨调用缓存、不导出DSM地址、不创建map。
+其余布局（跨页、partial/non-indexed、cached pool不匹配等）原scalar两读取；
+read失败返回原错误，捕获前不发布guest内存。
+
+实机旧路径三个256MiB接收任务内容PASS（带probe每轮约8s，非性能基线）：
+RX8-byte calls755050、RX32-byte calls560072；每call均1 map_at+1 buffer_at。
+两段合计1315122次各类lookup，ready描述符重复查找560072次。
+TX2048-byte快照read194978次；其他payload/control reads另计。
+这些是57.683s probe窗口含背景，ns为带多重uprobes的elapsed、不是CPU；
+probe显著扰动吞吐，不用来量化可节省CPU百分比。errors0、active/dropped0、
+probe正常cleanup。
+
+memfd提取实际struct/page_key/map_at/buffer_at/range_covered/pool_copy/
+read_pool/新helper，使用真实GLib索引/链表：
+ASAN+UBSAN30005 cases每mode OFF/ON/invalid PASS。
+差分返回值、status、全snapshot、barrier次数及caller status复核决定；
+四个barrier时点模拟DMA改status/metadata、DD0/1及DD翻转，
+native/read-only/direction变体、非indexed/BQL未持有、pool mismatch/null、
+缺失map或buffer、仅status8B注册、较大map、32B非对齐/跨页/status跨页、
+空container/output/overflow；native ready实际lookup2+2→1+1，DD0仍1+1。
+DMA硬件变化由barrier hook模拟，不是完整硬件等价证明。
+Ezreal build PASS，Garen同步/构建与实机性能待后续记录。source默认OFF。

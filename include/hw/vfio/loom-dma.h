@@ -29,6 +29,10 @@ int loom_vfio_dma_submit_snapshot(VFIOContainerBase *, hwaddr,
                                   const void *, uint64_t);
 /* Device snapshot capture and exact publication; caller orders dependencies. */
 int loom_vfio_dma_read_pool(VFIOContainerBase *, hwaddr, void *, uint64_t);
+/* Disjoint outputs: DD clear leaves snapshot untouched; caller rechecks status. */
+int loom_vfio_dma_read_rx_descriptor(VFIOContainerBase *, hwaddr,
+                                      uint8_t *snapshot, uint64_t *status);
+
 int loom_vfio_dma_publish_snapshot(VFIOContainerBase *, hwaddr,
                                    const void *, uint64_t);
 /* Immutable 32-byte RX writeback: metadata first, DD byte at offset 8 last. */

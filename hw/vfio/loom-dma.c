@@ -1492,6 +1492,63 @@ int loom_vfio_dma_read_pool(VFIOContainerBase *bc, hwaddr iova,
 }
 
 /*
+ * Sample RX DD, then capture a descriptor under the same registration lifetime.
+ * Reuse only an existing native-page pool; no DSM pointer escapes the BQL scope.
+ * Keep both read_pool barrier pairs and let the caller recheck the status word.
+ */
+int loom_vfio_dma_read_rx_descriptor(VFIOContainerBase *bc, hwaddr iova,
+                                      uint8_t *snapshot, uint64_t *status)
+{
+    static int paired = -1;
+    LoomDMABuffer *b;
+    LoomDMAMap *m;
+    uint8_t bytes[8];
+    uint8_t *pool = NULL;
+    hwaddr page = iova & ~4095ULL;
+    int ret;
+
+    if (paired < 0) {
+        const char *mode = getenv("LOOM_VFIO_RX_DESC_READ_PAIR");
+
+        paired = mode && !strcmp(mode, "1");
+    }
+    if (!bc || !bc->loom_dma) {
+        return -ENODEV;
+    }
+    if (!snapshot || !status || iova > UINT64_MAX - 32) {
+        return -EINVAL;
+    }
+    if (paired && bql_locked() && bc->loom_dma->page_indexed &&
+        !(iova & 31)) {
+        b = buffer_at(bc->loom_dma, iova);
+        m = b && b->iova == page && b->size == 4096 && b->pool ?
+            map_at(bc->loom_dma, iova) : NULL;
+        if (m && m->iova == page && m->size == 4096 && m->pool == b->pool) {
+            pool = m->pool + (iova - page);
+        }
+    }
+    if (!pool) {
+        ret = loom_vfio_dma_read_pool(bc, iova + 8, bytes, sizeof(bytes));
+        if (ret) {
+            return ret;
+        }
+        *status = ldq_le_p(bytes);
+        return (*status & 1) ?
+            loom_vfio_dma_read_pool(bc, iova, snapshot, 32) : 0;
+    }
+    smp_rmb();
+    memcpy(bytes, pool + 8, sizeof(bytes));
+    smp_rmb();
+    *status = ldq_le_p(bytes);
+    if (*status & 1) {
+        smp_rmb();
+        memcpy(snapshot, pool, 32);
+        smp_rmb();
+    }
+    return 0;
+}
+
+/*
  * Submit a caller-owned, validated CPU snapshot without rereading guest RAM.
  * BQL pins registration lifetimes throughout preflight and merge. Reject a
  * device-write-only registration before changing any pool or producer baseline.

@@ -967,7 +967,7 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
         for (unsigned n = 0; n < q->rx_count; n++) {
             unsigned slot = (c->rx_next + n) % q->rx_count;
             LoomIAVFRXSlot *posted = &c->rx_slot[slot];
-            uint8_t status[8], *snapshot = c->rx_snapshot + slot * 32;
+            uint8_t *snapshot = c->rx_snapshot + slot * 32;
             uint64_t word;
 
             if (!posted->iova) {
@@ -979,23 +979,18 @@ int loom_iavf_sync_data_completion(VFIODevice *dev)
                 c->seeded = false;
                 return 0;
             }
-            ret = loom_vfio_dma_read_pool(dev->bcontainer,
-                                q->rx_iova + slot * 32ULL + 8, status, 8);
+            /*
+             * DD precedes the immutable descriptor capture through dma_rmb(),
+             * as in the native driver. The helper may reuse a native mapping
+             * within this call; status must still match the captured word.
+             */
+            ret = loom_vfio_dma_read_rx_descriptor(dev->bcontainer,
+                                q->rx_iova + slot * 32ULL, snapshot, &word);
             if (ret) {
                 return ret;
             }
-            word = ldq_le_p(status);
             if (!(word & 1)) {
                 break;
-            }
-            /*
-             * read_pool's DMA read barrier orders the following descriptor
-             * fields after DD, as in the native guest driver's dma_rmb().
-             */
-            ret = loom_vfio_dma_read_pool(dev->bcontainer,
-                                q->rx_iova + slot * 32ULL, snapshot, 32);
-            if (ret) {
-                return ret;
             }
             if (ldq_le_p(snapshot + 8) != word ||
                 ((word >> 38) & 0x3fff) > q->rx_buffer_size ||
