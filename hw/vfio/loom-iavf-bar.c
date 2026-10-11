@@ -190,6 +190,9 @@ int loom_iavf_physical_bar_write(VFIORegion *r, hwaddr addr,
         }
         loom_iavf_reconcile_completion(dev);
         loom_iavf_observe_completion(dev);
+    } else if (!data) {
+        /* AQ publication must retain the original control observer ordering. */
+        loom_iavf_observe_completion(dev);
     }
     if (data) {
         ret = physical_data_write(&p, addr, value);
