@@ -7214,3 +7214,45 @@ MEMTX_ERROR=1代表设备错误，MEMTX_DECODE_ERROR=2代表地址解码失败�
 下一步需要恢复可运行现场后确认失败分类和真实配置序列，
 再将拓扑配置同步放入控制路径，避免在doorbell热路径补查询。
 DSM退出循环的stop处理仍未修改；整体优化目标未完成。
+
+### 2026-10-12：优化后双盘写复测工具准备（尚未产生磁盘结果）
+
+用户明确要求重新测写聚合，并检查是否与双网卡低吞吐共用开销。
+Garen已由用户重启，boot ID f94d0611-4c5b-448a-9945-61ba903bc0c9，
+旧243230/243241挂起实例已消失；worker-g4当前paused PID6922，未操作。
+QEMU两端5cab0d4f2b，原guest #26与HPET保留。
+
+扩展既有scripts/gvm-device-guest-disk-bandwidth.py：
+--workers-per-owner支持1/2，默认2；每worker默认QD4。
+两个本地worker CPU0/1或2/3在绑定后分配缓冲区，
+每个只循环写该owner 1GiB盘的一半，区域不重叠，
+完整预写也按worker分摊，避免两个worker同时覆盖相同offset。
+每阶段drain全部AIO、fsync、回读该worker首块和最后写块验证随机pattern。
+输出总完成带宽与包含全部worker末尾flush的带宽，
+使用各worker最早start到最晚end/flush_end的共同窗口。
+每64个完成才检查计时截止，删除每次io_getevents前后的时间读取，
+以避免测试程序自身高频HPET读取成为额外共享锁负载。
+三轮轮换single0/single1/parallel顺序，分别2/2/4worker，
+两种带宽均单独计算聚合效率。--workers-per-owner 1可重现旧worker数；
+计时频率与默认QD已改变，不能直接与旧测试作代码收益比较。
+
+实际source函数的16MiB/owner memfd控制流检查通过：
+4个独立区域、CPU0-3、真实Linux AIO syscall、完整预写32MiB、
+计时写、drain、fsync和随机pattern回读、flush共同窗口；
+该fixture替换disk解析并用RAM文件、非O_DIRECT，
+仅验证多worker控制流，所有吞吐数不作为存储benchmark结果。
+未创建guest脚本、结果或实验文件；未触碰真实盘。
+计划正式测量：既有1GiB raw后端、1MiB块、每worker QD4，
+单盘2worker/总QD8，双盘4worker/总QD16，8秒、3轮、
+首次完整预写与每阶段fsync/回读；无探针baseline后再做DSM诊断。
+磁盘使用原生virtio-blk、owner IOThread/ioeventfd/MSI-X，
+本轮先不挂VF，避免未解决的PCI bridge启动问题干扰写路径分析。
+
+运行阻塞：Garen重启后ib_ipoib/ib_umad未加载，已加载并恢复
+ibs4f0的172.0.1.4/24及admin UP，但port仍INIT/LID65535，
+到已Active的Ezreal172.0.1.2的ping失败。
+在Garen启动自己的priority0 OpenSM（私有RAM namespace，
+PID在私有/var/log，stdout日志）只进入STANDBY，未接管网络，
+没有变更Lux现有master SM或提高本地SM优先级。
+用户此前说明Lux有人使用、不要在Lux测，因此需协调现有SM
+重新发现Garen端口。未在失败链路上启动巨虚、没有真实磁盘吞吐结果。

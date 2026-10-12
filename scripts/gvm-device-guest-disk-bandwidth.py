@@ -24,7 +24,8 @@ def parse_size(value):
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--owner', type=int, choices=(0,1))
 parser.add_argument('--block-size', type=parse_size, default=1024**2)
-parser.add_argument('--queue-depth', type=int, default=8)
+parser.add_argument('--queue-depth', type=int, default=4)
+parser.add_argument('--workers-per-owner', type=int, choices=(1,2), default=2)
 parser.add_argument('--seconds', type=float, default=15)
 parser.add_argument('--rounds', type=int, default=3)
 parser.add_argument('--prefill-bytes', type=parse_size, default=1024**3)
@@ -34,6 +35,10 @@ args = parser.parse_args()
 BS, QD, SECONDS, ROUNDS = args.block_size, args.queue_depth, args.seconds, args.rounds
 CAPACITY = 1024 ** 3
 PREFILL_BYTES = args.prefill_bytes
+WORKERS = args.workers_per_owner
+REGION = CAPACITY // WORKERS
+if REGION % BS or PREFILL_BYTES % (WORKERS * BS):
+    parser.error('block/prefill must divide evenly across owner workers')
 if BS < 4096 or BS % 4096 or CAPACITY % BS or not 1 <= QD <= 64 or SECONDS <= 0 or ROUNDS < 1:
     parser.error('aligned block size dividing 1 GiB, QD 1--64, positive seconds/rounds required')
 if PREFILL_BYTES < BS or PREFILL_BYTES > CAPACITY or PREFILL_BYTES % BS:
@@ -81,9 +86,9 @@ def disk(owner):
         raise RuntimeError("dedicated 1 GiB disk required")
     return fd
 
-def worker(owner, ready, gate, output, full):
+def worker(owner, index, ready, gate, output, full):
     # Pin before creating the buffer or AIO context: first-touch belongs to owner.
-    cpu = (0, 2)[owner]
+    cpu = owner * 2 + index
     os.sched_setaffinity(0, {cpu})
     fd = disk(owner)
     buffers = []
@@ -105,18 +110,22 @@ def worker(owner, ready, gate, output, full):
         os.write(ready, b"R")
         os.read(gate, 1)
         start = time.monotonic()
+        last_clock_check = 0
+        running = True
+        target_blocks = PREFILL_BYTES // (WORKERS * BS)
+        region_start = index * REGION
         deadline = start + SECONDS
         sent = completed = inflight = 0
-        weighted_depth = wait_time = 0.0
         peak = 0
         stalls = 0
         while True:
-            running = sent < PREFILL_BYTES // BS if full else time.monotonic() < deadline
+            if full:
+                running = sent < target_blocks
             if running and free:
-                wanted = min(len(free), PREFILL_BYTES // BS - sent) if full else len(free)
+                wanted = min(len(free), target_blocks - sent) if full else len(free)
                 chosen = free[:wanted]
                 for n, i in enumerate(chosen):
-                    cbs[i].offset = ((sent + n) % (CAPACITY // BS)) * BS
+                    cbs[i].offset = region_start + ((sent + n) % (REGION // BS)) * BS
                 pointers = (C.POINTER(IOCB) * wanted)(*[C.pointer(cbs[i]) for i in chosen])
                 accepted = call(209, ctx, C.c_long(wanted), pointers)  # io_submit
                 if accepted:
@@ -128,12 +137,8 @@ def worker(owner, ready, gate, output, full):
                 if not running:
                     break
                 raise RuntimeError("AIO submit made no progress")
-            before = time.monotonic()
             count = call(208, ctx, C.c_long(1), C.c_long(QD),
                          events, C.byref(timeout))  # io_getevents
-            waited = time.monotonic() - before
-            weighted_depth += inflight * waited
-            wait_time += waited
             if not count:
                 stalls += 1
                 if stalls > 30:
@@ -148,19 +153,26 @@ def worker(owner, ready, gate, output, full):
                 free.append(event.data)
                 completed += 1
                 inflight -= 1
+            # Avoid a shared HPET read for every submit/completion batch.
+            if not full and completed - last_clock_check >= 64:
+                running = time.monotonic() < deadline
+                last_clock_check = completed
+        assert completed == sent and not inflight
         end = time.monotonic()
         os.fsync(fd)
         flushed = time.monotonic()
-        if full:
-            for offset in (0, PREFILL_BYTES - BS):
-                if os.preadv(fd, [memoryview(buffers[0])], offset) != BS or buffers[0][:] != pattern:
-                    raise RuntimeError("prefill data verification failed")
+        if not completed:
+            raise RuntimeError("no completed writes")
+        last_offset = region_start + ((completed - 1) % (REGION // BS)) * BS
+        for offset in {region_start, last_offset}:
+            if os.preadv(fd, [memoryview(buffers[0])], offset) != BS or buffers[0][:] != pattern:
+                raise RuntimeError("write readback verification failed")
         usage = os.times()
-        result = dict(owner=owner, cpu=cpu, bytes=completed * BS, elapsed=end-start,
+        result = dict(owner=owner, worker=index, cpu=cpu, bytes=completed * BS, elapsed=end-start,
                       flush_seconds=flushed-end, mib_s=completed*BS/(1024**2)/(end-start),
-                      flushed_mib_s=completed*BS/(1024**2)/(flushed-start), start=start, end=end,
+                      flushed_mib_s=completed*BS/(1024**2)/(flushed-start), start=start, end=end, flush_end=flushed, verified=True,
+                      region_start=region_start, region_bytes=REGION,
                       queue_depth_peak=peak,
-                      queue_depth_during_wait=weighted_depth/wait_time if wait_time else 0,
                       cpu_seconds=usage.user+usage.system, prefill=full)
         os.write(output, (json.dumps(result) + "\n").encode())
     finally:
@@ -173,8 +185,8 @@ def worker(owner, ready, gate, output, full):
 
 def phase(name, owners, full=False):
     children = []
-    emit("BENCH_PREPARE", dict(name=name, owners=owners, bs=BS, qd=QD))
-    for owner in owners:
+    emit("BENCH_PREPARE", dict(name=name, owners=owners, workers=len(owners)*WORKERS, bs=BS, per_worker_qd=QD))
+    for owner, index in [(o, i) for o in owners for i in range(WORKERS)]:
         ready_r, ready_w = os.pipe()
         gate_r, gate_w = os.pipe()
         out_r, out_w = os.pipe()
@@ -185,7 +197,7 @@ def phase(name, owners, full=False):
                     for fd in entry[1:]:
                         os.close(fd)
                 os.close(ready_r); os.close(gate_w); os.close(out_r)
-                worker(owner, ready_w, gate_r, out_w, full)
+                worker(owner, index, ready_w, gate_r, out_w, full)
                 os._exit(0)
             except BaseException:
                 traceback.print_exc()
@@ -213,8 +225,11 @@ def phase(name, owners, full=False):
         results.append(result)
     duration = max(r["end"] for r in results) - min(r["start"] for r in results)
     total = sum(r["bytes"] for r in results) / (1024**2) / duration
+    flush_duration = max(r["flush_end"] for r in results) - min(r["start"] for r in results)
+    flushed_total = sum(r["bytes"] for r in results) / (1024**2) / flush_duration
     obj = dict(name=name, owners=owners, results=results, total_mib_s=total,
-               common_window_seconds=duration)
+               flushed_total_mib_s=flushed_total,
+               common_window_seconds=duration, flushed_window_seconds=flush_duration)
     emit("BENCH_END", obj)
     return obj
 
@@ -222,7 +237,8 @@ if os.uname().machine != "x86_64" or C.sizeof(IOCB) != 64:
     raise RuntimeError("x86_64 Linux AIO ABI required")
 owners = [args.owner] if args.owner is not None else [0,1]
 emit("BENCH_CONFIG", dict(block_size=BS, queue_depth=QD, seconds=SECONDS,
-                         rounds=ROUNDS, owners=owners, prefill_bytes=PREFILL_BYTES,
+                         rounds=ROUNDS, owners=owners, workers_per_owner=WORKERS,
+                         prefill_bytes=PREFILL_BYTES,
                          full_device_prefill=not args.skip_prefill and PREFILL_BYTES==CAPACITY))
 if not args.skip_prefill:
     phase("prefill-local", owners, full=True)
@@ -239,10 +255,15 @@ for round_no in range(1, ROUNDS + 1):
 summary = {}
 for name in sorted(set(r["name"].rsplit("-r",1)[0] for r in all_results)):
     values = [r["total_mib_s"] for r in all_results if r["name"].startswith(name+"-")]
-    summary[name] = dict(median_mib_s=statistics.median(values),samples_mib_s=values)
+    flushed_values = [r["flushed_total_mib_s"] for r in all_results if r["name"].startswith(name+"-")]
+    summary[name] = dict(median_mib_s=statistics.median(values), samples_mib_s=values,
+                         median_flushed_mib_s=statistics.median(flushed_values),
+                         samples_flushed_mib_s=flushed_values)
 if args.owner is None:
     summary["gain_vs_best_single"] = summary["parallel"]["median_mib_s"] / max(
         summary["single0"]["median_mib_s"],summary["single1"]["median_mib_s"])
     summary["ratio_to_separate_single_sum"] = summary["parallel"]["median_mib_s"] / (
         summary["single0"]["median_mib_s"] + summary["single1"]["median_mib_s"])
+    summary["flushed_ratio_to_separate_single_sum"] = summary["parallel"]["median_flushed_mib_s"] / (
+        summary["single0"]["median_flushed_mib_s"] + summary["single1"]["median_flushed_mib_s"])
 emit("BENCH_SUMMARY",summary)
