@@ -6,6 +6,36 @@ ulimit -c 0
 node=${1:?Usage: gvm-device-node.sh 0|1 [additional QEMU arguments]}
 shift
 case "$node" in 0|1) ;; *) echo 'node must be 0 or 1' >&2; exit 2 ;; esac
+
+# Reject stale or sudo-filtered node addresses before creating a KVM VM.
+read -r -a cluster_ips <<< "${GVM_IPLIST:-172.0.1.2 172.0.1.3}"
+if [[ ${#cluster_ips[@]} != 2 ]]; then
+    echo 'GVM_IPLIST must contain exactly two IPv4 addresses' >&2
+    exit 2
+fi
+python3 - "$node" "${cluster_ips[@]}" <<'PY'
+import ipaddress
+import json
+import subprocess
+import sys
+
+node = int(sys.argv[1])
+addresses = sys.argv[2:]
+try:
+    if any(ipaddress.ip_address(a).version != 4 for a in addresses):
+        raise ValueError("IPv4 addresses required")
+    if addresses[0] == addresses[1]:
+        raise ValueError("node addresses must be distinct")
+    links = json.loads(subprocess.check_output(["ip", "-j", "-4", "addr", "show"]))
+    local = {a["local"] for link in links for a in link.get("addr_info", [])
+             if a.get("family") == "inet"}
+    if addresses[node] not in local:
+        raise ValueError(f"node {node} address {addresses[node]} is not assigned "
+                         "on this host; pass GVM_IPLIST explicitly through sudo env")
+except (ValueError, OSError, subprocess.CalledProcessError) as error:
+    print(f"GVM startup address validation failed: {error}", file=sys.stderr)
+    sys.exit(2)
+PY
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 export LOOM_DEVICE_AGGREGATION=1
 machine=${GVM_MACHINE:-pc}

@@ -7256,3 +7256,38 @@ PID在私有/var/log，stdout日志）只进入STANDBY，未接管网络，
 没有变更Lux现有master SM或提高本地SM优先级。
 用户此前说明Lux有人使用、不要在Lux测，因此需协调现有SM
 重新发现Garen端口。未在失败链路上启动巨虚、没有真实磁盘吞吐结果。
+
+### 2026-10-12：IB 恢复及写复测启动失败定位
+
+用户允许检查Lux现有SM后，只读核实OpenSM PID3204在mlx5_2运行，
+无/etc/opensm/opensm.conf；服务日志显示Garen重启期间被移除，
+当前节点未重新发现。核实本机man对HUP重扫语义及signal handler后，
+向该现有进程发一次HUP，日志实际记录HEAVY SWEEP、
+Switch port3 DOWN→INIT。Garen随后ACTIVE/LID2，
+Garen/Ezreal IPoIB双向各2包通过，Ezreal→Garen rping5次数据校验、
+server/client均退出0。没有在Lux跑性能测试、替换SM或改优先级。
+
+首次磁盘启动的wrapper在sudo外设置GVM_IPLIST，
+sudo过滤后裸gvm-device-node.sh采用旧默认172.0.1.2/172.0.1.3。
+这是本次启动配置错误。实际Ezreal cmdline及两端kernel
+rdma_bind_addr -99确认错误地址，guest未启动，真实数据盘未写。
+Garen router初始化失败退出；Ezreal等待错误peer，
+实验进程终止后两端都在kvm_dsm_free→kthread_stop挂起：
+Garen43714、Ezreal149521；已没有对应kvm-dsm根线程，
+内核记录__kthread_bind WARN，支持停止已退出线程的生命周期问题，
+不同于先前无消息receive不检查stop的情况；新receive取消模块
+也没有覆盖这类早期root线程退出。尚未修复该生命周期缺口。
+
+已把正确IP/HPET放入sudo env显式参数；
+后续启动因旧QMP4444仍占用而在创建VM前失败，未重复启动更多实例。
+新加启动预检：在创建KVM VM前检查两节点地址为不同IPv4，
+确认本节点地址在host实际网卡上。错误/被sudo过滤的地址直接exit2。
+bash语法检查通过；在Ezreal实际source guard的5项检查通过：
+正确node1、错误node0、重复地址、非IPv4、数量不符；
+测试仅执行guard、不创建QEMU或KVM VM。
+
+真实写聚合仍未产生结果，benchmark准备不能替代性能测量。
+两端IB已Active，但需先清理host WARN/hung实例后恢复测试；
+遵循用户此前先重启报错host、再编译内核的顺序，
+本轮未在报错host编译/安装新内核，guest/HPET未改。
+Garen worker-g4 PID6922保持paused，未保存、停止或重启。
