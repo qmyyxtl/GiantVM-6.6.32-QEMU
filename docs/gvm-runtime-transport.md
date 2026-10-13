@@ -71,6 +71,7 @@ Garen（master）：
 ```bash
 sudo env GVM_IPLIST="10.0.16.104 10.0.16.91" \
   GVM_GUEST_KERNEL=/home/xtl/GVM-guest-kernel/arch/x86/boot/bzImage \
+  GVM_GUEST_EXTRA_ARGS="clocksource=hpet isolcpus=domain,1-3" \
   GVM_QUIET=1 LOOM_RDMA_RECV_CQ_EVENTS=1 \
   numactl --cpunodebind=0 --membind=0 \
   /home/xtl/GVM-qemu/scripts/gvm-device-disk-node.sh 0 method=tcp
@@ -145,7 +146,8 @@ build/tests/unit/test-gvm-transport
 - KVM：<https://github.com/xue-123-song/GVM-kernel>。
   `a1b61042a` 实现 per-VM 传输选择和双后端适配；
   `b881d0e91` 修复 TCP 等待期间的退出响应；
-  `19e2a7b15` 提供模块加载脚本。
+  `19e2a7b15` 提供模块加载脚本；
+  `fdb8ce2d9` 修复普通 vCPU 唤醒信号中断 TCP DSM 事务的问题。
 
 QEMU 参数入口为 `system/vl.c`，KVM ioctl 设置在 `hw/i386/pc.c`；
 TCP 帧收发在 `migration/gvm-transport.c`，控制消息在
@@ -161,7 +163,7 @@ KVM 适配层为 `arch/x86/kvm/dsm-network.c`，TCP 实现在同目录 `ktcp.c`�
 
 环境为 Garen node 0、Ezreal node 1；host `6.6.32-krdma+`，guest
 `6.12.0-vanilla-vfio #26`，4 vCPU / 4 GiB、HPET、`-nic none`。
-本轮没有修改 guest 源码，没有重启 host，也没有运行吞吐对比。
+本轮没有修改 guest 源码，也没有运行吞吐对比。下述首次 RDMA/TCP 切换未重启 host；后续清理阻塞状态时经用户确认重启了两台 host。
 KVM 从源码树加载，未替换 `/lib/modules` 中的开机默认模块；host 重启后需要重新加载。
 
 RDMA（QEMU `6d0be754a4`）：
@@ -175,7 +177,7 @@ RDMA（QEMU `6d0be754a4`）：
   镜像已有 EFI FAT 未干净卸载提示不在该错误筛查范围。
 - guest 正常 poweroff 后，两端 QEMU 均退出 0。
 
-TCP 的验证分两次记录，不能合并为“最终版本所有启动均通过”：
+TCP 的各轮验证分别记录如下：
 
 - 早期双后端构建已完成 root/root 正常登录并通过相同 148 项校验。
   QMP 为 `method=tcp mode=0`，QEMU 未打开 uverbs/RDMA CM 设备；
@@ -189,7 +191,50 @@ TCP 的验证分两次记录，不能合并为“最终版本所有启动均通�
   `ktcp_receive -> kvm_dsm_fetch -> ivy_kvm_dsm_page_fault`。
   guest CPU 0 采样为 `update_sd_lb_stats.constprop.0`，CPU 1 为 `read_hpet`。
   这些证据说明等待发生在 DSM/guest 调度路径；还不足以断言是某一具体热页或唯一根因。
-  本轮保留运行现场，未重启 host、未改 HPET，也没有把延迟告警当作数据校验通过。
+  先保留现场完成诊断；退出时 Garen 等待 DSM 页锁、Ezreal 等待 SRCU，SIGKILL 后仍有残留线程。
+  经用户确认重启两台 host 清理状态，再以 isolcpus 继续验证；没有改 HPET。
 TCP 启动慢时应等待串口输出。若 systemd 设备超时进入维护模式，等待磁盘和串口就绪后
 用 root 密码登录，执行 `systemctl default --no-block` 恢复正常启动，再以 root/root 登录。
 `-nic none` 下镜像原有 networkd-wait-online 超时与传输通道无关。
+
+### TCP 后续定位与隔离配置
+
+用户建议后，在 master 启动环境中加入：
+
+```bash
+GVM_GUEST_EXTRA_ARGS="clocksource=hpet isolcpus=domain,1-3"
+```
+
+这使 guest CPU 1–3 不参与普通 scheduler domain 的自动负载均衡，4 个 vCPU 仍在线，
+显式绑核的跨节点数据校验仍能访问两个节点。参数只改变 guest 启动配置，不修改 guest 代码。
+重启后首次带此参数的 TCP 启动已正常 root/root 登录并正常关机，两端 QEMU 退出 0。
+随后两端加载下面的取消语义修复，重新启动并完成数据校验。
+
+另发现 TCP 取消条件与 RDMA 不一致：`ktcp_stopping()` 原先使用 `signal_pending()`，
+普通 QEMU vCPU kick 即可取消尚未完成的 DSM 请求。如果发生在 TCP 半帧接收期间，
+会丢失已消费字节的位置；即使完整帧已发送，丢弃尚未完成的 DSM 事务也不安全。
+KVM `fdb8ce2d9` 改为与 RDMA 相同的 `fatal_signal_pending()` / kthread stop 条件，
+发送采用 `MSG_DONTWAIT` 并沿用 EAGAIN 重试，避免普通信号打断阻塞发送。
+这是协议取消语义修复；不能仅凭它断言早期启动的全部 DSM 争用或所有退出阻塞都已解决。
+
+### 最终 TCP 功能回归
+
+使用 QEMU 功能提交 `6d0be754a4`、KVM `fdb8ce2d9`，
+两端加载的 kvm srcversion 为 `B7874CE750FD6158A6169BE`，APICv 关闭。
+
+- 使用上面的 Ethernet 地址及 `isolcpus=domain,1-3`，guest 正常 root/root 登录。
+- 相同 148 项数据校验全部通过：72 项两盘/两 CPU 节点的 O_DIRECT 读写和 fdatasync、
+  12 项非页对齐范围保护、64 项同页 DSM 竞争校验。
+- 校验期间两端各执行 12 次 QMP `info registers -a`，触发 vCPU 同步/唤醒；
+  查询均完成，没有再出现原先的 `-512` DSM 接收错误。这是回归覆盖，并非所有信号时序的穷举。
+- guest 最终仍为 HPET、CPU 0–3 全部在线、isolated 1–3，两盘序列号正确，
+  `dmesg --level=err` 筛查为空。
+- 两端 QMP 均为 `method=tcp mode=0`，direct_bytes / lease_bytes 为 0。
+  KVM DSM 连接为 10.0.16.104 与 10.0.16.91 的 TCP 连接。
+- host 出现既有 `mark_page_dirty_in_slot` WARNING，按用户要求记录但不因此重启。
+  Ezreal 启动时另有 SGX 关闭与重复 fstab 条目报错；本轮没有新增 DSM 错误或 hung-task。
+- guest 正常 poweroff 后，两端 QEMU 退出码均为 0；两端随后均成功卸载并重新加载
+  KVM 模块，没有遗留占用。slave 退出仍可能打印旧标签 `[RDMA] poll_cq error`，
+  这是复用控制通道的日志标签，不表示 TCP 回退到了 RDMA。
+- 本次通过是在指定隔离配置下取得；没有重新验证不带 isolcpus 的启动，
+  也不代表任意网络故障/强制终止均能完整回收。
