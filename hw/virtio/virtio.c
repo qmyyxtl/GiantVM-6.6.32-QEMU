@@ -31,6 +31,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/virtio/virtio-access.h"
 #include "sysemu/dma.h"
+#include "migration/gvm-private-io.h"
 #include "sysemu/runstate.h"
 #include "virtio-qmp.h"
 
@@ -755,6 +756,10 @@ static void virtqueue_unmap_sg(VirtQueue *vq, const VirtQueueElement *elem,
     for (i = 0; i < elem->in_num; i++) {
         size_t size = MIN(len - offset, elem->in_sg[i].iov_len);
 
+        if (gvm_private_io_unmap(elem->in_sg[i].iov_base, size, true)) {
+            offset += size;
+            continue;
+        }
         dma_memory_unmap(dma_as, elem->in_sg[i].iov_base,
                          elem->in_sg[i].iov_len,
                          DMA_DIRECTION_FROM_DEVICE, size);
@@ -762,11 +767,16 @@ static void virtqueue_unmap_sg(VirtQueue *vq, const VirtQueueElement *elem,
         offset += size;
     }
 
-    for (i = 0; i < elem->out_num; i++)
+    for (i = 0; i < elem->out_num; i++) {
+        if (gvm_private_io_unmap(elem->out_sg[i].iov_base,
+                                 elem->out_sg[i].iov_len, false)) {
+            continue;
+        }
         dma_memory_unmap(dma_as, elem->out_sg[i].iov_base,
                          elem->out_sg[i].iov_len,
                          DMA_DIRECTION_TO_DEVICE,
                          elem->out_sg[i].iov_len);
+    }
 }
 
 /* virtqueue_detach_element:
@@ -1519,11 +1529,15 @@ static bool virtqueue_map_desc(VirtIODevice *vdev, unsigned int *p_num_sg,
             goto out;
         }
 
-        iov[num_sg].iov_base = dma_memory_map(vdev->dma_as, pa, &len,
-                                              is_write ?
-                                              DMA_DIRECTION_FROM_DEVICE :
-                                              DMA_DIRECTION_TO_DEVICE,
-                                              MEMTXATTRS_UNSPECIFIED);
+        if (vdev->device_id != VIRTIO_ID_BLOCK ||
+            !gvm_private_io_map(vdev->dma_as, pa, &len, is_write,
+                                &iov[num_sg].iov_base)) {
+            iov[num_sg].iov_base = dma_memory_map(vdev->dma_as, pa, &len,
+                                                 is_write ?
+                                                 DMA_DIRECTION_FROM_DEVICE :
+                                                 DMA_DIRECTION_TO_DEVICE,
+                                                 MEMTXATTRS_UNSPECIFIED);
+        }
         if (!iov[num_sg].iov_base) {
             virtio_error(vdev, "virtio: bogus descriptor or out of resources");
             goto out;
@@ -1555,7 +1569,9 @@ static void virtqueue_undo_map_desc(unsigned int out_num, unsigned int in_num,
     for (i = 0; i < out_num + in_num; i++) {
         int is_write = i >= out_num;
 
-        cpu_physical_memory_unmap(iov->iov_base, iov->iov_len, is_write, 0);
+        if (!gvm_private_io_unmap(iov->iov_base, 0, is_write)) {
+            cpu_physical_memory_unmap(iov->iov_base, iov->iov_len, is_write, 0);
+        }
         iov++;
     }
 }

@@ -15,6 +15,7 @@
 #include "qom/object_interfaces.h"
 #include "hw/boards.h"
 #include "migration/rdma-gvm.h"
+#include "migration/gvm-private-io.h"
 #include "hw/pci/loom.h"
 #include "sysemu/kvm.h"
 #include "qemu/main-loop.h"
@@ -607,6 +608,8 @@ void start_io_router(void)
     object_property_add(OBJECT(ms), "loom-rdma-rpc-spin-ns", "uint64",
                         router_get_rpc_spin_ns, router_set_rpc_spin_ns,
                         NULL, NULL);
+    gvm_private_io_start(ms->local_cpu_start_index / ms->local_cpus,
+                         ms->qemu_nums, router_hosts);
     printf("RDMA router started successfully\n");
 }
 
@@ -618,6 +621,7 @@ void disconnect_io_router(void)
         return;
     }
     
+    gvm_private_io_stop();
     rdma_router_cleanup();
     
     for (int i = 0; i < router_hosts_num; i++) {
