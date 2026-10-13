@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "migration/gvm-transport.h"
 #include "hw/pci/loom.h"
 #include "qemu/help-texts.h"
 #include "qemu/datadir.h"
@@ -245,6 +246,9 @@ static QemuOptsList qemu_local_cpu_opts = {
             .type = QEMU_OPT_NUMBER,
         }, {
             .name = "iplist",
+            .type = QEMU_OPT_STRING,
+        }, {
+            .name = "method",
             .type = QEMU_OPT_STRING,
         },
         { /*end of list */ }
@@ -3685,6 +3689,14 @@ void qemu_init(int argc, char **argv)
                                                optarg, false);
                 if (!opts) {
                     exit(1);
+                }
+                {
+                    const char *method = qemu_opt_get(opts, "method");
+                    if (method && strcmp(method, "tcp") && strcmp(method, "rdma")) {
+                        error_report("local-cpu method must be tcp or rdma");
+                        exit(1);
+                    }
+                    gvm_transport_tcp = method && !strcmp(method, "tcp");
                 }
                 local_cpus = qemu_opt_get_number(opts, "cpus", 1);
                 local_cpu_start_index = qemu_opt_get_number(opts, "start", 0);

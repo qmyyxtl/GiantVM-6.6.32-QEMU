@@ -5,6 +5,12 @@ set -euo pipefail
 ulimit -c 0
 node=${1:?Usage: gvm-device-node.sh 0|1 [additional QEMU arguments]}
 shift
+method=${GVM_METHOD:-rdma}
+if [[ ${1:-} == method=* ]]; then
+    method=${1#method=}
+    shift
+fi
+case "$method" in tcp|rdma) ;; *) echo 'method must be tcp or rdma' >&2; exit 2 ;; esac
 case "$node" in 0|1) ;; *) echo 'node must be 0 or 1' >&2; exit 2 ;; esac
 
 # Reject stale or sudo-filtered node addresses before creating a KVM VM.
@@ -68,7 +74,7 @@ args=(
     -enable-kvm -machine "$machine,kernel-irqchip=split" -smp 4 -m 4G
     -display none -monitor none
     -qmp tcp:127.0.0.1:4444,server=on,wait=off
-    -local-cpu "cpus=2,start=$((node * 2)),iplist=${GVM_IPLIST:-172.0.1.2 172.0.1.3}"
+    -local-cpu "method=$method,cpus=2,start=$((node * 2)),iplist=${GVM_IPLIST:-172.0.1.2 172.0.1.3}"
     -drive "file=${GVM_ROOT_IMAGE:-/home/xtl/start/debian-12-40G.raw},format=raw,id=rootfs,if=none,file.locking=off"
     -device ide-hd,drive=rootfs,id=rootfs
     -device "edu,id=edu-owner-$node,addr=0$((5 + node)).0,loom-aggregate=on,loom-numa-node=$node"

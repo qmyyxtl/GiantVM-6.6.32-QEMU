@@ -15,6 +15,7 @@
 #include "qom/object_interfaces.h"
 #include "hw/boards.h"
 #include "migration/rdma-gvm.h"
+#include "migration/gvm-transport.h"
 #include "migration/gvm-private-io.h"
 #include "hw/pci/loom.h"
 #include "sysemu/kvm.h"
@@ -584,7 +585,8 @@ void start_io_router(void)
         exit(1);
     }
     
-    printf("Starting RDMA router for QEMU %d (total: %d)\n",
+    printf("Starting %s router for QEMU %d (total: %d)\n",
+           gvm_transport_method(),
            ms->local_cpu_start_index / ms->local_cpus, ms->qemu_nums);
     
     /* 设置消息处理回调 */
@@ -610,7 +612,7 @@ void start_io_router(void)
                         NULL, NULL);
     gvm_private_io_start(ms->local_cpu_start_index / ms->local_cpus,
                          ms->qemu_nums, router_hosts);
-    printf("RDMA router started successfully\n");
+    printf("GVM %s router started successfully\n", gvm_transport_method());
 }
 
 void disconnect_io_router(void)

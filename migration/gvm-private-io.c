@@ -21,6 +21,7 @@
 #include "sysemu/kvm.h"
 #include "migration/blocker.h"
 #include "gvm-private-io.h"
+#include "gvm-transport.h"
 #include <linux/kvm.h>
 #include <rdma/rdma_cma.h>
 #include <infiniband/verbs.h>
@@ -64,6 +65,8 @@ typedef struct IORemote {
 } IORemote;
 
 typedef struct IOConnection {
+    int tcp_fd;
+    bool tcp_send_done;
     struct rdma_cm_id *id;
     struct ibv_pd *pd;
     struct ibv_cq *cq;
@@ -145,6 +148,7 @@ static int io_cm_event(struct rdma_event_channel *ch,
 
 static void io_post_recv(IOConnection *c)
 {
+    if (gvm_transport_tcp) { return; }
     struct ibv_sge sge = {
         .addr = (uintptr_t)c->rx, .length = IO_BUFFER,
         .lkey = c->rx_mr->lkey,
@@ -157,6 +161,12 @@ static void io_post_recv(IOConnection *c)
 
 static void io_post_send(IOConnection *c, size_t length)
 {
+    if (gvm_transport_tcp) {
+        int ret = gvm_tcp_send_frame(c->tcp_fd, c->tx, length, 30000);
+        if (ret < 0) { errno = -ret; io_fatal("TCP private send"); }
+        c->tcp_send_done = true;
+        return;
+    }
     struct ibv_sge sge = {
         .addr = (uintptr_t)c->tx, .length = length, .lkey = c->tx_mr->lkey,
     };
@@ -172,6 +182,24 @@ static void io_post_send(IOConnection *c, size_t length)
 /* CQ belongs to one RPC caller or one server thread, never both. */
 static int io_completion(IOConnection *c, struct ibv_wc *wc, bool idle)
 {
+    if (gvm_transport_tcp) {
+        if (c->tcp_send_done) {
+            c->tcp_send_done = false;
+            *wc = (struct ibv_wc) { .wr_id = 1 };
+            return 1;
+        }
+        while (idle && !qatomic_read(&io.stopping)) {
+            struct pollfd p = { .fd = c->tcp_fd, .events = POLLIN };
+            int ret = poll(&p, 1, 100);
+            if (ret > 0) { break; }
+            if (ret < 0 && errno != EINTR) { return -1; }
+        }
+        if (qatomic_read(&io.stopping)) { return 0; }
+        int ret = gvm_tcp_recv_frame(c->tcp_fd, c->rx, IO_BUFFER, 30000);
+        if (ret < 0) { errno = -ret; return -1; }
+        *wc = (struct ibv_wc) { .wr_id = 2, .byte_len = ret };
+        return 1;
+    }
     int64_t end = io_ms() + 30000;
     for (;;) {
         int n = ibv_poll_cq(c->cq, 1, wc);
@@ -530,7 +558,7 @@ static void *io_service(void *opaque)
         case IO_ECHO:
             *(IORemote *)(c->tx + sizeof(IOHeader)) = (IORemote) {
                 .address = (uintptr_t)c->rx + IO_HEADER,
-                .rkey = c->rx_mr->rkey, .mode = io.mode,
+                .rkey = c->rx_mr ? c->rx_mr->rkey : 0, .mode = io.mode,
             };
             memcpy(c->tx + IO_HEADER, c->rx + IO_HEADER, req.length);
             bytes += req.length;
@@ -855,16 +883,69 @@ static void io_get_stats(Object *obj, Visitor *v, const char *name,
                          void *opaque, Error **errp)
 {
     g_autofree char *stats = g_strdup_printf(
-        "calls=%" PRIu64 " read_bytes=%" PRIu64 " write_bytes=%" PRIu64
+        "method=%s calls=%" PRIu64 " read_bytes=%" PRIu64 " write_bytes=%" PRIu64
         " remote_maps=%" PRIu64 " local_maps=%" PRIu64
         " mode=%u send_zcopy_bytes=%" PRIu64
         " direct_bytes=%" PRIu64 " lease_bytes=%" PRIu64 " lease_calls=%" PRIu64,
-        qatomic_read(&io.calls), qatomic_read(&io.read_bytes),
+        gvm_transport_method(), qatomic_read(&io.calls), qatomic_read(&io.read_bytes),
         qatomic_read(&io.write_bytes), qatomic_read(&io.remote_maps),
         qatomic_read(&io.local_maps), io.mode, qatomic_read(&io.send_zcopy_bytes),
         qatomic_read(&io.direct_bytes), qatomic_read(&io.lease_bytes),
         qatomic_read(&io.lease_calls));
     visit_type_str(v, name, &stats, errp);
+}
+
+
+static IOConnection *io_tcp_connection(int fd, int peer, bool outgoing)
+{
+    uint32_t hello[] = { IO_MAGIC, IO_VERSION, io.local, peer, io.nodes,
+                         outgoing ? io.local : peer };
+    uint32_t remote[G_N_ELEMENTS(hello)];
+    if (fd < 0 ||
+        gvm_tcp_send_frame(fd, hello, sizeof(hello), 30000) < 0 ||
+        gvm_tcp_recv_frame(fd, remote, sizeof(remote), 30000) != sizeof(remote) ||
+        remote[0] != hello[0] || remote[1] != hello[1] ||
+        remote[2] != peer || remote[3] != io.local ||
+        remote[4] != io.nodes || remote[5] != hello[5]) {
+        io_fatal("TCP private connection/handshake");
+    }
+    IOConnection *c = g_new0(IOConnection, 1);
+    c->tcp_fd = fd;
+    c->peer = peer;
+    c->tx = g_malloc0(IO_BUFFER);
+    c->rx = g_malloc0(IO_BUFFER);
+    pthread_mutex_init(&c->lock, NULL);
+    return c;
+}
+
+static void io_tcp_start(char **hosts)
+{
+    int listeners[IO_NODES];
+    for (int peer = 0; peer < io.nodes; peer++) {
+        if (peer == io.local) { continue; }
+        listeners[peer] = gvm_tcp_listen(hosts[io.local],
+                                         41000 + io.local * IO_NODES + peer);
+        if (listeners[peer] < 0) {
+            errno = -listeners[peer];
+            io_fatal("TCP private listen");
+        }
+    }
+    for (int peer = 0; peer < io.nodes; peer++) {
+        if (peer == io.local) { continue; }
+        for (int step = 0; step < 2; step++) {
+            bool outgoing = (io.local < peer) == (step == 0);
+            int fd = outgoing ?
+                gvm_tcp_connect(hosts[peer], 41000 + peer * IO_NODES + io.local) :
+                gvm_tcp_accept(listeners[peer]);
+            IOConnection *c = io_tcp_connection(fd, peer, outgoing);
+            if (outgoing) { io.out[peer] = c; }
+            else { io.in[peer] = c; }
+        }
+        close(listeners[peer]);
+        if (pthread_create(&io.threads[peer], NULL, io_service, io.in[peer])) {
+            io_fatal("start TCP private worker");
+        }
+    }
 }
 
 void gvm_private_io_start(int local, int nodes, char **hosts)
@@ -887,6 +968,10 @@ void gvm_private_io_start(int local, int nodes, char **hosts)
     } else {
         io_fatal("unknown GVM_PRIVATE_IO_ZCOPY mode");
     }
+    if (gvm_transport_tcp && io.mode) {
+        error_report("GVM TCP private I/O uses DSM copy; RDMA zcopy mode is inactive");
+        io.mode = 0;
+    }
     if (io.mode) {
         io.pool = qemu_memalign(IO_PAGE, IO_POOL_LIMIT);
         memset(io.pool, 0, IO_POOL_LIMIT);
@@ -905,6 +990,10 @@ void gvm_private_io_start(int local, int nodes, char **hosts)
         memory_region_ref(io.ram[i]);
     }
 
+    if (gvm_transport_tcp) {
+        io_tcp_start(hosts);
+        goto echo_test;
+    }
     struct rdma_cm_id *listeners[IO_NODES] = { 0 };
     for (int peer = 0; peer < nodes; peer++) {
         if (peer == local) {
@@ -939,6 +1028,8 @@ void gvm_private_io_start(int local, int nodes, char **hosts)
             io_fatal("start private memory worker");
         }
     }
+echo_test:
+    ; /* A label must precede a statement before C declarations. */
     /* No guest pages touched by the transport self-test. */
     uint8_t *test = g_malloc(IO_BYTES);
     for (int peer = 0; peer < nodes; peer++) {
@@ -967,8 +1058,8 @@ void gvm_private_io_start(int local, int nodes, char **hosts)
                         io_get_stats, NULL, NULL, NULL);
     io.initialized = true;
     qatomic_set(&io.enabled, true);
-    error_report("GVM private I/O: node %d, independent RDMA pool echo PASS (2 MiB)",
-                 local);
+    error_report("GVM private I/O: node %d, method=%s pool echo PASS (2 MiB)",
+                 local, gvm_transport_method());
 }
 
 void gvm_private_io_stop(void)

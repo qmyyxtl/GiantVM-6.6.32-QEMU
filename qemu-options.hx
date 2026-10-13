@@ -23,7 +23,8 @@ DEF("local-cpu", HAS_ARG, QEMU_OPTION_local_cpu,
     "-local-cpu [cpus=]n[,start=start][,iplist=\"ip1[ ip2]...\"]\n"
     "                set the number of local CPUs to 'n' [default=1]\n"
     "                start= the start index of local CPUs\n"
-    "                iplist= ip of each node hosting the distributed VM\n",
+    "                iplist= ip of each node hosting the distributed VM\n"
+    "                method=tcp|rdma (default rdma), selected for QEMU and KVM\n",
         QEMU_ARCH_ALL)
 SRST
 ``-local-cpu [cpus=]n[,start=start][,iplist=\"ip1[ ip2]...\"]``

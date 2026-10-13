@@ -5,6 +5,7 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include "rdma-gvm.h"
+#include "gvm-transport.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +35,7 @@ typedef struct pending_response {
 
 // RDMA 连接
 typedef struct {
+    int tcp_fd; /* -1 for RDMA. */
     struct rdma_cm_id *cm_id;
     struct ibv_pd *pd;
     struct ibv_cq *cq;
@@ -106,6 +108,76 @@ static int rdma_send_msg(rdma_conn_t *conn, rdma_msg_header_t *hdr, const void *
 static int rdma_wait_completion(rdma_conn_t *conn, struct ibv_wc *wc);
 static void* recv_thread_func(void *arg);
 static void *request_worker_func(void *arg);
+
+
+/* Preserve the independent request/reply streams and control/worker split. */
+static rdma_conn_t *tcp_router_connection(int fd, int peer, int channel)
+{
+    uint32_t hello[] = { 0x47565431, 1, g_ctx.local_id, peer,
+                         g_ctx.total_nodes, channel };
+    uint32_t remote[G_N_ELEMENTS(hello)];
+    if (fd < 0 ||
+        gvm_tcp_send_frame(fd, hello, sizeof(hello), 30000) < 0 ||
+        gvm_tcp_recv_frame(fd, remote, sizeof(remote), 30000) != sizeof(remote) ||
+        remote[0] != hello[0] || remote[1] != hello[1] ||
+        remote[2] != peer || remote[3] != g_ctx.local_id ||
+        remote[4] != g_ctx.total_nodes || remote[5] != channel) {
+        if (fd >= 0) { close(fd); }
+        return NULL;
+    }
+    rdma_conn_t *conn = g_new0(rdma_conn_t, 1);
+    conn->tcp_fd = fd;
+    conn->next_seq = 1;
+    conn->recv_bufs[0] = g_malloc(RDMA_BUFFER_SIZE);
+    pthread_mutex_init(&conn->send_lock, NULL);
+    pthread_mutex_init(&conn->recv_lock, NULL);
+    pthread_mutex_init(&conn->response_lock, NULL);
+    return conn;
+}
+static int tcp_router_init(char **hosts, int base)
+{
+    int listeners[16][2];
+    int local = g_ctx.local_id, nodes = g_ctx.total_nodes;
+    if (nodes < 2 || nodes > 16 || local < 0 || local >= nodes) { return -EINVAL; }
+    for (int i = 0; i < nodes; i++) {
+        if (i == local) { continue; }
+        for (int j = 0; j < 2; j++) {
+            listeners[i][j] = gvm_tcp_listen(hosts[local],
+                                            base + i * nodes * 2 + local * 2 + j);
+            if (listeners[i][j] < 0) { return listeners[i][j]; }
+        }
+    }
+    for (int i = 0; i < nodes; i++) {
+        if (i == local) { continue; }
+        for (int step = 0; step < 2; step++) {
+            bool outgoing = (local < i) == (step == 0);
+            for (int j = 0; j < 2; j++) {
+                int fd = outgoing ?
+                    gvm_tcp_connect(hosts[i], base + local * nodes * 2 + i * 2 + j) :
+                    gvm_tcp_accept(listeners[i][j]);
+                rdma_conn_t *c = tcp_router_connection(fd, i, j);
+                if (!c) { return -EPROTO; }
+                if (outgoing) {
+                    if (!j) { g_ctx.request_conns[i] = c; }
+                    else { g_ctx.reply_for_recv_conns[i] = c; }
+                } else if (!j) { g_ctx.recv_conns[i] = c; }
+                else { g_ctx.response_for_req_conns[i] = c; }
+            }
+        }
+        close(listeners[i][0]);
+        close(listeners[i][1]);
+    }
+    return 0;
+}
+static int tcp_router_recv(rdma_conn_t *conn, struct ibv_wc *wc, unsigned timeout)
+{
+    int ret = gvm_tcp_recv_frame(conn->tcp_fd, conn->recv_bufs[0],
+                                 RDMA_BUFFER_SIZE, timeout);
+    if (ret < 0) { conn->failed = true; return ret; }
+    *wc = (struct ibv_wc) { .wr_id = 0, .status = IBV_WC_SUCCESS,
+                           .opcode = IBV_WC_RECV, .byte_len = ret };
+    return 1;
+}
 
 /*
  * Called by the main-loop control plane after router initialization. Connection
@@ -181,7 +253,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
     g_ctx.local_id = local_id;
     g_ctx.total_nodes = total_nodes;
     qatomic_set(&g_ctx.running, true);
-    g_ctx.recv_cq_events =
+    g_ctx.recv_cq_events = !gvm_transport_tcp &&
         g_strcmp0(getenv("LOOM_RDMA_RECV_CQ_EVENTS"), "1") == 0;
     qatomic_set(&g_ctx.recv_cq_event_wait, g_ctx.recv_cq_events);
     if (g_ctx.recv_cq_events) {
@@ -198,6 +270,14 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
     g_ctx.recv_threads = calloc(total_nodes, sizeof(pthread_t));
     g_ctx.workers = calloc(total_nodes, sizeof(*g_ctx.workers));
     
+    if (gvm_transport_tcp) {
+        int ret = tcp_router_init(hosts, base_port);
+        if (ret < 0) {
+            fprintf(stderr, "GVM TCP router initialization failed: %s\n", strerror(-ret));
+            return ret;
+        }
+        goto start_workers;
+    }
     // ========== 创建所有 listener ==========
     struct rdma_cm_id ***listeners = calloc(total_nodes, sizeof(struct rdma_cm_id**));
     for (int i = 0; i < total_nodes; i++) {
@@ -533,6 +613,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
     }
     free(listeners);
     
+start_workers:
     // 启动接收线程
     for (int i = 0; i < total_nodes; i++) {
         if (i == local_id) continue;
@@ -564,6 +645,7 @@ int rdma_router_init(int local_id, int total_nodes, char **hosts, int base_port)
 static int create_connection(const char *host, int port, struct rdma_cm_id *server_cm_id, rdma_conn_t **out_conn, bool event_receive)
 {
     rdma_conn_t *conn = calloc(1, sizeof(rdma_conn_t));
+    conn->tcp_fd = -1;
     pthread_mutex_init(&conn->send_lock, NULL);
     pthread_mutex_init(&conn->recv_lock, NULL);
     pthread_mutex_init(&conn->response_lock, NULL);
@@ -789,6 +871,16 @@ static int rdma_send_msg(rdma_conn_t *conn, rdma_msg_header_t *hdr, const void *
         pthread_mutex_unlock(&conn->send_lock);
         return -ENOTCONN;
     }
+    if (gvm_transport_tcp) {
+        uint8_t frame[RDMA_BUFFER_SIZE];
+        memcpy(frame, hdr, sizeof(*hdr));
+        if (hdr->data_len) { memcpy(frame + sizeof(*hdr), data, hdr->data_len); }
+        int ret = gvm_tcp_send_frame(conn->tcp_fd, frame,
+                                     sizeof(*hdr) + hdr->data_len, 30000);
+        if (ret < 0) { conn->failed = true; }
+        pthread_mutex_unlock(&conn->send_lock);
+        return ret < 0 ? ret : sizeof(*hdr) + hdr->data_len;
+    }
     // Copy message
     void *buf = conn->send_bufs[buf_idx];
     memcpy(buf, hdr, sizeof(*hdr));
@@ -903,6 +995,14 @@ static void *request_worker_func(void *arg)
  */
 static int rdma_recv_completion(rdma_conn_t *conn, struct ibv_wc *wc)
 {
+    if (gvm_transport_tcp) {
+        struct pollfd p = { .fd = conn->tcp_fd, .events = POLLIN };
+        int ret = poll(&p, 1, 100);
+        if (!qatomic_read(&g_ctx.running) || !ret || (ret < 0 && errno == EINTR)) {
+            return 0;
+        }
+        return ret < 0 ? -errno : tcp_router_recv(conn, wc, 30000);
+    }
     while (qatomic_read(&g_ctx.running)) {
         int n;
         bool wait_events = qatomic_read(&g_ctx.recv_cq_event_wait) &&
@@ -979,6 +1079,10 @@ static void* recv_thread_func(void *arg)
         int n = rdma_recv_completion(conn, &wc);
         
         if (n < 0) {
+            if (gvm_transport_tcp && qatomic_read(&g_ctx.running)) {
+                fprintf(stderr, "GVM TCP router connection failed; stopping VM\n");
+                _exit(EXIT_FAILURE);
+            }
             fprintf(stderr, "[RDMA] poll_cq error\n");
             break;
         }
@@ -1016,6 +1120,7 @@ static void* recv_thread_func(void *arg)
                 memcpy(data_copy, data, hdr->data_len);
             }
             
+            if (!gvm_transport_tcp) {
             // 🔑 立即 re-post recv（在处理消息之前！）
             struct ibv_sge sge;
             sge.addr = (uint64_t)buf;
@@ -1032,6 +1137,7 @@ static void* recv_thread_func(void *arg)
                 fprintf(stderr, "[RDMA] Failed to re-post recv\n");
             }
             
+            }
             // 🔑 现在可以慢慢处理消息了（使用副本）
             debugf("[RDMA Router] Handling message from peer %d\n", peer_id);
             if (g_control_handler &&
@@ -1080,6 +1186,7 @@ static uint64_t rdma_monotonic_ms(void)
 
 static int rdma_repost_response(rdma_conn_t *conn, unsigned index)
 {
+    if (gvm_transport_tcp) { return 0; }
     struct ibv_sge sge = {
         .addr = (uint64_t)conn->recv_bufs[index],
         .length = RDMA_BUFFER_SIZE,
@@ -1129,7 +1236,9 @@ int rdma_router_call(int target_id, uint16_t msg_type,
     wait = rdma_rpc_wait_init();
     while (rdma_monotonic_ms() < deadline) {
         struct ibv_wc wc;
-        int n = ibv_poll_cq(resp->cq, 1, &wc);
+        int n = gvm_transport_tcp ?
+            tcp_router_recv(resp, &wc, timeout_ms) :
+            ibv_poll_cq(resp->cq, 1, &wc);
         if (n < 0) {
             goto out;
         }
@@ -1219,6 +1328,16 @@ int rdma_router_send_response(int peer_id, uint16_t msg_type, uint64_t sequence,
 void rdma_router_cleanup(void)
 {
     qatomic_set(&g_ctx.running, false);
+    if (gvm_transport_tcp) {
+        for (int i = 0; i < g_ctx.total_nodes; i++) {
+            rdma_conn_t *all[] = { g_ctx.request_conns[i],
+                g_ctx.response_for_req_conns[i], g_ctx.recv_conns[i],
+                g_ctx.reply_for_recv_conns[i] };
+            for (unsigned j = 0; j < G_N_ELEMENTS(all); j++) {
+                if (all[j]) { shutdown(all[j]->tcp_fd, SHUT_RDWR); }
+            }
+        }
+    }
     if (g_ctx.stop_fd >= 0) {
         uint64_t wake = 1;
         ssize_t ret = write(g_ctx.stop_fd, &wake, sizeof(wake));

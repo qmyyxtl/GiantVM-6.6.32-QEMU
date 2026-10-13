@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "migration/gvm-transport.h"
 #include "qemu/units.h"
 #include "hw/i386/pc.h"
 #include "hw/char/serial.h"
@@ -842,7 +843,16 @@ void pc_memory_init(PCMachineState *pcms,
         if (kvm_enabled() && kvm_check_extension(kvm_state, KVM_CAP_X86_DSM)) {
             params.dsm_index = machine->local_cpu_start_index / machine->local_cpus;
             params.cluster_iplist = (void *) get_cluster_iplist(&params.cluster_iplist_len);
-            int ret = kvm_vm_ioctl(kvm_state, KVM_DSM_ENABLE, &params);
+            uint32_t method = gvm_transport_tcp ? KVM_DSM_TRANSPORT_TCP :
+                                                KVM_DSM_TRANSPORT_RDMA;
+            int ret = kvm_vm_ioctl(kvm_state, KVM_DSM_SET_TRANSPORT, &method);
+            if (ret < 0) {
+                error_report("Select KVM DSM method=%s failed: %s; load KVM "
+                             "with runtime transport support",
+                             gvm_transport_method(), strerror(-ret));
+                exit(EXIT_FAILURE);
+            }
+            ret = kvm_vm_ioctl(kvm_state, KVM_DSM_ENABLE, &params);
             if (ret < 0) {
                 error_report("Enable kernel DSM failed: %s", strerror(-ret));
                 exit(EXIT_FAILURE);

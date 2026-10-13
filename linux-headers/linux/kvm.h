@@ -1263,6 +1263,12 @@ struct kvm_vfio_spapr_tce {
 #define KVM_HAS_DEVICE_ATTR	  _IOW(KVMIO,  0xe3, struct kvm_device_attr)
 
 /* dsm */
+
+/* Per-VM transport selection, before KVM_DSM_ENABLE. Existing ENABLE ABI stays. */
+#define KVM_DSM_TRANSPORT_TCP 1
+#define KVM_DSM_TRANSPORT_RDMA 2
+#define KVM_DSM_SET_TRANSPORT _IOW(KVMIO, 0xf0, __u32)
+
 struct kvm_dsm_params {
 	__u32 dsm_index;
 	__u32 cluster_iplist_len;
