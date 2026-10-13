@@ -752,6 +752,7 @@ static void virtqueue_unmap_sg(VirtQueue *vq, const VirtQueueElement *elem,
     unsigned int offset;
     int i;
 
+    gvm_private_io_complete(elem, len);
     offset = 0;
     for (i = 0; i < elem->in_num; i++) {
         size_t size = MIN(len - offset, elem->in_sg[i].iov_len);
@@ -1755,6 +1756,7 @@ static void *virtqueue_split_pop(VirtQueue *vq, size_t sz)
         elem->in_addr[i] = addr[out_num + i];
         elem->in_sg[i] = iov[out_num + i];
     }
+    gvm_private_io_prepare(elem);
 
     if (virtio_vdev_has_feature(vdev, VIRTIO_F_IN_ORDER)) {
         idx = (vq->last_avail_idx - 1) % vq->vring.num;
@@ -1893,6 +1895,7 @@ static void *virtqueue_packed_pop(VirtQueue *vq, size_t sz)
         elem->in_addr[i] = addr[out_num + i];
         elem->in_sg[i] = iov[out_num + i];
     }
+    gvm_private_io_prepare(elem);
 
     elem->index = id;
     elem->ndescs = (desc_cache == &indirect_desc_cache) ? 1 : elem_entries;

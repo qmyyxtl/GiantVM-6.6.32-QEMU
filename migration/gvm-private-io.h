@@ -3,6 +3,10 @@
 #define GVM_PRIVATE_IO_H
 #include "exec/memory.h"
 
+typedef struct VirtQueueElement VirtQueueElement;
+void gvm_private_io_prepare(const VirtQueueElement *elem);
+void gvm_private_io_complete(const VirtQueueElement *elem, unsigned accessed);
+
 /* Private host buffers, never guest RAM and never a DSM memory slot. */
 void gvm_private_io_start(int local, int nodes, char **hosts);
 void gvm_private_io_stop(void);

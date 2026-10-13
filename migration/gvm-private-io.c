@@ -15,6 +15,7 @@
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "hw/boards.h"
+#include "hw/virtio/virtio.h"
 #include "sysemu/hostmem.h"
 #include "sysemu/kvm.h"
 #include "migration/blocker.h"
@@ -30,10 +31,13 @@
 #define IO_HEADER 4096
 #define IO_BUFFER (IO_HEADER + IO_BYTES)
 #define IO_MAGIC 0x4756494f
-#define IO_VERSION 1
+#define IO_VERSION 2
 #define IO_READ 1
 #define IO_WRITE 2
 #define IO_ECHO 3
+#define IO_READV 4
+#define IO_WRITEV 5
+#define IO_SEGMENTS 240
 #define IO_POOL_LIMIT (64 * 1024 * 1024)
 
 typedef struct IOHeader {
@@ -42,6 +46,11 @@ typedef struct IOHeader {
     int32_t status;
     uint32_t reserved;
 } IOHeader;
+
+typedef struct IOVec {
+    uint64_t offset;
+    uint32_t length, reserved;
+} IOVec;
 
 typedef struct IOConnection {
     struct rdma_cm_id *id;
@@ -61,7 +70,7 @@ typedef struct IOMapping {
     uint64_t offset;
     size_t length;
     int peer;
-    bool write;
+    bool write, published;
 } IOMapping;
 
 static struct {
@@ -305,11 +314,15 @@ static void *io_service(void *opaque)
             io_fatal("receive private request");
         }
         IOHeader req = *(IOHeader *)c->rx;
-        bool payload = req.operation == IO_WRITE || req.operation == IO_ECHO;
+        bool vector = req.operation == IO_READV || req.operation == IO_WRITEV;
+        bool payload = req.operation == IO_WRITE || req.operation == IO_ECHO ||
+                       req.operation == IO_WRITEV;
         if (req.magic != IO_MAGIC || req.version != IO_VERSION ||
             !req.length || req.length > IO_BYTES ||
             wc.byte_len != IO_HEADER + (payload ? req.length : 0) ||
-            req.sequence != ++c->sequence || req.status || req.reserved) {
+            req.sequence != ++c->sequence || req.status ||
+            (vector ? (!req.reserved || req.reserved > IO_SEGMENTS) :
+                      req.reserved != 0)) {
             io_fatal("invalid private request");
         }
         IOHeader *resp = (IOHeader *)c->tx;
@@ -327,6 +340,43 @@ static void *io_service(void *opaque)
                 bytes += req.length;
             }
             break;
+        case IO_READV:
+        case IO_WRITEV: {
+            IOVec *vec = (IOVec *)(c->rx + sizeof(IOHeader));
+            unsigned total = 0;
+            uint64_t ram_size = memory_region_size(io.ram[io.local]);
+            for (unsigned i = 0; i < req.reserved; i++) {
+                if (vec[i].reserved || !vec[i].length ||
+                    vec[i].length > req.length - total ||
+                    vec[i].offset > ram_size ||
+                    vec[i].length > ram_size - vec[i].offset) {
+                    io_fatal("invalid private vector");
+                }
+                total += vec[i].length;
+            }
+            if (total != req.length || req.offset) {
+                io_fatal("invalid private vector length");
+            }
+            bool write = req.operation == IO_WRITEV;
+            uint8_t *data = (write ? c->rx : c->tx) + IO_HEADER;
+            total = 0;
+            for (unsigned i = 0; i < req.reserved; ) {
+                uint64_t offset = vec[i].offset;
+                unsigned length = vec[i++].length;
+                while (i < req.reserved && vec[i].offset == offset + length) {
+                    length += vec[i++].length;
+                }
+                resp->status = io_guest_copy(offset, data + total, length, write);
+                if (resp->status) {
+                    break;
+                }
+                total += length;
+            }
+            if (!write && !resp->status) {
+                bytes += req.length;
+            }
+            break;
+        }
         case IO_ECHO:
             memcpy(c->tx + IO_HEADER, c->rx + IO_HEADER, req.length);
             bytes += req.length;
@@ -406,6 +456,125 @@ static void io_call(int peer, unsigned operation, uint64_t offset,
         qatomic_add(&io.write_bytes, length);
     }
     pthread_mutex_unlock(&c->lock);
+}
+
+
+/* Pack the scatter/gather list into one registered private RDMA buffer.
+ * Individual guest pages never appear in an RDMA MR or remote address.
+ */
+static void io_callv(int peer, bool write, IOMapping **maps,
+                      uint32_t *lengths, unsigned count)
+{
+    IOConnection *c = io.out[peer];
+    struct ibv_wc wc;
+    unsigned length = 0;
+    pthread_mutex_lock(&c->lock);
+    IOHeader *req = (IOHeader *)c->tx;
+    IOVec *vec = (IOVec *)(c->tx + sizeof(*req));
+    for (unsigned i = 0; i < count; i++) {
+        vec[i] = (IOVec) { .offset = maps[i]->offset, .length = lengths[i] };
+        if (write) {
+            memcpy(c->tx + IO_HEADER + length, maps[i]->buffer, lengths[i]);
+        }
+        length += lengths[i];
+    }
+    assert(count && count <= IO_SEGMENTS && length && length <= IO_BYTES);
+    *req = (IOHeader) {
+        .magic = IO_MAGIC, .version = IO_VERSION,
+        .operation = write ? IO_WRITEV : IO_READV,
+        .length = length, .sequence = ++c->sequence, .reserved = count,
+    };
+    io_post_recv(c);
+    io_post_send(c, IO_HEADER + (write ? length : 0));
+    unsigned seen = 0, received = 0;
+    while (seen != 3) {
+        if (io_completion(c, &wc, false) != 1 ||
+            (wc.wr_id != 1 && wc.wr_id != 2) ||
+            (seen & (unsigned)wc.wr_id)) {
+            io_fatal("private vector RPC completion");
+        }
+        seen |= wc.wr_id;
+        if (wc.wr_id == 2) {
+            received = wc.byte_len;
+        }
+    }
+    IOHeader *resp = (IOHeader *)c->rx;
+    if (received < IO_HEADER || resp->magic != IO_MAGIC ||
+        resp->version != IO_VERSION || resp->sequence != req->sequence ||
+        resp->operation != req->operation || resp->offset ||
+        resp->length != length || resp->reserved != count || resp->status ||
+        received != IO_HEADER + (write ? 0 : length)) {
+        io_fatal("private vector RPC response");
+    }
+    unsigned offset = 0;
+    for (unsigned i = 0; i < count; i++) {
+        if (!write) {
+            memcpy(maps[i]->buffer, c->rx + IO_HEADER + offset, lengths[i]);
+        } else {
+            maps[i]->published = true;
+        }
+        offset += lengths[i];
+    }
+    qatomic_inc(&io.calls);
+    if (write) {
+        qatomic_add(&io.write_bytes, length);
+    } else {
+        qatomic_add(&io.read_bytes, length);
+    }
+    pthread_mutex_unlock(&c->lock);
+}
+
+static void io_element_transfer(const VirtQueueElement *elem,
+                                 unsigned accessed, bool write)
+{
+    if (!io.initialized || !qatomic_read(&io.allocated)) {
+        return;
+    }
+    unsigned num = write ? elem->in_num : elem->out_num;
+    struct iovec *sg = write ? elem->in_sg : elem->out_sg;
+    IOMapping *maps[IO_SEGMENTS];
+    uint32_t lengths[IO_SEGMENTS];
+
+    for (int peer = 0; peer < io.nodes; peer++) {
+        if (peer == io.local) {
+            continue;
+        }
+        unsigned count = 0, bytes = 0, remaining = accessed;
+        for (unsigned i = 0; i < num; i++) {
+            unsigned length = write ? MIN(remaining, sg[i].iov_len) :
+                                      sg[i].iov_len;
+            if (write) {
+                remaining -= length;
+            }
+            pthread_mutex_lock(&io.maps_lock);
+            IOMapping *m = g_hash_table_lookup(io.maps, sg[i].iov_base);
+            pthread_mutex_unlock(&io.maps_lock);
+            if (!m || m->peer != peer || !length) {
+                continue;
+            }
+            assert(m->write == write && length <= m->length);
+            if (count == IO_SEGMENTS || length > IO_BYTES - bytes) {
+                io_callv(peer, write, maps, lengths, count);
+                count = bytes = 0;
+            }
+            maps[count] = m;
+            lengths[count++] = length;
+            bytes += length;
+        }
+        if (count) {
+            io_callv(peer, write, maps, lengths, count);
+        }
+    }
+}
+
+void gvm_private_io_prepare(const VirtQueueElement *elem)
+{
+    io_element_transfer(elem, 0, false);
+}
+
+void gvm_private_io_complete(const VirtQueueElement *elem, unsigned accessed)
+{
+    io_element_transfer(elem, accessed, true);
 }
 
 static bool io_get_enabled(Object *obj, Error **errp)
@@ -568,15 +737,14 @@ bool gvm_private_io_map(AddressSpace *as, hwaddr addr, hwaddr *len,
         *buffer = NULL;
         return true;
     }
-    io.allocated += length;
+    qatomic_add(&io.allocated, length);
     pthread_mutex_unlock(&io.maps_lock);
     m->buffer = qemu_memalign(4096, length);
-    if (!write) {
-        io_call(peer, IO_READ, offset, m->buffer, length);
-    } else {
+    if (write) {
         /* Do not expose uninitialized host data on a short backend read. */
         memset(m->buffer, 0, length);
     }
+    /* Output descriptors are fetched together after the whole chain is parsed. */
     pthread_mutex_lock(&io.maps_lock);
     g_hash_table_insert(io.maps, m->buffer, m);
     pthread_mutex_unlock(&io.maps_lock);
@@ -603,11 +771,11 @@ bool gvm_private_io_unmap(void *buffer, hwaddr accessed, bool write)
     if (m->write != write || accessed > m->length) {
         io_fatal("private mapping direction/length mismatch");
     }
-    if (write && accessed) {
-        io_call(m->peer, IO_WRITE, m->offset, m->buffer, accessed);
+    if (write && accessed && !m->published) {
+        io_fatal("private buffer released before publication");
     }
     pthread_mutex_lock(&io.maps_lock);
-    io.allocated -= m->length;
+    qatomic_sub(&io.allocated, m->length);
     pthread_mutex_unlock(&io.maps_lock);
     qemu_vfree(m->buffer);
     g_free(m);
