@@ -232,9 +232,12 @@ KVM `fdb8ce2d9` 改为与 RDMA 相同的 `fatal_signal_pending()` / kthread stop
 - 两端 QMP 均为 `method=tcp mode=0`，direct_bytes / lease_bytes 为 0。
   KVM DSM 连接为 10.0.16.104 与 10.0.16.91 的 TCP 连接。
 - host 出现既有 `mark_page_dirty_in_slot` WARNING，按用户要求记录但不因此重启。
-  Ezreal 启动时另有 SGX 关闭与重复 fstab 条目报错；本轮没有新增 DSM 错误或 hung-task。
+  Ezreal 启动时另有 SGX 关闭与重复 fstab 条目报错；运行和校验期间未出现新的 DSM 错误或 hung-task。
 - guest 正常 poweroff 后，两端 QEMU 退出码均为 0；两端随后均成功卸载并重新加载
   KVM 模块，没有遗留占用。slave 退出仍可能打印旧标签 `[RDMA] poll_cq error`，
   这是复用控制通道的日志标签，不表示 TCP 回退到了 RDMA。
+  此轮 Ezreal 的 KVM 在对端关闭连接时记录 `ktcp_receive ... ret -32` /
+  `dsm root server exited with -32`（EPIPE）；发生在关机阶段，两端仍正常退出且模块可卸载。
+  该退出日志尚未区分预期 EOF 与异常断连，因此不能把 host 日志概括为“完全无报错”。
 - 本次通过是在指定隔离配置下取得；没有重新验证不带 isolcpus 的启动，
   也不代表任意网络故障/强制终止均能完整回收。
