@@ -285,11 +285,19 @@ static int io_guest_copy(uint64_t offset, void *data, size_t length, bool write)
 static void *io_service(void *opaque)
 {
     IOConnection *c = opaque;
-    struct ibv_wc wc;
+    struct ibv_wc wc, pending;
+    bool have_pending = false;
     pthread_setname_np(pthread_self(), "gvm-io-memory");
     rcu_register_thread();
     while (!qatomic_read(&io.stopping)) {
-        int ret = io_completion(c, &wc, true);
+        int ret;
+        if (have_pending) {
+            wc = pending;
+            have_pending = false;
+            ret = 1;
+        } else {
+            ret = io_completion(c, &wc, true);
+        }
         if (!ret) {
             break;
         }
@@ -326,11 +334,25 @@ static void *io_service(void *opaque)
         default:
             io_fatal("unknown private operation");
         }
-        io_post_send(c, bytes);
-        if (io_completion(c, &wc, false) != 1 || wc.wr_id != 1) {
-            io_fatal("send private response");
-        }
+        /* Replenish before replying: otherwise the next request can hit
+         * RC receiver-not-ready retry, whose default delay is very large.
+         * The next receive completion may precede our send completion.
+         */
         io_post_recv(c);
+        io_post_send(c, bytes);
+        for (;;) {
+            if (io_completion(c, &wc, false) != 1) {
+                io_fatal("send private response");
+            }
+            if (wc.wr_id == 1) {
+                break;
+            }
+            if (wc.wr_id != 2 || have_pending) {
+                io_fatal("unexpected private receive completion");
+            }
+            pending = wc;
+            have_pending = true;
+        }
     }
     rcu_unregister_thread();
     return NULL;
