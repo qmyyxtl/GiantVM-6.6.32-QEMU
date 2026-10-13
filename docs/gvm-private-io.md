@@ -1,5 +1,7 @@
 # 巨虚磁盘私有 RDMA 缓冲区原型
 
+本文记录默认复制路径及初次验证。后续共用注册缓冲池与直接写 guest 的实现、启动开关和结果见 [RDMA 直接传输](gvm-rdma-direct-io.md)。
+
 此分支从 QEMU `53cf493234`（已恢复的 virtio-blk 基线）出发。Host KVM 保持
 `98793b608`，运行版本仍为 `6.6.32-krdma+`；guest 保持
 `6.12.0-vanilla-vfio #26`。本次仅修改 QEMU。

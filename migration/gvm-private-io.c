@@ -620,7 +620,7 @@ static void io_call(int peer, unsigned operation, uint64_t offset,
 
 
 
-/* Unsigned data WRs precede a signaled SEND on the same RC QP. The SEND
+/* Unsignaled data WRs precede a signaled SEND on the same RC QP. The SEND
  * completion retires the entire chain; the peer processes it only after
  * data visibility. No relaxed-ordering MR or cross-QP dependency is used. */
 static void io_post_pool_write(IOConnection *c, IOMapping **maps,
@@ -718,8 +718,9 @@ static void io_direct_write(IOConnection *c, IOMapping **maps,
     qatomic_add(&io.write_bytes, length);
 }
 
-/* Pack the scatter/gather list into one registered private RDMA buffer.
- * Individual guest pages never appear in an RDMA MR or remote address.
+/* Default mode packs data into the registered SEND buffer. Pool mode
+ * sends directly from disk buffers; direct mode additionally leases the
+ * receiver's guest pages for DMA. Small guest accesses retain memcpy.
  */
 static void io_callv(int peer, bool write, IOMapping **maps,
                       uint32_t *lengths, unsigned count)
