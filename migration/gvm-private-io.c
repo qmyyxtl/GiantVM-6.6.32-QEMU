@@ -9,6 +9,7 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
+#include "qemu/bitmap.h"
 #include "qemu/rcu.h"
 #include "qemu/memalign.h"
 #include "qemu/error-report.h"
@@ -31,12 +32,15 @@
 #define IO_HEADER 4096
 #define IO_BUFFER (IO_HEADER + IO_BYTES)
 #define IO_MAGIC 0x4756494f
-#define IO_VERSION 2
+#define IO_VERSION 3
 #define IO_READ 1
 #define IO_WRITE 2
 #define IO_ECHO 3
 #define IO_READV 4
 #define IO_WRITEV 5
+#define IO_WRITE_POOL 6
+#define IO_PAGE 4096
+#define IO_POOL_PAGES (IO_POOL_LIMIT / IO_PAGE)
 #define IO_SEGMENTS 240
 #define IO_POOL_LIMIT (64 * 1024 * 1024)
 
@@ -52,12 +56,18 @@ typedef struct IOVec {
     uint32_t length, reserved;
 } IOVec;
 
+typedef struct IORemote {
+    uint64_t address;
+    uint32_t rkey, mode;
+} IORemote;
+
 typedef struct IOConnection {
     struct rdma_cm_id *id;
     struct ibv_pd *pd;
     struct ibv_cq *cq;
     struct ibv_comp_channel *events;
-    struct ibv_mr *tx_mr, *rx_mr;
+    struct ibv_mr *tx_mr, *rx_mr, *pool_mr;
+    IORemote remote_pool;
     uint8_t *tx, *rx;
     pthread_mutex_t lock;
     uint64_t sequence;
@@ -75,6 +85,10 @@ typedef struct IOMapping {
 
 static struct {
     bool initialized, enabled, stopping;
+    unsigned mode; /* 0: copies, 1: registered pool, 2: DSM-authorized direct */
+    uint8_t *pool;
+    unsigned long *pool_used;
+    uint64_t send_zcopy_bytes;
     int local, nodes;
     MemoryRegion *ram[IO_NODES];
     IOConnection *out[IO_NODES], *in[IO_NODES];
@@ -200,7 +214,7 @@ static IOConnection *io_resources(struct rdma_cm_id *id, int peer)
     IOConnection *c = g_new0(IOConnection, 1);
     struct ibv_qp_init_attr qp = {
         .qp_type = IBV_QPT_RC,
-        .cap = { .max_send_wr = 4, .max_recv_wr = 4,
+        .cap = { .max_send_wr = IO_SEGMENTS + 2, .max_recv_wr = 4,
                  .max_send_sge = 1, .max_recv_sge = 1 },
     };
     c->id = id;
@@ -221,7 +235,14 @@ static IOConnection *io_resources(struct rdma_cm_id *id, int peer)
     memset(c->tx, 0, IO_BUFFER);
     memset(c->rx, 0, IO_BUFFER);
     c->tx_mr = ibv_reg_mr(c->pd, c->tx, IO_BUFFER, IBV_ACCESS_LOCAL_WRITE);
-    c->rx_mr = ibv_reg_mr(c->pd, c->rx, IO_BUFFER, IBV_ACCESS_LOCAL_WRITE);
+    c->rx_mr = ibv_reg_mr(c->pd, c->rx, IO_BUFFER,
+                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (io.mode) {
+        c->pool_mr = ibv_reg_mr(c->pd, io.pool, IO_POOL_LIMIT, 0);
+        if (!c->pool_mr) {
+            io_fatal("register disk/RDMA shared pool");
+        }
+    }
     if (!c->tx_mr || !c->rx_mr) {
         io_fatal("register private memory");
     }
@@ -314,7 +335,8 @@ static void *io_service(void *opaque)
             io_fatal("receive private request");
         }
         IOHeader req = *(IOHeader *)c->rx;
-        bool vector = req.operation == IO_READV || req.operation == IO_WRITEV;
+        bool vector = req.operation == IO_READV || req.operation == IO_WRITEV ||
+                      req.operation == IO_WRITE_POOL;
         bool payload = req.operation == IO_WRITE || req.operation == IO_ECHO ||
                        req.operation == IO_WRITEV;
         if (req.magic != IO_MAGIC || req.version != IO_VERSION ||
@@ -341,7 +363,8 @@ static void *io_service(void *opaque)
             }
             break;
         case IO_READV:
-        case IO_WRITEV: {
+        case IO_WRITEV:
+        case IO_WRITE_POOL: {
             IOVec *vec = (IOVec *)(c->rx + sizeof(IOHeader));
             unsigned total = 0;
             uint64_t ram_size = memory_region_size(io.ram[io.local]);
@@ -357,7 +380,10 @@ static void *io_service(void *opaque)
             if (total != req.length || req.offset) {
                 io_fatal("invalid private vector length");
             }
-            bool write = req.operation == IO_WRITEV;
+            bool write = req.operation != IO_READV;
+            if (req.operation == IO_WRITE_POOL && !io.mode) {
+                io_fatal("unnegotiated pool write");
+            }
             uint8_t *data = (write ? c->rx : c->tx) + IO_HEADER;
             total = 0;
             for (unsigned i = 0; i < req.reserved; ) {
@@ -378,6 +404,10 @@ static void *io_service(void *opaque)
             break;
         }
         case IO_ECHO:
+            *(IORemote *)(c->tx + sizeof(IOHeader)) = (IORemote) {
+                .address = (uintptr_t)c->rx + IO_HEADER,
+                .rkey = c->rx_mr->rkey, .mode = io.mode,
+            };
             memcpy(c->tx + IO_HEADER, c->rx + IO_HEADER, req.length);
             bytes += req.length;
             break;
@@ -446,6 +476,12 @@ static void io_call(int peer, unsigned operation, uint64_t offset,
         received != IO_HEADER + (result_data ? length : 0)) {
         io_fatal("private RPC response");
     }
+    if (operation == IO_ECHO) {
+        c->remote_pool = *(IORemote *)(c->rx + sizeof(IOHeader));
+        if (c->remote_pool.mode != io.mode) {
+            io_fatal("private I/O mode mismatch");
+        }
+    }
     if (result_data) {
         memcpy(buffer, c->rx + IO_HEADER, length);
     }
@@ -458,6 +494,46 @@ static void io_call(int peer, unsigned operation, uint64_t offset,
     pthread_mutex_unlock(&c->lock);
 }
 
+
+
+/* Unsigned data WRs precede a signaled SEND on the same RC QP. The SEND
+ * completion retires the entire chain; the peer processes it only after
+ * data visibility. No relaxed-ordering MR or cross-QP dependency is used. */
+static void io_post_pool_write(IOConnection *c, IOMapping **maps,
+                                uint32_t *lengths, unsigned count,
+                                uint64_t base, uint32_t rkey, bool guest)
+{
+    struct ibv_sge sge[IO_SEGMENTS];
+    struct ibv_send_wr wr[IO_SEGMENTS], *bad;
+    uint64_t offset = 0;
+    unsigned n = 0;
+    for (unsigned i = 0; i < count; i++) {
+        uint64_t remote = base + (guest ? maps[i]->offset : offset);
+        uintptr_t local = (uintptr_t)maps[i]->buffer;
+        if (n && sge[n - 1].addr + sge[n - 1].length == local &&
+            wr[n - 1].wr.rdma.remote_addr + sge[n - 1].length == remote) {
+            sge[n - 1].length += lengths[i];
+        } else {
+            sge[n] = (struct ibv_sge) {
+                .addr = local, .length = lengths[i], .lkey = c->pool_mr->lkey,
+            };
+            wr[n] = (struct ibv_send_wr) {
+                .wr_id = 3, .sg_list = &sge[n], .num_sge = 1,
+                .opcode = IBV_WR_RDMA_WRITE,
+                .wr.rdma = { .remote_addr = remote, .rkey = rkey },
+            };
+            if (n) {
+                wr[n - 1].next = &wr[n];
+            }
+            n++;
+        }
+        offset += lengths[i];
+    }
+    if (ibv_post_send(c->id->qp, wr, &bad)) {
+        io_fatal("post private pool data");
+    }
+    qatomic_add(&io.send_zcopy_bytes, offset);
+}
 
 /* Pack the scatter/gather list into one registered private RDMA buffer.
  * Individual guest pages never appear in an RDMA MR or remote address.
@@ -473,7 +549,7 @@ static void io_callv(int peer, bool write, IOMapping **maps,
     IOVec *vec = (IOVec *)(c->tx + sizeof(*req));
     for (unsigned i = 0; i < count; i++) {
         vec[i] = (IOVec) { .offset = maps[i]->offset, .length = lengths[i] };
-        if (write) {
+        if (write && !io.mode) {
             memcpy(c->tx + IO_HEADER + length, maps[i]->buffer, lengths[i]);
         }
         length += lengths[i];
@@ -481,11 +557,15 @@ static void io_callv(int peer, bool write, IOMapping **maps,
     assert(count && count <= IO_SEGMENTS && length && length <= IO_BYTES);
     *req = (IOHeader) {
         .magic = IO_MAGIC, .version = IO_VERSION,
-        .operation = write ? IO_WRITEV : IO_READV,
+        .operation = write ? (io.mode ? IO_WRITE_POOL : IO_WRITEV) : IO_READV,
         .length = length, .sequence = ++c->sequence, .reserved = count,
     };
     io_post_recv(c);
-    io_post_send(c, IO_HEADER + (write ? length : 0));
+    if (write && io.mode) {
+        io_post_pool_write(c, maps, lengths, count, c->remote_pool.address,
+                           c->remote_pool.rkey, false);
+    }
+    io_post_send(c, IO_HEADER + (write && !io.mode ? length : 0));
     unsigned seen = 0, received = 0;
     while (seen != 3) {
         if (io_completion(c, &wc, false) != 1 ||
@@ -587,10 +667,11 @@ static void io_get_stats(Object *obj, Visitor *v, const char *name,
 {
     g_autofree char *stats = g_strdup_printf(
         "calls=%" PRIu64 " read_bytes=%" PRIu64 " write_bytes=%" PRIu64
-        " remote_maps=%" PRIu64 " local_maps=%" PRIu64,
+        " remote_maps=%" PRIu64 " local_maps=%" PRIu64
+        " mode=%u send_zcopy_bytes=%" PRIu64,
         qatomic_read(&io.calls), qatomic_read(&io.read_bytes),
         qatomic_read(&io.write_bytes), qatomic_read(&io.remote_maps),
-        qatomic_read(&io.local_maps));
+        qatomic_read(&io.local_maps), io.mode, qatomic_read(&io.send_zcopy_bytes));
     visit_type_str(v, name, &stats, errp);
 }
 
@@ -603,6 +684,19 @@ void gvm_private_io_start(int local, int nodes, char **hosts)
     if (nodes < 2 || nodes > IO_NODES || !ms->numa_state ||
         ms->numa_state->num_nodes != nodes || ms->shm_path) {
         io_fatal("requires one RAM memdev per distributed NUMA node");
+    }
+    const char *mode = getenv("GVM_PRIVATE_IO_ZCOPY");
+    if (!mode || !strcmp(mode, "off")) {
+        io.mode = 0;
+    } else if (!strcmp(mode, "send")) {
+        io.mode = 1;
+    } else {
+        io_fatal("unknown GVM_PRIVATE_IO_ZCOPY mode");
+    }
+    if (io.mode) {
+        io.pool = qemu_memalign(IO_PAGE, IO_POOL_LIMIT);
+        memset(io.pool, 0, IO_POOL_LIMIT);
+        io.pool_used = bitmap_new(IO_POOL_PAGES);
     }
     io.local = local;
     io.nodes = nodes;
@@ -737,9 +831,23 @@ bool gvm_private_io_map(AddressSpace *as, hwaddr addr, hwaddr *len,
         *buffer = NULL;
         return true;
     }
+    if (io.mode) {
+        unsigned pages = DIV_ROUND_UP(length, IO_PAGE);
+        unsigned first = bitmap_find_next_zero_area(io.pool_used, IO_POOL_PAGES,
+                                                     0, pages, 0);
+        if (first >= IO_POOL_PAGES || pages > IO_POOL_PAGES - first) {
+            pthread_mutex_unlock(&io.maps_lock);
+            g_free(m);
+            *buffer = NULL;
+            return true;
+        }
+        bitmap_set(io.pool_used, first, pages);
+        m->buffer = io.pool + first * IO_PAGE;
+    } else {
+        m->buffer = qemu_memalign(IO_PAGE, length);
+    }
     qatomic_add(&io.allocated, length);
     pthread_mutex_unlock(&io.maps_lock);
-    m->buffer = qemu_memalign(4096, length);
     if (write) {
         /* Do not expose uninitialized host data on a short backend read. */
         memset(m->buffer, 0, length);
@@ -776,8 +884,14 @@ bool gvm_private_io_unmap(void *buffer, hwaddr accessed, bool write)
     }
     pthread_mutex_lock(&io.maps_lock);
     qatomic_sub(&io.allocated, m->length);
+    if (io.mode) {
+        bitmap_clear(io.pool_used, ((uint8_t *)m->buffer - io.pool) / IO_PAGE,
+                     DIV_ROUND_UP(m->length, IO_PAGE));
+    }
     pthread_mutex_unlock(&io.maps_lock);
-    qemu_vfree(m->buffer);
+    if (!io.mode) {
+        qemu_vfree(m->buffer);
+    }
     g_free(m);
     return true;
 }
