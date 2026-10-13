@@ -179,6 +179,11 @@ static int io_completion(IOConnection *c, struct ibv_wc *wc, bool idle)
             return -1;
         }
         if (n) {
+            if (wc->status != IBV_WC_SUCCESS) {
+                error_report("private RDMA WC: %s id=%" PRIu64 " vendor=%u",
+                             ibv_wc_status_str(wc->status), wc->wr_id,
+                             wc->vendor_err);
+            }
             return wc->status == IBV_WC_SUCCESS ? 1 : -1;
         }
         if (qatomic_read(&io.stopping)) {
@@ -340,7 +345,10 @@ static void io_lease_pin(IOConnection *c, bool unpin)
         if (unpin) {
             memory_region_set_dirty(mr, offset, length);
         }
-        if (kvm_vm_ioctl(kvm_state, KVM_DSM_MEMPIN, &pin)) {
+        int ret = kvm_vm_ioctl(kvm_state, KVM_DSM_MEMPIN, &pin);
+        /* DSM faults may return a positive access-right mask on success. */
+        if (ret < 0) {
+            errno = -ret;
             io_fatal(unpin ? "release guest DMA lease" : "acquire guest DMA lease");
         }
         if (!unpin) {
