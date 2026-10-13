@@ -568,6 +568,11 @@ static void router_set_rpc_spin_ns(Object *obj, Visitor *v, const char *name,
     }
 }
 
+static char *router_get_method(Object *obj, Error **errp)
+{
+    return g_strdup(gvm_transport_method());
+}
+
 void start_io_router(void)
 {
     MachineState *ms = MACHINE(qdev_get_machine());
@@ -600,10 +605,11 @@ void start_io_router(void)
                                40000);
     
     if (ret < 0) {
-        error_report("Failed to initialize RDMA router");
+        error_report("Failed to initialize %s router", gvm_transport_method());
         exit(1);
     }
     
+    object_property_add_str(OBJECT(ms), "gvm-method", router_get_method, NULL);
     object_property_add_bool(OBJECT(ms), "loom-rdma-recv-cq-events",
                              router_get_recv_cq_events,
                              router_set_recv_cq_events);

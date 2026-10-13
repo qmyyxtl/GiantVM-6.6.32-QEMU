@@ -49,6 +49,10 @@ tests = {
   'test-interval-tree': [],
 }
 
+if host_os == 'linux'
+  tests += {'test-gvm-transport': ['../../migration/gvm-transport.c']}
+endif
+
 if have_system or have_tools
   tests += {
     'test-qmp-event': [testqapi],

@@ -42,6 +42,12 @@ except (ValueError, OSError, subprocess.CalledProcessError) as error:
     print(f"GVM startup address validation failed: {error}", file=sys.stderr)
     sys.exit(2)
 PY
+# The current DSM LAPIC forwarding path requires software APIC handling.
+if [[ -r /sys/module/kvm_intel/parameters/enable_apicv ]] &&
+   [[ $(cat /sys/module/kvm_intel/parameters/enable_apicv) != N ]]; then
+    echo 'GVM requires kvm_intel enable_apicv=0; stop VMs before reloading the module' >&2
+    exit 2
+fi
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 export LOOM_DEVICE_AGGREGATION=1
 machine=${GVM_MACHINE:-pc}

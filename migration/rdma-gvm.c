@@ -879,7 +879,7 @@ static int rdma_send_msg(rdma_conn_t *conn, rdma_msg_header_t *hdr, const void *
                                      sizeof(*hdr) + hdr->data_len, 30000);
         if (ret < 0) { conn->failed = true; }
         pthread_mutex_unlock(&conn->send_lock);
-        return ret < 0 ? ret : sizeof(*hdr) + hdr->data_len;
+        return ret < 0 ? ret : (int)(sizeof(*hdr) + hdr->data_len);
     }
     // Copy message
     void *buf = conn->send_bufs[buf_idx];
@@ -958,7 +958,7 @@ static void *request_worker_func(void *arg)
     router_worker_t *worker = &g_ctx.workers[peer];
 
     free(arg);
-    pthread_setname_np(pthread_self(), "gvm-rdma-req");
+    pthread_setname_np(pthread_self(), gvm_transport_tcp ? "gvm-tcp-req" : "gvm-rdma-req");
     rcu_register_thread();
     for (;;) {
         router_work_t *work;
@@ -1069,7 +1069,7 @@ static void* recv_thread_func(void *arg)
 {
     int peer_id = *(int*)arg;
     free(arg);
-    pthread_setname_np(pthread_self(), "gvm-rdma-rx");
+    pthread_setname_np(pthread_self(), gvm_transport_tcp ? "gvm-tcp-rx" : "gvm-rdma-rx");
     
     rdma_conn_t *conn = g_ctx.recv_conns[peer_id];
     debugf("[RDMA Router] Recv thread started for peer %d\n", peer_id);
@@ -1237,7 +1237,7 @@ int rdma_router_call(int target_id, uint16_t msg_type,
     while (rdma_monotonic_ms() < deadline) {
         struct ibv_wc wc;
         int n = gvm_transport_tcp ?
-            tcp_router_recv(resp, &wc, timeout_ms) :
+            tcp_router_recv(resp, &wc, MIN(timeout_ms, deadline - rdma_monotonic_ms() + 1)) :
             ibv_poll_cq(resp->cq, 1, &wc);
         if (n < 0) {
             goto out;
@@ -1278,6 +1278,10 @@ int rdma_router_call(int target_id, uint16_t msg_type,
     result = -ETIMEDOUT;
 out:
     pthread_mutex_unlock(&req->response_lock);
+    if (gvm_transport_tcp && result < 0 && qatomic_read(&g_ctx.running)) {
+        fprintf(stderr, "GVM TCP RPC failed (%d); stopping before further I/O\n", result);
+        _exit(EXIT_FAILURE);
+    }
     return result;
 }
 
