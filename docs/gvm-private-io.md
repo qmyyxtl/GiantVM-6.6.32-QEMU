@@ -137,3 +137,19 @@ SHA256 `f66b94b34f4ac12d07b59a97876c6ff775c3ae491db22e5e5ffea6e6a2e458aa`。
 `--owner 1 --seconds 15 --rounds 5 --skip-prefill`。
 该脚本只允许序列号匹配的专用 1 GiB 测试盘；写测试会覆盖其内容。
 
+
+## 数据路径计数核验
+
+最终启用状态下，另外运行一次带短时 kprobe 的跨机读检查（性能数字不计入上面的无探针中位数）。
+20 秒探针窗口覆盖一段约 8 秒的读取及准备/收尾：
+
+- guest 实际完成 8,538,554,368 字节（约 7.95 GiB），并访问每个页面、完成块校验。
+- Garen 设备 owner 的 DSM pin 总字节数为 871,568（不足 1 MiB），包含窗口内控制路径。
+- Ezreal 的 `gvm-io-memory` 执行 DSM memcpy 共 8,547,081,668 字节；
+  该线程在窗口内没有触发 `kvm_dsm_fetch`。
+- 两端 vCPU、ring/控制路径仍有 DSM fetch，不能声称整个 I/O 过程完全没有 DSM。
+- 这证明大块读数据没有通过设备 owner 的逐页 DSM pin 取得；
+  guest RAM 的最终发布仍由内存节点的 DSM memcpy 保护。
+
+探针已退出。最终重启巨虚后，四路随机读写/跨 CPU 读回检查再次全部通过（约 2.18 秒）。
+两端运行相同 QEMU 源码；host KVM、guest 内核、HPET、raw 后端和 `-nic none` 保持原配置。
