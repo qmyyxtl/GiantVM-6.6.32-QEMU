@@ -22,6 +22,7 @@
 #include "migration/blocker.h"
 #include "gvm-private-io.h"
 #include "gvm-transport.h"
+#include "interrupt-router.h"
 #include <linux/kvm.h>
 #include <rdma/rdma_cma.h>
 #include <infiniband/verbs.h>
@@ -130,7 +131,17 @@ static int io_cm_event(struct rdma_event_channel *ch,
 {
     struct pollfd p = { .fd = ch->fd, .events = POLLIN };
     struct rdma_cm_event *event;
-    if (poll(&p, 1, 30000) != 1 || rdma_get_cm_event(ch, &event)) {
+    int ret;
+    do {
+        ret = poll(&p, 1, 30000);
+    } while (ret < 0 && errno == EINTR);
+    if (ret <= 0) {
+        if (!ret) {
+            errno = ETIMEDOUT;
+        }
+        return -1;
+    }
+    if (rdma_get_cm_event(ch, &event)) {
         return -1;
     }
     bool ok = event->event == expected && !event->status;
@@ -143,6 +154,9 @@ static int io_cm_event(struct rdma_event_channel *ch,
                      event->status);
     }
     rdma_ack_cm_event(event);
+    if (!ok) {
+        errno = ECONNREFUSED;
+    }
     return ok ? 0 : -1;
 }
 
@@ -934,6 +948,11 @@ static void io_tcp_start(char **hosts)
             io_fatal("TCP private listen");
         }
     }
+    int ready = gvm_private_io_listeners_ready(io.local, io.nodes);
+    if (ready < 0) {
+        errno = -ready;
+        io_fatal("wait for TCP private listeners");
+    }
     for (int peer = 0; peer < io.nodes; peer++) {
         if (peer == io.local) { continue; }
         for (int step = 0; step < 2; step++) {
@@ -1014,6 +1033,11 @@ void gvm_private_io_start(int local, int nodes, char **hosts)
             rdma_listen(listeners[peer], 1)) {
             io_fatal("listen private RDMA");
         }
+    }
+    int ready = gvm_private_io_listeners_ready(local, nodes);
+    if (ready < 0) {
+        errno = -ready;
+        io_fatal("wait for RDMA private listeners");
     }
     for (int peer = 0; peer < nodes; peer++) {
         if (peer == local) {

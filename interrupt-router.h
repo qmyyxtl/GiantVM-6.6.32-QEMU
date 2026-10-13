@@ -32,6 +32,7 @@ struct connect_thread_arg {
 };
 
 void start_io_router(void);
+int gvm_private_io_listeners_ready(unsigned local, unsigned nodes);
 
 void mmio_forwarding(hwaddr addr, MemTxAttrs attrs, uint8_t *buf, int len, bool is_write);
 void pio_forwarding(uint16_t port, MemTxAttrs attrs, void *data, int direction, int size, uint32_t count, bool broadcast);

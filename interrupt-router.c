@@ -58,6 +58,7 @@ enum forward_type {
     LOOM_MSI,
     LOOM_DIRECTORY_UPDATE,
     LOOM_DIRECTORY_ACK,
+    GVM_PRIVATE_IO_READY,
 };
 
 
@@ -96,11 +97,57 @@ static int loom_notify(unsigned peer, uint16_t type, const void *payload,
     return rdma_router_notify(peer, type, data, size + sizeof(cpu));
 }
 
+/* Startup-only rendezvous, before either peer connects its private I/O lane. */
+static unsigned private_io_ready_mask;
+
+int gvm_private_io_listeners_ready(unsigned local, unsigned nodes)
+{
+    uint32_t version = 1;
+    unsigned peers;
+    int64_t deadline = g_get_monotonic_time() + 30 * G_USEC_PER_SEC;
+
+    if (!nodes || nodes > 31 || local >= nodes) {
+        return -EINVAL;
+    }
+    peers = ((1U << nodes) - 1) & ~(1U << local);
+    for (unsigned peer = 0; peer < nodes; peer++) {
+        if (peer != local) {
+            int ret = loom_notify(peer, GVM_PRIVATE_IO_READY,
+                                  &version, sizeof(version));
+            if (ret < 0) {
+                return ret;
+            }
+        }
+    }
+    while ((qatomic_read(&private_io_ready_mask) & peers) != peers) {
+        if (g_get_monotonic_time() >= deadline) {
+            return -ETIMEDOUT;
+        }
+        g_usleep(1000);
+    }
+    return 0;
+}
+
 /* Runs directly in the CQ receive thread, never under the BQL. */
 static int handle_directory_control(int peer, rdma_msg_header_t *hdr,
                                     void *data)
 {
     uint8_t *payload = data;
+    if (hdr->msg_type == GVM_PRIVATE_IO_READY) {
+        uint32_t version;
+        if (peer < 0 || peer >= 31 || hdr->flags != 1 ||
+            hdr->data_len != sizeof(int32_t) + sizeof(version)) {
+            error_report("GVM private I/O: malformed listener-ready message");
+            exit(EXIT_FAILURE);
+        }
+        memcpy(&version, payload + sizeof(int32_t), sizeof(version));
+        if (version != 1) {
+            error_report("GVM private I/O: incompatible listener-ready version");
+            exit(EXIT_FAILURE);
+        }
+        qatomic_or(&private_io_ready_mask, 1U << peer);
+        return 1;
+    }
     if ((hdr->msg_type == SHUTDOWN || hdr->msg_type == EXIT) &&
         hdr->flags == 1 && hdr->data_len == sizeof(int32_t)) {
         /* Observe lifecycle intent before EOF can overtake the worker. */
