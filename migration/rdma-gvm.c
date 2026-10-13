@@ -1079,7 +1079,8 @@ static void* recv_thread_func(void *arg)
         int n = rdma_recv_completion(conn, &wc);
         
         if (n < 0) {
-            if (gvm_transport_tcp && qatomic_read(&g_ctx.running)) {
+            if (gvm_transport_tcp && qatomic_read(&g_ctx.running) &&
+                !qatomic_read(&gvm_transport_stopping)) {
                 fprintf(stderr, "GVM TCP router connection failed; stopping VM\n");
                 _exit(EXIT_FAILURE);
             }
@@ -1278,7 +1279,8 @@ int rdma_router_call(int target_id, uint16_t msg_type,
     result = -ETIMEDOUT;
 out:
     pthread_mutex_unlock(&req->response_lock);
-    if (gvm_transport_tcp && result < 0 && qatomic_read(&g_ctx.running)) {
+    if (gvm_transport_tcp && result < 0 && qatomic_read(&g_ctx.running) &&
+        !qatomic_read(&gvm_transport_stopping)) {
         fprintf(stderr, "GVM TCP RPC failed (%d); stopping before further I/O\n", result);
         _exit(EXIT_FAILURE);
     }

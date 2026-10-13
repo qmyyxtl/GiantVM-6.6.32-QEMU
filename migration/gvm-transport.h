@@ -3,6 +3,8 @@
 #define GVM_TRANSPORT_H
 /* Selected once by -local-cpu method=tcp|rdma, shared by all GVM channels. */
 extern bool gvm_transport_tcp;
+/* Set only for explicit cluster shutdown/exit, never on a network error. */
+extern bool gvm_transport_stopping;
 const char *gvm_transport_method(void);
 int gvm_tcp_listen(const char *host, int port);
 int gvm_tcp_connect(const char *host, int port);

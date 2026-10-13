@@ -6,6 +6,7 @@
 #include <poll.h>
 
 bool gvm_transport_tcp;
+bool gvm_transport_stopping;
 
 const char *gvm_transport_method(void)
 {

@@ -101,6 +101,12 @@ static int handle_directory_control(int peer, rdma_msg_header_t *hdr,
                                     void *data)
 {
     uint8_t *payload = data;
+    if ((hdr->msg_type == SHUTDOWN || hdr->msg_type == EXIT) &&
+        hdr->flags == 1 && hdr->data_len == sizeof(int32_t)) {
+        /* Observe lifecycle intent before EOF can overtake the worker. */
+        qatomic_set(&gvm_transport_stopping, true);
+        return 0;
+    }
     if (hdr->msg_type != LOOM_DIRECTORY_UPDATE &&
         hdr->msg_type != LOOM_DIRECTORY_ACK) {
         return 0;
@@ -1088,6 +1094,7 @@ void kvmclock_fetching(uint64_t *kvmclock)
 
 void shutdown_forwarding(void)
 {
+    qatomic_set(&gvm_transport_stopping, true);
     qemu_mutex_lock(&io_forwarding_mutex);
     debugf("[RDMA Router] Shutdown forwarding\n");
     MachineState *ms = MACHINE(qdev_get_machine());
@@ -1136,6 +1143,7 @@ void reset_forwarding(void)
 
 void exit_forwarding(void)
 {
+    qatomic_set(&gvm_transport_stopping, true);
     qemu_mutex_lock(&io_forwarding_mutex);
     debugf("[RDMA Router] Exit forwarding\n");
     MachineState *ms = MACHINE(qdev_get_machine());

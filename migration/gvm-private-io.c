@@ -196,7 +196,11 @@ static int io_completion(IOConnection *c, struct ibv_wc *wc, bool idle)
         }
         if (qatomic_read(&io.stopping)) { return 0; }
         int ret = gvm_tcp_recv_frame(c->tcp_fd, c->rx, IO_BUFFER, 30000);
-        if (ret < 0) { errno = -ret; return -1; }
+        if (ret < 0) {
+            if (qatomic_read(&gvm_transport_stopping)) { return 0; }
+            errno = -ret;
+            return -1;
+        }
         *wc = (struct ibv_wc) { .wr_id = 2, .byte_len = ret };
         return 1;
     }
