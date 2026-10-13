@@ -328,6 +328,39 @@ static int io_guest_copy(uint64_t offset, void *data, size_t length, bool write)
  * lifetime pin. No DSM mutex is held while waiting for a network completion.
  * Fixed RAM topology, no migration, and cooperative trusted peers are required.
  */
+
+static int io_lease_compare(const void *a, const void *b)
+{
+    const IOVec *x = a, *y = b;
+    return (x->offset > y->offset) - (x->offset < y->offset);
+}
+
+/* DSM protects pages, not byte ranges. Sort and coalesce exactly the pages
+ * covered by the request (never bridge an unrequested page). This avoids
+ * hundreds of ioctl pairs for a physically scattered virtqueue chain.
+ */
+static void io_lease_ranges(IOConnection *c, IOVec *vec, unsigned count)
+{
+    for (unsigned i = 0; i < count; i++) {
+        uint64_t start = QEMU_ALIGN_DOWN(vec[i].offset, IO_PAGE);
+        uint64_t end = QEMU_ALIGN_UP(vec[i].offset + vec[i].length, IO_PAGE);
+        c->lease[i] = (IOVec) { .offset = start, .length = end - start };
+    }
+    qsort(c->lease, count, sizeof(c->lease[0]), io_lease_compare);
+    unsigned n = 0;
+    for (unsigned i = 0; i < count; i++) {
+        IOVec v = c->lease[i];
+        if (n && v.offset <= c->lease[n - 1].offset + c->lease[n - 1].length) {
+            uint64_t end = MAX(v.offset + v.length,
+                              c->lease[n - 1].offset + c->lease[n - 1].length);
+            c->lease[n - 1].length = end - c->lease[n - 1].offset;
+        } else {
+            c->lease[n++] = v;
+        }
+    }
+    c->lease_count = n;
+}
+
 static void io_lease_pin(IOConnection *c, bool unpin)
 {
     MemoryRegion *mr = io.ram[io.local];
@@ -448,8 +481,7 @@ static void *io_service(void *opaque)
                         io_fatal("register fixed guest RAM backing");
                     }
                 }
-                memcpy(c->lease, vec, req.reserved * sizeof(*vec));
-                c->lease_count = req.reserved;
+                io_lease_ranges(c, vec, req.reserved);
                 c->lease_length = req.length;
                 c->lease_sequence = req.sequence;
                 io_lease_pin(c, false);
