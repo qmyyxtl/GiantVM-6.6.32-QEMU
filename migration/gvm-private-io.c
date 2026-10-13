@@ -2,10 +2,10 @@
  * Request-scoped private-buffer RDMA transport for distributed virtio-blk.
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * A prototype two-sided bulk transport: registered private SEND/RECV buffers
- * on dedicated RC QPs/CQs/threads. No guest page is registered for remote DMA.
- * NUMA is a routing hint, not proof of DSM ownership: the memory home always
- * uses KVM_DSM_MEMCPY to acquire coherent access before copying.
+ * Dedicated RC QPs/CQs/threads. Optional registered disk-buffer pool removes
+ * sender copies; optional receiver DSM leases permit direct DMA to guest RAM.
+ * NUMA is a routing hint, not proof of DSM ownership: the memory home uses
+ * KVM_DSM_MEMCPY or KVM_DSM_MEMPIN before accessing its local guest replica.
  */
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
@@ -39,6 +39,8 @@
 #define IO_READV 4
 #define IO_WRITEV 5
 #define IO_WRITE_POOL 6
+#define IO_LEASE_WRITE 7
+#define IO_COMMIT_WRITE 8
 #define IO_PAGE 4096
 #define IO_POOL_PAGES (IO_POOL_LIMIT / IO_PAGE)
 #define IO_SEGMENTS 240
@@ -68,6 +70,10 @@ typedef struct IOConnection {
     struct ibv_comp_channel *events;
     struct ibv_mr *tx_mr, *rx_mr, *pool_mr;
     IORemote remote_pool;
+    struct ibv_mr *guest_mr;
+    IOVec lease[IO_SEGMENTS];
+    unsigned lease_count, lease_length;
+    uint64_t lease_sequence;
     uint8_t *tx, *rx;
     pthread_mutex_t lock;
     uint64_t sequence;
@@ -88,7 +94,7 @@ static struct {
     unsigned mode; /* 0: copies, 1: registered pool, 2: DSM-authorized direct */
     uint8_t *pool;
     unsigned long *pool_used;
-    uint64_t send_zcopy_bytes;
+    uint64_t send_zcopy_bytes, direct_bytes, lease_bytes, lease_calls;
     int local, nodes;
     MemoryRegion *ram[IO_NODES];
     IOConnection *out[IO_NODES], *in[IO_NODES];
@@ -312,6 +318,38 @@ static int io_guest_copy(uint64_t offset, void *data, size_t length, bool write)
     return 0;
 }
 
+
+/* A DMA lease pins DSM ownership, separately from the MR's physical-page
+ * lifetime pin. No DSM mutex is held while waiting for a network completion.
+ * Fixed RAM topology, no migration, and cooperative trusted peers are required.
+ */
+static void io_lease_pin(IOConnection *c, bool unpin)
+{
+    MemoryRegion *mr = io.ram[io.local];
+    for (unsigned i = 0; i < c->lease_count; ) {
+        uint64_t offset = c->lease[i].offset;
+        unsigned length = c->lease[i++].length;
+        while (i < c->lease_count && c->lease[i].offset == offset + length) {
+            length += c->lease[i++].length;
+        }
+        struct kvm_dsm_mempin pin = {
+            .write = true, .unpin = unpin,
+            .host_virt_addr = (uintptr_t)memory_region_get_ram_ptr(mr) + offset,
+            .length = length,
+        };
+        if (unpin) {
+            memory_region_set_dirty(mr, offset, length);
+        }
+        if (kvm_vm_ioctl(kvm_state, KVM_DSM_MEMPIN, &pin)) {
+            io_fatal(unpin ? "release guest DMA lease" : "acquire guest DMA lease");
+        }
+        if (!unpin) {
+            qatomic_add(&io.lease_bytes, length);
+            qatomic_inc(&io.lease_calls);
+        }
+    }
+}
+
 static void *io_service(void *opaque)
 {
     IOConnection *c = opaque;
@@ -326,7 +364,7 @@ static void *io_service(void *opaque)
             have_pending = false;
             ret = 1;
         } else {
-            ret = io_completion(c, &wc, true);
+            ret = io_completion(c, &wc, !c->lease_count);
         }
         if (!ret) {
             break;
@@ -336,7 +374,7 @@ static void *io_service(void *opaque)
         }
         IOHeader req = *(IOHeader *)c->rx;
         bool vector = req.operation == IO_READV || req.operation == IO_WRITEV ||
-                      req.operation == IO_WRITE_POOL;
+                      req.operation == IO_WRITE_POOL || req.operation == IO_LEASE_WRITE;
         bool payload = req.operation == IO_WRITE || req.operation == IO_ECHO ||
                        req.operation == IO_WRITEV;
         if (req.magic != IO_MAGIC || req.version != IO_VERSION ||
@@ -346,6 +384,9 @@ static void *io_service(void *opaque)
             (vector ? (!req.reserved || req.reserved > IO_SEGMENTS) :
                       req.reserved != 0)) {
             io_fatal("invalid private request");
+        }
+        if (c->lease_count && req.operation != IO_COMMIT_WRITE) {
+            io_fatal("request before DMA lease commit");
         }
         IOHeader *resp = (IOHeader *)c->tx;
         *resp = req;
@@ -364,7 +405,8 @@ static void *io_service(void *opaque)
             break;
         case IO_READV:
         case IO_WRITEV:
-        case IO_WRITE_POOL: {
+        case IO_WRITE_POOL:
+        case IO_LEASE_WRITE: {
             IOVec *vec = (IOVec *)(c->rx + sizeof(IOHeader));
             unsigned total = 0;
             uint64_t ram_size = memory_region_size(io.ram[io.local]);
@@ -379,6 +421,35 @@ static void *io_service(void *opaque)
             }
             if (total != req.length || req.offset) {
                 io_fatal("invalid private vector length");
+            }
+            if (req.operation == IO_LEASE_WRITE) {
+                if (io.mode != 2 || c->lease_count) {
+                    io_fatal("unnegotiated or overlapping guest DMA lease");
+                }
+                MemoryRegion *mr = io.ram[io.local];
+                if (!c->guest_mr) {
+                    /* Registration stabilizes this local replica, not DSM
+                     * ownership. Every DMA still requires a request lease.
+                     * Keys are shared only with trusted cooperating peers.
+                     */
+                    c->guest_mr = ibv_reg_mr(c->pd, memory_region_get_ram_ptr(mr),
+                                             memory_region_size(mr),
+                                             IBV_ACCESS_LOCAL_WRITE |
+                                             IBV_ACCESS_REMOTE_WRITE);
+                    if (!c->guest_mr) {
+                        io_fatal("register fixed guest RAM backing");
+                    }
+                }
+                memcpy(c->lease, vec, req.reserved * sizeof(*vec));
+                c->lease_count = req.reserved;
+                c->lease_length = req.length;
+                c->lease_sequence = req.sequence;
+                io_lease_pin(c, false);
+                *(IORemote *)(c->tx + sizeof(IOHeader)) = (IORemote) {
+                    .address = (uintptr_t)memory_region_get_ram_ptr(mr),
+                    .rkey = c->guest_mr->rkey, .mode = io.mode,
+                };
+                break;
             }
             bool write = req.operation != IO_READV;
             if (req.operation == IO_WRITE_POOL && !io.mode) {
@@ -403,6 +474,19 @@ static void *io_service(void *opaque)
             }
             break;
         }
+        case IO_COMMIT_WRITE:
+            if (io.mode != 2 || !c->lease_count ||
+                req.offset != c->lease_sequence || req.length != c->lease_length) {
+                io_fatal("invalid guest DMA commit");
+            }
+            /* RC data writes precede this SEND. Publish DMA before releasing
+             * DSM pins and allowing any ownership transfer or guest completion.
+             */
+            smp_mb();
+            io_lease_pin(c, true);
+            c->lease_count = 0;
+            qatomic_add(&io.direct_bytes, req.length);
+            break;
         case IO_ECHO:
             *(IORemote *)(c->tx + sizeof(IOHeader)) = (IORemote) {
                 .address = (uintptr_t)c->rx + IO_HEADER,
@@ -535,6 +619,65 @@ static void io_post_pool_write(IOConnection *c, IOMapping **maps,
     qatomic_add(&io.send_zcopy_bytes, offset);
 }
 
+
+static void io_control(IOConnection *c)
+{
+    IOHeader sent = *(IOHeader *)c->tx;
+    struct ibv_wc wc;
+    unsigned seen = 0, received = 0;
+    io_post_recv(c);
+    io_post_send(c, IO_HEADER);
+    while (seen != 3) {
+        if (io_completion(c, &wc, false) != 1 ||
+            (wc.wr_id != 1 && wc.wr_id != 2) ||
+            (seen & (unsigned)wc.wr_id)) {
+            io_fatal("guest DMA control completion");
+        }
+        seen |= wc.wr_id;
+        if (wc.wr_id == 2) {
+            received = wc.byte_len;
+        }
+    }
+    IOHeader *resp = (IOHeader *)c->rx;
+    if (received != IO_HEADER || resp->magic != IO_MAGIC ||
+        resp->version != IO_VERSION || resp->sequence != sent.sequence ||
+        resp->operation != sent.operation || resp->length != sent.length ||
+        resp->reserved != sent.reserved || resp->offset != sent.offset ||
+        resp->status) {
+        io_fatal("guest DMA control response");
+    }
+    qatomic_inc(&io.calls);
+}
+
+/* Called under the per-peer lock, after the disk has completed. The short
+ * receiver-side lease covers network DMA, never disk latency.
+ */
+static void io_direct_write(IOConnection *c, IOMapping **maps,
+                              uint32_t *lengths, unsigned count, unsigned length)
+{
+    IOHeader *req = (IOHeader *)c->tx;
+    *req = (IOHeader) {
+        .magic = IO_MAGIC, .version = IO_VERSION, .operation = IO_LEASE_WRITE,
+        .length = length, .sequence = ++c->sequence, .reserved = count,
+    };
+    uint64_t lease = req->sequence;
+    io_control(c);
+    IORemote remote = *(IORemote *)(c->rx + sizeof(IOHeader));
+    if (remote.mode != 2 || !remote.address || !remote.rkey) {
+        io_fatal("invalid guest DMA grant");
+    }
+    io_post_pool_write(c, maps, lengths, count, remote.address, remote.rkey, true);
+    *req = (IOHeader) {
+        .magic = IO_MAGIC, .version = IO_VERSION, .operation = IO_COMMIT_WRITE,
+        .length = length, .sequence = ++c->sequence, .offset = lease,
+    };
+    io_control(c);
+    for (unsigned i = 0; i < count; i++) {
+        maps[i]->published = true;
+    }
+    qatomic_add(&io.write_bytes, length);
+}
+
 /* Pack the scatter/gather list into one registered private RDMA buffer.
  * Individual guest pages never appear in an RDMA MR or remote address.
  */
@@ -555,6 +698,11 @@ static void io_callv(int peer, bool write, IOMapping **maps,
         length += lengths[i];
     }
     assert(count && count <= IO_SEGMENTS && length && length <= IO_BYTES);
+    if (write && io.mode == 2 && length >= IO_PAGE) {
+        io_direct_write(c, maps, lengths, count, length);
+        pthread_mutex_unlock(&c->lock);
+        return;
+    }
     *req = (IOHeader) {
         .magic = IO_MAGIC, .version = IO_VERSION,
         .operation = write ? (io.mode ? IO_WRITE_POOL : IO_WRITEV) : IO_READV,
@@ -668,10 +816,13 @@ static void io_get_stats(Object *obj, Visitor *v, const char *name,
     g_autofree char *stats = g_strdup_printf(
         "calls=%" PRIu64 " read_bytes=%" PRIu64 " write_bytes=%" PRIu64
         " remote_maps=%" PRIu64 " local_maps=%" PRIu64
-        " mode=%u send_zcopy_bytes=%" PRIu64,
+        " mode=%u send_zcopy_bytes=%" PRIu64
+        " direct_bytes=%" PRIu64 " lease_bytes=%" PRIu64 " lease_calls=%" PRIu64,
         qatomic_read(&io.calls), qatomic_read(&io.read_bytes),
         qatomic_read(&io.write_bytes), qatomic_read(&io.remote_maps),
-        qatomic_read(&io.local_maps), io.mode, qatomic_read(&io.send_zcopy_bytes));
+        qatomic_read(&io.local_maps), io.mode, qatomic_read(&io.send_zcopy_bytes),
+        qatomic_read(&io.direct_bytes), qatomic_read(&io.lease_bytes),
+        qatomic_read(&io.lease_calls));
     visit_type_str(v, name, &stats, errp);
 }
 
@@ -690,6 +841,8 @@ void gvm_private_io_start(int local, int nodes, char **hosts)
         io.mode = 0;
     } else if (!strcmp(mode, "send")) {
         io.mode = 1;
+    } else if (!strcmp(mode, "direct")) {
+        io.mode = 2;
     } else {
         io_fatal("unknown GVM_PRIVATE_IO_ZCOPY mode");
     }
